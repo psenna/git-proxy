@@ -83,8 +83,10 @@ func (f *Frontend) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Make the authenticated identity available to later milestones
-		// (policy, audit) via the request context. Unused for now.
-		r = r.WithContext(withAgent(r.Context(), agent))
+		// (policy, audit) via the request context. Stored via the shared
+		// auth.WithAgent helper so the protocol layer can read it without
+		// importing this package (no import cycle).
+		r = r.WithContext(auth.WithAgent(r.Context(), agent))
 	}
 	repo, endpoint, ok := parsePath(r.URL.Path)
 	if !ok {
@@ -256,17 +258,9 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// agentCtxKey is the context key for the authenticated agent identity.
-type agentCtxKey struct{}
-
-// withAgent stores the authenticated agent identity in ctx.
-func withAgent(ctx context.Context, a auth.AgentIdentity) context.Context {
-	return context.WithValue(ctx, agentCtxKey{}, a)
-}
-
 // AgentFromContext returns the authenticated agent identity stored in ctx, if
-// any. Reserved for later milestones (policy, audit).
+// any. It delegates to the shared auth.FromContext helper so the protocol layer
+// and the frontend read the same context key.
 func AgentFromContext(ctx context.Context) (auth.AgentIdentity, bool) {
-	a, ok := ctx.Value(agentCtxKey{}).(auth.AgentIdentity)
-	return a, ok
+	return auth.FromContext(ctx)
 }
