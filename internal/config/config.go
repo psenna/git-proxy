@@ -23,8 +23,9 @@ import (
 // Config is the parsed proxy configuration.
 type Config struct {
 	Listen   string            `yaml:"listen"`
-	Upstream UpstreamConfig    `yaml:"upstream"`
+	Upstream UpstreamConfig     `yaml:"upstream"`
 	Repos    map[string]string `yaml:"repos"`
+	Policy   PolicyConfig      `yaml:"policy"`
 }
 
 // UpstreamConfig describes the upstream git server the proxy forwards to.
