@@ -77,29 +77,22 @@ func EnforceReceivePack(ctx context.Context, req *ReceivePackRequest, mirror *gi
 	// extraction error yields a Deny carrying the error as a reason — the push
 	// is never allowed when its contents could not be inspected. Mirror errors
 	// are already redacted of upstream credentials by gitx.redactCreds.
-	shas, err := mirror.NewCommits(ctx, updates)
+	//
+	// Commit SHAs + messages are fetched in a SINGLE git invocation under ONE
+	// lock acquisition (Mirror.NewCommitMessages) rather than one
+	// NewCommits + one CommitMessage call per commit, so a push introducing
+	// many commits does not churn the per-mirror mutex.
+	commits, err := mirror.NewCommitMessages(ctx, updates)
 	if err != nil {
 		return port.Decision{
 			Verdict: port.VerdictDeny,
 			Reasons: []port.Reason{{
 				Rule:    "enforcement",
-				Message: fmt.Sprintf("new-commit extraction failed: %v", err),
+				Message: fmt.Sprintf("commit extraction failed: %v", err),
 			}},
 		}, err
 	}
-	for _, sha := range shas {
-		msg, err := mirror.CommitMessage(ctx, sha)
-		if err != nil {
-			return port.Decision{
-				Verdict: port.VerdictDeny,
-				Reasons: []port.Reason{{
-					Rule:    "enforcement",
-					Message: fmt.Sprintf("commit-message extraction failed for %s: %v", sha, err),
-				}},
-			}, err
-		}
-		pushReq.Commits = append(pushReq.Commits, port.Commit{SHA: sha, Message: msg})
-	}
+	pushReq.Commits = commits
 	files, err := mirror.ChangedFiles(ctx, updates)
 	if err != nil {
 		return port.Decision{

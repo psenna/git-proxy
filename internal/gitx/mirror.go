@@ -231,6 +231,63 @@ func (m *Mirror) CommitMessage(ctx context.Context, sha string) (string, error) 
 	return strings.TrimRight(string(out), "\n"), nil
 }
 
+// NewCommitMessages returns the SHAs and full commit messages of the commits
+// introduced by the push across the given ref updates, in a SINGLE git
+// invocation under ONE lock acquisition. It replaces the per-commit
+// CommitMessage loop (one git call + one lock per commit) used by the
+// enforcement population path so a push introducing many commits does not
+// churn the per-mirror mutex. Delete updates (New == "") contribute no
+// commits. The result is in rev-list order (newest first), matching
+// NewCommits. The per-mirror mutex is held for the duration of the call.
+//
+// The format is `%H%x00%B%x00`: each commit emits `<SHA>\0<body>\0` and git
+// appends a newline after the entry, so the full output is
+// `SHA1\0body1\0\nSHA2\0body2\0\n`. Commit messages cannot contain NUL (git
+// rejects it), so NUL is a safe field/record separator. Bodies carry %B's
+// trailing newline; the message is trimmed of trailing newlines to match
+// CommitMessage.
+func (m *Mirror) NewCommitMessages(ctx context.Context, updates []port.RefUpdate) ([]port.Commit, error) {
+	pos := make([]string, 0, len(updates))
+	for _, u := range updates {
+		if u.New != "" {
+			pos = append(pos, u.New)
+		}
+	}
+	if len(pos) == 0 {
+		return nil, nil
+	}
+	args := append([]string{"log", "--format=%H%x00%B%x00"}, pos...)
+	args = append(args, "--not", "--all")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out, err := runGit(ctx, m.dir, args...)
+	if err != nil {
+		return nil, fmt.Errorf("gitx: new commit messages: %w", err)
+	}
+	return parseCommitMessages(out), nil
+}
+
+// parseCommitMessages parses the output of `git log --format=%H%x00%B%x00`.
+// Each commit record is `<SHA>\0<body>\0` with git appending a newline after
+// each entry, so splitting on NUL yields parts = [SHA1, body1, "\nSHA2", body2,
+// ..., "\n"]. SHAs after the first carry a leading "\n" (git's appended
+// newline); the trailing "\n" after the last body is the final lone part.
+func parseCommitMessages(out []byte) []port.Commit {
+	if len(out) == 0 {
+		return nil
+	}
+	parts := strings.Split(string(out), "\x00")
+	var commits []port.Commit
+	for i := 0; i+1 < len(parts); i += 2 {
+		sha := strings.TrimPrefix(parts[i], "\n")
+		commits = append(commits, port.Commit{
+			SHA:     sha,
+			Message: strings.TrimRight(parts[i+1], "\n"),
+		})
+	}
+	return commits
+}
+
 // ChangedFiles returns the files added/modified/deleted across the push, per
 // update `git diff --raw --no-renames old new` (create → diff against the empty
 // tree). Delete updates (New == "") contribute no files. Deduped by
