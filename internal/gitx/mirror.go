@@ -2,6 +2,8 @@ package gitx
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/url"
@@ -26,13 +28,17 @@ type Mirror struct {
 	mu          sync.Mutex
 }
 
-// repoSlug derives a filesystem-safe directory name from a repo path, replacing
-// path separators with "-". e.g. "org/team/repo.git" -> "org-team-repo.git".
+// repoSlug derives a filesystem-safe, collision-resistant directory name from a
+// repo path: path separators are replaced with "-" and a short hash of the repo
+// path is appended so that "a/b" and "a-b" (which would collide under a plain
+// replace) map to distinct directories. The slug is deterministic and stable
+// across restarts (same repo -> same dir).
 func repoSlug(repo string) string {
 	if repo == "" {
 		return "default"
 	}
-	return strings.ReplaceAll(repo, "/", "-")
+	sum := sha256.Sum256([]byte(repo))
+	return strings.ReplaceAll(repo, "/", "-") + "-" + hex.EncodeToString(sum[:])[:8]
 }
 
 // upstreamRepoURL builds the full URL to the upstream repo. When creds supplies
@@ -77,7 +83,7 @@ func Open(ctx context.Context, upstreamURL, repo, root string, creds port.Creden
 	// Detect an existing bare repo by checking for the HEAD file. If absent,
 	// clone a fresh mirror. `git clone --mirror` sets up a refspec of
 	// +refs/*:refs/* so Refresh fetches every ref.
-	if !mirrorExists(dir) {
+	if !mirrorExists(ctx, dir) {
 		if err := cloneMirror(ctx, dir, repoURL); err != nil {
 			return nil, fmt.Errorf("gitx: open mirror for %q: %w", repo, err)
 		}
@@ -92,8 +98,9 @@ func Open(ctx context.Context, upstreamURL, repo, root string, creds port.Creden
 	return &Mirror{dir: dir, upstreamURL: repoURL}, nil
 }
 
-// mirrorExists reports whether dir looks like an existing git bare repo.
-func mirrorExists(dir string) bool {
+// mirrorExists reports whether dir looks like an existing git bare repo. The
+// git invocation is ctx-aware so a cancelled context aborts the rev-parse.
+func mirrorExists(ctx context.Context, dir string) bool {
 	if dir == "" {
 		return false
 	}
@@ -104,7 +111,7 @@ func mirrorExists(dir string) bool {
 		return false
 	}
 	// Confirm it is a git dir (git rev-parse succeeds).
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "--git-dir").CombinedOutput()
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--git-dir").CombinedOutput()
 	if err != nil {
 		_ = out
 		return false

@@ -22,10 +22,10 @@ import (
 	"github.com/psenna/git-proxy/internal/port"
 )
 
-// DefaultMaxPackfileBytes is the default cap on a receive-pack request body
-// when enforcement is enabled (256 MiB). A push larger than this is denied
-// fail-closed rather than buffered indefinitely.
-const DefaultMaxPackfileBytes int64 = 256 << 20
+// DefaultMaxPackfileBytes lives in internal/config (the single source of truth
+// for the push size cap default); cmd/git-proxy passes
+// config.PolicyConfig.MaxPackfileBytesOrDefault() into SetEnforcement, so the
+// proxy layer does not redefine it.
 
 // MirrorOpener opens (or returns a cached) read-only inspection mirror for a
 // repository. The opener owns mirroring policy (caching, root directory); the
@@ -55,17 +55,15 @@ func New(up port.Upstream) *Proxy {
 
 // SetEnforcement wires push enforcement dependencies: the policy engine, a
 // mirror opener for inspection, and the max receive-pack request body size in
-// bytes (the proxy denies pushes larger than this fail-closed). Pass
-// maxBytes <= 0 to use DefaultMaxPackfileBytes. With engine == nil or
-// mirrorOpener == nil the proxy stays passthrough (policy off).
+// bytes (the proxy denies pushes larger than this fail-closed). maxBytes must be
+// greater than 0; the caller is responsible for defaulting (cmd/git-proxy uses
+// config.PolicyConfig.MaxPackfileBytesOrDefault). With engine == nil or
+// mirrorOpener == nil the proxy stays passthrough (policy off). A non-positive
+// maxBytes yields fail-closed denial of every non-empty push (no forward).
 func (p *Proxy) SetEnforcement(engine *policy.Engine, opener MirrorOpener, maxBytes int64) {
 	p.engine = engine
 	p.mirrorOpener = opener
-	if maxBytes > 0 {
-		p.maxPackfileBytes = maxBytes
-	} else {
-		p.maxPackfileBytes = DefaultMaxPackfileBytes
-	}
+	p.maxPackfileBytes = maxBytes
 }
 
 // UploadPack handles a git-upload-pack (fetch/clone) exchange. The agent's
@@ -111,9 +109,6 @@ func (p *Proxy) UploadPack(ctx context.Context, repo string, body io.Reader, w i
 // agent name is "" and rules apply per their applicability logic.
 func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w io.Writer) error {
 	max := p.maxPackfileBytes
-	if max <= 0 {
-		max = DefaultMaxPackfileBytes
-	}
 	enforce := p.engine != nil && p.mirrorOpener != nil
 
 	// When enforcement is on, cap the read at max+1 bytes so a malicious agent
