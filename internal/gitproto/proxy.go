@@ -127,6 +127,15 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 	}
 
 	// --- Enforcement on ---
+	// Fail-closed on an unparseable request: without commands/refs the proxy
+	// cannot compute a decision, so it must not forward. There is no
+	// structured report-status channel (no parsed capabilities), so close the
+	// stream; the agent sees a failed push. Real git always sends parseable
+	// requests, so this is an edge case.
+	if perr != nil || req == nil {
+		log.Printf("gitproto: receive-pack deny: unparseable request for repo %q: %v", repo, perr)
+		return nil
+	}
 	max := p.maxPackfileBytes
 	if max <= 0 {
 		max = DefaultMaxPackfileBytes
