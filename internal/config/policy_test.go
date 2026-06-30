@@ -59,3 +59,53 @@ func TestPolicyToPolicyCollectAll(t *testing.T) {
 		t.Errorf("mode = %v, want CollectAll", p.Mode)
 	}
 }
+
+func TestParsePolicyMirrorAndPush(t *testing.T) {
+	c, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+policy:
+  mirror:
+    dir: "/var/cache/git-proxy/mirror"
+  push:
+    max_packfile_bytes: 134217728
+  rules:
+    history_protect:
+      enabled: true
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Policy.Mirror.Dir != "/var/cache/git-proxy/mirror" {
+		t.Errorf("mirror.dir = %q", c.Policy.Mirror.Dir)
+	}
+	if c.Policy.Push.MaxPackfileBytes != 134217728 {
+		t.Errorf("push.max_packfile_bytes = %d, want 134217728", c.Policy.Push.MaxPackfileBytes)
+	}
+	if !c.Policy.HasEnabledRules() {
+		t.Errorf("HasEnabledRules = false, want true (history_protect enabled)")
+	}
+	if got := c.Policy.MaxPackfileBytesOrDefault(); got != 134217728 {
+		t.Errorf("MaxPackfileBytesOrDefault = %d, want 134217728", got)
+	}
+}
+
+func TestPolicyHasEnabledRulesFalseOnEmpty(t *testing.T) {
+	p := PolicyConfig{}
+	if p.HasEnabledRules() {
+		t.Errorf("empty policy HasEnabledRules = true, want false (passthrough)")
+	}
+	// A disabled rule does not count as enabled.
+	p = PolicyConfig{Rules: map[string]RuleConfig{"r": {Enabled: false}}}
+	if p.HasEnabledRules() {
+		t.Errorf("disabled-only policy HasEnabledRules = true, want false")
+	}
+}
+
+func TestPolicyMaxPackfileBytesDefault(t *testing.T) {
+	p := PolicyConfig{}
+	if got := p.MaxPackfileBytesOrDefault(); got != DefaultMaxPackfileBytes {
+		t.Errorf("default = %d, want %d", got, DefaultMaxPackfileBytes)
+	}
+}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/psenna/git-proxy/internal/auth"
 	"github.com/psenna/git-proxy/internal/gitproto"
+	"github.com/psenna/git-proxy/internal/policy"
 	"github.com/psenna/git-proxy/internal/port"
 )
 
@@ -72,6 +73,15 @@ func (f *Frontend) Serve(ctx context.Context) error {
 	}
 }
 
+// SetEnforcement wires push enforcement into the frontend's proxy: the policy
+// engine, a mirror opener for inspection, and the max receive-pack request body
+// size in bytes. With engine == nil or opener == nil the proxy stays
+// passthrough (policy off). Call before Serve. maxBytes <= 0 uses the proxy
+// default (256 MiB).
+func (f *Frontend) SetEnforcement(engine *policy.Engine, opener gitproto.MirrorOpener, maxBytes int64) {
+	f.proxy.SetEnforcement(engine, opener, maxBytes)
+}
+
 // handle routes a single smart-HTTP request to one of the three endpoints.
 func (f *Frontend) handle(w http.ResponseWriter, r *http.Request) {
 	if f.auth != nil {
@@ -83,8 +93,10 @@ func (f *Frontend) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Make the authenticated identity available to later milestones
-		// (policy, audit) via the request context. Unused for now.
-		r = r.WithContext(withAgent(r.Context(), agent))
+		// (policy, audit) via the request context. Stored via the shared
+		// auth.WithAgent helper so the protocol layer can read it without
+		// importing this package (no import cycle).
+		r = r.WithContext(auth.WithAgent(r.Context(), agent))
 	}
 	repo, endpoint, ok := parsePath(r.URL.Path)
 	if !ok {
@@ -256,17 +268,9 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// agentCtxKey is the context key for the authenticated agent identity.
-type agentCtxKey struct{}
-
-// withAgent stores the authenticated agent identity in ctx.
-func withAgent(ctx context.Context, a auth.AgentIdentity) context.Context {
-	return context.WithValue(ctx, agentCtxKey{}, a)
-}
-
 // AgentFromContext returns the authenticated agent identity stored in ctx, if
-// any. Reserved for later milestones (policy, audit).
+// any. It delegates to the shared auth.FromContext helper so the protocol layer
+// and the frontend read the same context key.
 func AgentFromContext(ctx context.Context) (auth.AgentIdentity, bool) {
-	a, ok := ctx.Value(agentCtxKey{}).(auth.AgentIdentity)
-	return a, ok
+	return auth.FromContext(ctx)
 }
