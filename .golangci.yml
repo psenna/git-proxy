@@ -1,0 +1,25 @@
+# golangci-lint configuration for git-proxy.
+# Enables a focused set of linters aligned with the CI quality gates.
+run:
+  timeout: 5m
+  go: "1.23"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+
+linters-settings:
+  errcheck:
+    # Fail on unchecked errors; allow common unhandled close() calls only
+    # when explicitly listed here (none for now).
+    check-type-assertions: true
+
+issues:
+  # Don't auto-exclude anything; surface everything CI should gate on.
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
