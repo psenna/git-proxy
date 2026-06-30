@@ -68,3 +68,28 @@ func TestRepoPath(t *testing.T) {
 		t.Errorf("unknown repo = %q, want other.git", got)
 	}
 }
+
+func TestParseAuthAndVault(t *testing.T) {
+	c, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+  credentials_file: "/etc/git-proxy/vault.yaml"
+auth:
+  tokens:
+    "agent-token-1": "agent-1"
+    "agent-token-2": "agent-2"
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Upstream.CredentialsFile != "/etc/git-proxy/vault.yaml" {
+		t.Errorf("CredentialsFile = %q", c.Upstream.CredentialsFile)
+	}
+	if got := c.Auth.Tokens["agent-token-1"]; got != "agent-1" {
+		t.Errorf("token agent-token-1 = %q, want agent-1", got)
+	}
+	if got := c.Auth.Tokens["agent-token-2"]; got != "agent-2" {
+		t.Errorf("token agent-token-2 = %q, want agent-2", got)
+	}
+}
