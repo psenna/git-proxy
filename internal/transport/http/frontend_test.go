@@ -76,6 +76,50 @@ func TestFrontend_InvalidToken_Unauthorized(t *testing.T) {
 	}
 }
 
+// TestFrontend_AuthGatesAllEndpoints asserts that the shared auth check (which
+// runs in handle BEFORE the endpoint switch) gates all three smart-HTTP
+// endpoints, not just /info/refs. A refactor that moved auth into per-endpoint
+// handlers would otherwise drop coverage on the POST endpoints. Auth fails
+// before the endpoint switch is reached, so proxy: nil is safe (the proxy is
+// never invoked).
+func TestFrontend_AuthGatesAllEndpoints(t *testing.T) {
+	endpoints := []string{
+		"/test.git/info/refs?service=git-upload-pack",
+		"/test.git/git-upload-pack",
+		"/test.git/git-receive-pack",
+	}
+	cases := []struct {
+		name string
+		auth string // Authorization header value; "" means none
+	}{
+		{name: "no_token", auth: ""},
+		{name: "invalid_token", auth: "Bearer not-valid"},
+	}
+	for _, ep := range endpoints {
+		for _, c := range cases {
+			t.Run(ep+"_"+c.name, func(t *testing.T) {
+				f := newTestFrontend(t, newTestAuth())
+				method := http.MethodGet
+				if ep != "/test.git/info/refs?service=git-upload-pack" {
+					method = http.MethodPost
+				}
+				req := httptest.NewRequest(method, ep, nil)
+				if c.auth != "" {
+					req.Header.Set("Authorization", c.auth)
+				}
+				rr := httptest.NewRecorder()
+				f.handle(rr, req)
+				if rr.Code != http.StatusUnauthorized {
+					t.Fatalf("code = %d, want 401 for %s (%s)", rr.Code, ep, c.name)
+				}
+				if got := rr.Header().Get("WWW-Authenticate"); got != "Bearer" {
+					t.Errorf("WWW-Authenticate = %q, want Bearer", got)
+				}
+			})
+		}
+	}
+}
+
 func TestFrontend_ValidToken_PassesAuth(t *testing.T) {
 	f := newTestFrontend(t, newTestAuth())
 	req := httptest.NewRequest(http.MethodGet, "/test.git/info/refs?service=git-upload-pack", nil)
