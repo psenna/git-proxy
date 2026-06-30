@@ -3,10 +3,12 @@ package gitx_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/psenna/git-proxy/internal/gitx"
@@ -220,5 +222,98 @@ func TestMirrorOpenCachedReopen(t *testing.T) {
 	}
 	if ok, err := m2.IsAncestor(ctx, tip, tip); err != nil || !ok {
 		t.Fatalf("reopen IsAncestor(tip,tip) = (%v, %v), want (true, nil)", ok, err)
+	}
+}
+
+// TestMirror_ConcurrentRefreshIngestIsAncestorNoLockError spawns N goroutines
+// that each Refresh, IngestPackfile, and IsAncestor through the SAME mirror
+// concurrently — the shared-bare-dir scenario of concurrent pushes to one repo.
+// Without per-mirror serialization the git fetch (ref locks) and index-pack
+// invocations race and can surface spurious "cannot lock ref" errors on
+// legitimate pushes. With the internal mutex, every git invocation is serialized
+// and all goroutines complete cleanly.
+func TestMirror_ConcurrentRefreshIngestIsAncestorNoLockError(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	// Base commit A on the upstream.
+	source := t.TempDir()
+	tips := makeSourceRepo(t, source, 1)
+	A := tips[0]
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+
+	root := t.TempDir()
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", root, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// Build N divergent commits B_i (each a child of A on its own branch) and a
+	// packfile for each, so concurrent IngestPackfile calls write distinct packs
+	// (realistic concurrent-push shape, no identical-pack filename collision).
+	const n = 8
+	type prepared struct {
+		tip  string
+		pack []byte
+	}
+	preps := make([]prepared, n)
+	for i := 0; i < n; i++ {
+		w := t.TempDir()
+		mustGit(t, "", "clone", "-q", "file://"+bare, w)
+		mustGit(t, w, "config", "user.email", "test@example.com")
+		mustGit(t, w, "config", "user.name", "Test")
+		mustGit(t, w, "checkout", "-q", "-b", fmt.Sprintf("topic-%d", i), A)
+		if err := os.WriteFile(filepath.Join(w, fmt.Sprintf("topic-%d.txt", i)), []byte(fmt.Sprintf("topic %d\n", i)), 0o644); err != nil {
+			t.Fatalf("write topic file: %v", err)
+		}
+		mustGit(t, w, "add", fmt.Sprintf("topic-%d.txt", i))
+		mustGit(t, w, "commit", "-q", "-m", fmt.Sprintf("topic commit %d", i))
+		preps[i] = prepared{tip: revParseHead(t, w), pack: makePackfile(t, w, revParseHead(t, w))}
+	}
+
+	var wg sync.WaitGroup
+	type result struct {
+		ok  bool
+		err error
+	}
+	errs := make([]error, n)
+	ancestry := make([]result, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := m.Refresh(ctx); err != nil {
+				errs[i] = fmt.Errorf("Refresh: %w", err)
+				return
+			}
+			if err := m.IngestPackfile(ctx, bytes.NewReader(preps[i].pack)); err != nil {
+				errs[i] = fmt.Errorf("IngestPackfile: %w", err)
+				return
+			}
+			ok, err := m.IsAncestor(ctx, A, preps[i].tip)
+			ancestry[i] = result{ok: ok, err: err}
+			if err != nil {
+				errs[i] = fmt.Errorf("IsAncestor: %w", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i, e := range errs {
+		if e == nil {
+			continue
+		}
+		if strings.Contains(e.Error(), "lock") {
+			t.Errorf("goroutine %d hit a ref-lock race (must be serialized): %v", i, e)
+		} else {
+			t.Errorf("goroutine %d unexpected error: %v", i, e)
+		}
+	}
+	for i, r := range ancestry {
+		if r.err != nil || !r.ok {
+			t.Errorf("goroutine %d IsAncestor(A,B_i) = (%v, %v), want (true, nil); B_i objects must be present after ingest", i, r.ok, r.err)
+		}
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/psenna/git-proxy/internal/port"
 )
@@ -16,10 +17,13 @@ import (
 // Mirror is a read-only bare clone of a single upstream repository, used only
 // for object inspection (ancestry walks). The proxy never serves from it, it
 // is never a push target, and the agent never sees it. A Mirror is safe for
-// concurrent use after Open.
+// concurrent use after Open: a per-mirror mutex serializes the git invocations
+// (Refresh, IngestPackfile, IsAncestor) so concurrent pushes to the same repo
+// do not race on the shared bare dir (ref locks / index-pack).
 type Mirror struct {
 	dir         string // bare repo path
 	upstreamURL string // full upstream URL for the repo (creds embedded if any)
+	mu          sync.Mutex
 }
 
 // repoSlug derives a filesystem-safe directory name from a repo path, replacing
@@ -118,8 +122,12 @@ func cloneMirror(ctx context.Context, dir, repoURL string) error {
 }
 
 // Refresh fetches all refs from the upstream so the mirror has the current
-// "old" values the enforcement path compares pushed commits against.
+// "old" values the enforcement path compares pushed commits against. The
+// per-mirror mutex is held for the duration of the fetch so concurrent pushes
+// to the same repo serialize and do not race on the bare dir's ref locks.
 func (m *Mirror) Refresh(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if _, err := runGit(ctx, m.dir, "fetch", "--quiet", "origin"); err != nil {
 		return fmt.Errorf("gitx: refresh mirror: %w", err)
 	}
@@ -129,8 +137,12 @@ func (m *Mirror) Refresh(ctx context.Context) error {
 // IngestPackfile writes a pushed packfile's objects into the mirror's object
 // store via `git index-pack --stdin` WITHOUT updating any ref. After this, both
 // the old (from Refresh) and the new (from the pack) objects are present for
-// ancestry walks. The packfile is read to EOF from r.
+// ancestry walks. The packfile is read to EOF from r. The per-mirror mutex is
+// held so index-pack does not race a concurrent Refresh or another IngestPackfile
+// on the same bare dir.
 func (m *Mirror) IngestPackfile(ctx context.Context, r io.Reader) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	cmd := exec.CommandContext(ctx, "git", "-C", m.dir, "index-pack", "--stdin")
 	cmd.Stdin = r
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -143,11 +155,14 @@ func (m *Mirror) IngestPackfile(ctx context.Context, r io.Reader) error {
 // `git merge-base --is-ancestor old new`. old=="" (ref creation) and new==""
 // (ref deletion) are NOT force-pushes: return (false, nil) for those. An
 // ancestry error (e.g. a missing object) is returned as an error so the caller
-// can fail closed.
+// can fail closed. The per-mirror mutex is held so this read-only walk does not
+// race a concurrent Refresh/IngestPackfile on the same bare dir.
 func (m *Mirror) IsAncestor(ctx context.Context, old, new string) (bool, error) {
 	if old == "" || new == "" {
 		return false, nil
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	cmd := exec.CommandContext(ctx, "git", "-C", m.dir, "merge-base", "--is-ancestor", old, new)
 	if err := cmd.Run(); err != nil {
 		// merge-base --is-ancestor exits 1 when old is NOT an ancestor of new,
