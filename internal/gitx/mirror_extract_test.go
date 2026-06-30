@@ -13,10 +13,6 @@ import (
 	"github.com/psenna/git-proxy/internal/port"
 )
 
-// emptyTreeOID is git's well-known empty-tree object id, used as the diff base
-// for ref creations.
-const emptyTreeOID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-
 // TestMirrorExtract exercises NewCommits/CommitMessage/ChangedFiles/BlobContent
 // against a real git mirror after Refresh + IngestPackfile, covering create
 // and update ref updates and dedup across updates.
