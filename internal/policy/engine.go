@@ -74,6 +74,7 @@ func newFilteredEngine(mode EvalMode, entries []ruleEntry) *Engine {
 // aggregated.
 func (e *Engine) EvaluatePush(req port.PushRequest) port.Decision {
 	var reasons []port.Reason
+	denied := false
 	for _, entry := range e.entries {
 		if !entry.applies(req.Agent, req.Repo) {
 			continue
@@ -81,19 +82,21 @@ func (e *Engine) EvaluatePush(req port.PushRequest) port.Decision {
 		dec, err := entry.rule.EvaluatePush(req)
 		if err != nil {
 			reasons = append(reasons, port.Reason{Rule: entry.rule.Name(), Message: errorMessage(err)})
+			denied = true
 			if e.mode == FirstDeny {
 				return port.Decision{Verdict: port.VerdictDeny, Reasons: reasons}
 			}
 			continue
 		}
 		if dec.Verdict == port.VerdictDeny {
+			denied = true
 			reasons = append(reasons, dec.Reasons...)
 			if e.mode == FirstDeny {
 				return port.Decision{Verdict: port.VerdictDeny, Reasons: reasons}
 			}
 		}
 	}
-	if len(reasons) > 0 {
+	if denied || len(reasons) > 0 {
 		return port.Decision{Verdict: port.VerdictDeny, Reasons: reasons}
 	}
 	return port.Decision{Verdict: port.VerdictAllow}
@@ -103,6 +106,7 @@ func (e *Engine) EvaluatePush(req port.PushRequest) port.Decision {
 // path. Semantics mirror EvaluatePush.
 func (e *Engine) EvaluateFetch(req port.FetchRequest) port.Decision {
 	var reasons []port.Reason
+	denied := false
 	for _, entry := range e.entries {
 		if !entry.applies(req.Agent, req.Repo) {
 			continue
@@ -110,19 +114,21 @@ func (e *Engine) EvaluateFetch(req port.FetchRequest) port.Decision {
 		dec, err := entry.rule.EvaluateFetch(req)
 		if err != nil {
 			reasons = append(reasons, port.Reason{Rule: entry.rule.Name(), Message: errorMessage(err)})
+			denied = true
 			if e.mode == FirstDeny {
 				return port.Decision{Verdict: port.VerdictDeny, Reasons: reasons}
 			}
 			continue
 		}
 		if dec.Verdict == port.VerdictDeny {
+			denied = true
 			reasons = append(reasons, dec.Reasons...)
 			if e.mode == FirstDeny {
 				return port.Decision{Verdict: port.VerdictDeny, Reasons: reasons}
 			}
 		}
 	}
-	if len(reasons) > 0 {
+	if denied || len(reasons) > 0 {
 		return port.Decision{Verdict: port.VerdictDeny, Reasons: reasons}
 	}
 	return port.Decision{Verdict: port.VerdictAllow}

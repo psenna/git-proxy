@@ -44,6 +44,17 @@ func deny(name, msg string) *stubRule {
 	}
 }
 
+// bareDeny returns a rule that denies with no Reasons. In CollectAll mode the
+// final verdict must still be Deny — the absence of a reason must not cause a
+// bare-deny to be lost (fail-closed).
+func bareDeny(name string) *stubRule {
+	return &stubRule{
+		name:     name,
+		pushDec:  port.Decision{Verdict: port.VerdictDeny},
+		fetchDec: port.Decision{Verdict: port.VerdictDeny},
+	}
+}
+
 func TestEngine_AllowWhenAllAllow(t *testing.T) {
 	e := NewEngine(FirstDeny, allow("a"), allow("b"))
 	got := e.EvaluatePush(port.PushRequest{Agent: "x", Repo: "r"})
@@ -115,6 +126,33 @@ func TestEngine_CollectAllAggregates(t *testing.T) {
 	if len(got.Reasons) != 2 {
 		t.Fatalf("reasons = %+v, want two aggregated", got.Reasons)
 	}
+}
+
+func TestEngine_CollectAllBareDenyForcesDeny(t *testing.T) {
+	// A rule that denies with NO reasons must still force a Deny final verdict
+	// in CollectAll mode. The final verdict is decoupled from the reasons count
+	// so a bare-deny is never lost (fail-closed). The complementary allow case
+	// is also asserted: a bare allow with no reasons stays Allow.
+	t.Run("bare deny forces deny", func(t *testing.T) {
+		e := NewEngine(CollectAll, bareDeny("bare_deny"))
+		got := e.EvaluatePush(port.PushRequest{Agent: "x", Repo: "r"})
+		if got.Verdict != port.VerdictDeny {
+			t.Fatalf("verdict = %v, want Deny (bare-deny must not be lost)", got.Verdict)
+		}
+		if len(got.Reasons) != 0 {
+			t.Fatalf("reasons = %+v, want empty (no reasons emitted)", got.Reasons)
+		}
+	})
+	t.Run("bare allow stays allow", func(t *testing.T) {
+		e := NewEngine(CollectAll, allow("bare_allow"))
+		got := e.EvaluatePush(port.PushRequest{Agent: "x", Repo: "r"})
+		if got.Verdict != port.VerdictAllow {
+			t.Fatalf("verdict = %v, want Allow", got.Verdict)
+		}
+		if len(got.Reasons) != 0 {
+			t.Fatalf("reasons = %+v, want empty", got.Reasons)
+		}
+	})
 }
 
 func TestEngine_FetchPath(t *testing.T) {
