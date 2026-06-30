@@ -65,6 +65,22 @@ func New(patterns []string) *Matcher {
 	return m
 }
 
+// IsMalformed reports whether pattern is a non-blank pattern that New would
+// drop as structurally invalid (e.g. an unclosed `[`). It lets a security
+// DENY-list caller detect a config typo and fail closed rather than silently
+// allowing everything through. A blank pattern (empty or whitespace-only) is
+// NOT malformed — it means "nothing configured" and New drops it as a no-op
+// (matches nothing), so IsMalformed returns false for it. This keeps New's
+// behavior (drop malformed, never panic) unchanged; IsMalformed only exposes
+// the detection.
+func IsMalformed(pattern string) bool {
+	if strings.TrimSpace(pattern) == "" {
+		return false
+	}
+	_, ok := compile(pattern)
+	return !ok
+}
+
 // compile parses a single pattern. It returns ok=false if the pattern is empty
 // or malformed (unclosed `[`).
 func compile(p string) (pattern, bool) {

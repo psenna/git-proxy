@@ -105,3 +105,39 @@ func TestMatcher_NilSafe(t *testing.T) {
 		t.Fatal("nil matcher should not match")
 	}
 }
+
+func TestIsMalformed(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+		want    bool
+	}{
+		// Good patterns are not malformed.
+		{name: "literal", pattern: "config.env", want: false},
+		{name: "star", pattern: "*.env", want: false},
+		{name: "double-star dir", pattern: "secrets/**", want: false},
+		{name: "anchored glob", pattern: "/.github/workflows/*", want: false},
+		{name: "trailing slash dir", pattern: "secrets/", want: false},
+		{name: "char class", pattern: "[abc].txt", want: false},
+		{name: "negated char class", pattern: "[!abc].txt", want: false},
+		{name: "double-star alone", pattern: "**", want: false},
+		{name: "question", pattern: "a?.txt", want: false},
+
+		// Blank = nothing configured, NOT malformed.
+		{name: "empty", pattern: "", want: false},
+		{name: "whitespace", pattern: "   ", want: false},
+
+		// Malformed: New would drop these.
+		{name: "unclosed class", pattern: "[abc.txt", want: true},
+		{name: "unclosed class mid", pattern: "foo[bar", want: true},
+		{name: "unbalanced class", pattern: "foo[!bar", want: true},
+		{name: "root slash only", pattern: "/", want: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := pathmatch.IsMalformed(c.pattern); got != c.want {
+				t.Fatalf("IsMalformed(%q) = %v, want %v", c.pattern, got, c.want)
+			}
+		})
+	}
+}
