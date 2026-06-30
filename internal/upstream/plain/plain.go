@@ -19,13 +19,19 @@ import (
 type Upstream struct {
 	BaseURL string
 	client  *http.Client
+	creds   port.CredentialStore
 }
 
-// New returns an Upstream that forwards to the git server at baseURL.
-func New(baseURL string) *Upstream {
+// New returns an Upstream that forwards to the git server at baseURL. creds, if
+// non-nil, is the vault of upstream credentials the proxy attaches to its
+// upstream requests (HTTP Basic auth). The agent never receives these; they
+// live only on the proxy→upstream leg. A nil creds means no credentials are
+// attached (passthrough).
+func New(baseURL string, creds port.CredentialStore) *Upstream {
 	return &Upstream{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		client:  &http.Client{},
+		creds:   creds,
 	}
 }
 
@@ -38,6 +44,7 @@ func (u *Upstream) ListRefs(ctx context.Context, repo string) (port.Refs, error)
 	if err != nil {
 		return port.Refs{}, err
 	}
+	u.applyCreds(req, repo)
 	resp, err := u.client.Do(req)
 	if err != nil {
 		return port.Refs{}, fmt.Errorf("plain: list refs: %w", err)
@@ -76,6 +83,7 @@ func (u *Upstream) post(ctx context.Context, repo, service, contentType string, 
 		return nil, err
 	}
 	req.Header.Set("Content-Type", contentType)
+	u.applyCreds(req, repo)
 	resp, err := u.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("plain: %s: %w", service, err)
@@ -85,4 +93,14 @@ func (u *Upstream) post(ctx context.Context, repo, service, contentType string, 
 		return nil, fmt.Errorf("plain: %s: upstream returned %s", service, resp.Status)
 	}
 	return resp.Body, nil
+}
+
+// applyCreds attaches vault credentials for repo to req, if any are configured.
+func (u *Upstream) applyCreds(req *http.Request, repo string) {
+	if u.creds == nil {
+		return
+	}
+	if c, ok := u.creds.CredentialsFor(repo); ok {
+		req.SetBasicAuth(c.Username, c.Password)
+	}
 }

@@ -15,7 +15,10 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/psenna/git-proxy/internal/auth/token"
 	"github.com/psenna/git-proxy/internal/config"
+	"github.com/psenna/git-proxy/internal/credentials/file"
+	"github.com/psenna/git-proxy/internal/port"
 	httpfront "github.com/psenna/git-proxy/internal/transport/http"
 	"github.com/psenna/git-proxy/internal/upstream/plain"
 	"github.com/psenna/git-proxy/internal/version"
@@ -41,8 +44,30 @@ func run(configPath string) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 
-	up := plain.New(cfg.Upstream.URL)
-	frontend := httpfront.New(ln, up, cfg.Upstream.URL, cfg.Repos)
+	// Upstream credential vault: holds per-repo upstream credentials the proxy
+	// attaches on the proxy→upstream leg. The agent never sees these. A missing
+	// credentials_file is allowed (passthrough); a malformed one fails closed at
+	// startup.
+	var creds port.CredentialStore
+	if cfg.Upstream.CredentialsFile != "" {
+		store, err := file.New(cfg.Upstream.CredentialsFile)
+		if err != nil {
+			return fmt.Errorf("load credentials: %w", err)
+		}
+		creds = store
+	}
+
+	// Agent authenticator: Bearer tokens. If no tokens are configured the proxy
+	// runs unauthenticated (fail open at the config level); production must
+	// configure at least one token. With tokens configured, every request must
+	// present a valid token or receive 401 (fail closed at the request level).
+	var auth port.Authenticator
+	if len(cfg.Auth.Tokens) > 0 {
+		auth = token.New(cfg.Auth.Tokens)
+	}
+
+	up := plain.New(cfg.Upstream.URL, creds)
+	frontend := httpfront.New(ln, up, cfg.Upstream.URL, cfg.Repos, auth, creds)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

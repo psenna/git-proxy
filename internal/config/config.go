@@ -23,14 +23,26 @@ import (
 // Config is the parsed proxy configuration.
 type Config struct {
 	Listen   string            `yaml:"listen"`
-	Upstream UpstreamConfig     `yaml:"upstream"`
+	Upstream UpstreamConfig    `yaml:"upstream"`
 	Repos    map[string]string `yaml:"repos"`
+	Auth     AuthConfig        `yaml:"auth"`
 	Policy   PolicyConfig      `yaml:"policy"`
 }
 
 // UpstreamConfig describes the upstream git server the proxy forwards to.
 type UpstreamConfig struct {
-	URL string `yaml:"url"`
+	URL             string `yaml:"url"`
+	CredentialsFile string `yaml:"credentials_file"`
+}
+
+// AuthConfig configures agent authentication on the proxy frontend.
+type AuthConfig struct {
+	// Tokens maps a bearer token to the agent name it authenticates. A request
+	// is authorized if it presents any token in this map. Empty (the default)
+	// means no tokens are valid; in that case the proxy runs without auth only
+	// if no Authenticator is wired (see cmd/git-proxy). Production deployments
+	// must configure at least one token.
+	Tokens map[string]string `yaml:"tokens"`
 }
 
 // Parse decodes configuration from raw YAML bytes.
