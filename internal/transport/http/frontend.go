@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/psenna/git-proxy/internal/auth"
 	"github.com/psenna/git-proxy/internal/gitproto"
 	"github.com/psenna/git-proxy/internal/port"
 )
@@ -25,18 +26,28 @@ type Frontend struct {
 	repos       map[string]string
 	client      *http.Client
 	server      *http.Server
+	creds       port.CredentialStore
+	auth        port.Authenticator
 }
 
 // New returns a Frontend that listens on ln, forwards POST streams through up,
 // and reverse-proxies info/refs to upstreamURL. repos maps agent-facing repo
 // paths to upstream repo paths.
-func New(ln net.Listener, up port.Upstream, upstreamURL string, repos map[string]string) *Frontend {
+//
+// auth gates every request with Bearer token authentication: a missing or
+// invalid token is rejected with 401 (fail closed). Pass a nil Authenticator
+// only for unauthenticated passthrough (e.g. local tests). creds, if non-nil,
+// is the vault of upstream credentials the proxy attaches when it talks to the
+// upstream; the agent never receives these.
+func New(ln net.Listener, up port.Upstream, upstreamURL string, repos map[string]string, a port.Authenticator, creds port.CredentialStore) *Frontend {
 	f := &Frontend{
 		ln:          ln,
 		upstreamURL: strings.TrimRight(upstreamURL, "/"),
 		proxy:       gitproto.New(up),
 		repos:       repos,
 		client:      &http.Client{},
+		auth:        a,
+		creds:       creds,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", f.handle)
@@ -63,6 +74,18 @@ func (f *Frontend) Serve(ctx context.Context) error {
 
 // handle routes a single smart-HTTP request to one of the three endpoints.
 func (f *Frontend) handle(w http.ResponseWriter, r *http.Request) {
+	if f.auth != nil {
+		agent, err := f.authenticate(r)
+		if err != nil {
+			log.Printf("httpfront: auth denied: %v", err)
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// Make the authenticated identity available to later milestones
+		// (policy, audit) via the request context. Unused for now.
+		r = r.WithContext(withAgent(r.Context(), agent))
+	}
 	repo, endpoint, ok := parsePath(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
@@ -96,6 +119,7 @@ func (f *Frontend) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo s
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	f.applyUpstreamCreds(req, repo)
 	resp, err := f.client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -142,6 +166,34 @@ func (f *Frontend) handleService(w http.ResponseWriter, r *http.Request, repo, s
 		} else {
 			log.Printf("httpfront: %s stream error after partial write: %v", service, streamErr)
 		}
+	}
+}
+
+// authenticate extracts the Bearer token from the Authorization header and
+// validates it. A missing header, a non-Bearer scheme, an empty token, or an
+// unknown token all return an error (fail closed → 401).
+func (f *Frontend) authenticate(r *http.Request) (auth.AgentIdentity, error) {
+	h := r.Header.Get("Authorization")
+	if h == "" {
+		return auth.AgentIdentity{}, fmt.Errorf("missing Authorization header")
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(h, prefix) {
+		return auth.AgentIdentity{}, fmt.Errorf("authorization scheme is not Bearer")
+	}
+	token := strings.TrimSpace(h[len(prefix):])
+	return f.auth.Authenticate(r.Context(), token)
+}
+
+// applyUpstreamCreds attaches vault credentials for repo to an upstream request,
+// if any are configured. The agent never sees these: they live only on the
+// proxy→upstream leg.
+func (f *Frontend) applyUpstreamCreds(req *http.Request, repo string) {
+	if f.creds == nil {
+		return
+	}
+	if c, ok := f.creds.CredentialsFor(repo); ok {
+		req.SetBasicAuth(c.Username, c.Password)
 	}
 }
 
@@ -202,4 +254,19 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 		fw.f.Flush()
 	}
 	return n, err
+}
+
+// agentCtxKey is the context key for the authenticated agent identity.
+type agentCtxKey struct{}
+
+// withAgent stores the authenticated agent identity in ctx.
+func withAgent(ctx context.Context, a auth.AgentIdentity) context.Context {
+	return context.WithValue(ctx, agentCtxKey{}, a)
+}
+
+// AgentFromContext returns the authenticated agent identity stored in ctx, if
+// any. Reserved for later milestones (policy, audit).
+func AgentFromContext(ctx context.Context) (auth.AgentIdentity, bool) {
+	a, ok := ctx.Value(agentCtxKey{}).(auth.AgentIdentity)
+	return a, ok
 }

@@ -20,6 +20,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/psenna/git-proxy/internal/auth/token"
+	"github.com/psenna/git-proxy/internal/credentials/file"
+	"github.com/psenna/git-proxy/internal/port"
 	httpfront "github.com/psenna/git-proxy/internal/transport/http"
 	"github.com/psenna/git-proxy/internal/upstream/plain"
 )
@@ -35,6 +38,13 @@ type Harness struct {
 	// BarePath is the filesystem path to the upstream bare repo, for
 	// verifying that pushes through the proxy reached upstream directly.
 	BarePath string
+	// Token is the valid agent bearer token when the proxy is started with
+	// auth enabled (StartWithAuth). Empty for the unauthenticated passthrough
+	// harness (Start). The git client sends it via http.extraHeader.
+	Token string
+	// VaultPath is the filesystem path to the credential vault file when the
+	// proxy is started with a vault (StartWithAuth). Empty when no vault.
+	VaultPath string
 
 	upstreamSrv *httptest.Server
 	ln          net.Listener
@@ -82,13 +92,14 @@ func Start(t *testing.T, repo string) *Harness {
 	})
 
 	// Proxy: ephemeral listener, passthrough upstream, identity repo map.
+	// No auth and no vault: passthrough mode (kept for the passthrough suite).
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		upstreamSrv.Close()
 		t.Fatalf("listen: %v", err)
 	}
-	up := plain.New(upstreamSrv.URL)
-	frontend := httpfront.New(ln, up, upstreamSrv.URL, map[string]string{repo: repo})
+	up := plain.New(upstreamSrv.URL, nil)
+	frontend := httpfront.New(ln, up, upstreamSrv.URL, map[string]string{repo: repo}, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -106,6 +117,79 @@ func Start(t *testing.T, repo string) *Harness {
 	}
 	t.Cleanup(h.Close)
 	return h
+}
+
+// StartWithAuth brings up the same upstream + proxy pair as Start, but with
+// Bearer token authentication enabled on the proxy and an optional credential
+// vault. token is the single valid agent token. vaultCreds, if non-nil, is
+// written to a vault file the proxy loads and used to attach upstream Basic
+// auth on the proxy→upstream leg. The harness exposes Token (for the git
+// client) and VaultPath (so a test can assert creds isolation against the
+// file's contents).
+func StartWithAuth(t *testing.T, repo, agentToken string, vaultCreds map[string]port.Credentials) *Harness {
+	t.Helper()
+
+	h := Start(t, repo)
+	// Stop the passthrough frontend Start built and rebuild with auth + vault.
+	if h.cancel != nil {
+		h.cancel()
+		h.cancel = nil
+	}
+	if h.errCh != nil {
+		<-h.errCh
+		h.errCh = nil
+	}
+	if h.ln != nil {
+		_ = h.ln.Close()
+		h.ln = nil
+	}
+
+	var store port.CredentialStore
+	if vaultCreds != nil {
+		h.VaultPath = writeVault(t, vaultCreds)
+		s, err := file.New(h.VaultPath)
+		if err != nil {
+			t.Fatalf("load vault: %v", err)
+		}
+		store = s
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	up := plain.New(h.UpstreamURL, store)
+	authn := token.New(map[string]string{agentToken: "agent-1"})
+	frontend := httpfront.New(ln, up, h.UpstreamURL, map[string]string{h.Repo: h.Repo}, authn, store)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- frontend.Serve(ctx) }()
+
+	h.ProxyURL = "http://" + ln.Addr().String()
+	h.Token = agentToken
+	h.ln = ln
+	h.cancel = cancel
+	h.errCh = errCh
+	return h
+}
+
+// writeVault writes a credential vault YAML file and returns its path. The
+// vault maps repo paths to upstream credentials.
+func writeVault(t *testing.T, creds map[string]port.Credentials) string {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("credentials:\n")
+	for repo, c := range creds {
+		b.WriteString("  \"" + repo + "\":\n")
+		b.WriteString("    username: " + c.Username + "\n")
+		b.WriteString("    password: " + c.Password + "\n")
+	}
+	p := filepath.Join(t.TempDir(), "vault.yaml")
+	if err := os.WriteFile(p, []byte(b.String()), 0o600); err != nil {
+		t.Fatalf("write vault: %v", err)
+	}
+	return p
 }
 
 // Close stops the proxy and upstream servers. It is safe to call multiple
@@ -152,10 +236,15 @@ func seedUpstream(t *testing.T, barePath string) {
 // stdout/stderr unattached; use RunGit for fail-fast execution or set
 // cmd.Stdout/Stderr yourself for inspection.
 func (h *Harness) Git(dir string, args ...string) *exec.Cmd {
-	full := append(
-		[]string{"-c", "url." + h.ProxyURL + ".insteadOf=" + h.UpstreamURL},
-		args...,
-	)
+	full := []string{"-c", "url." + h.ProxyURL + ".insteadOf=" + h.UpstreamURL}
+	if h.Token != "" {
+		// Send the agent bearer token to the proxy. http.extraHeader applies
+		// to every HTTP request git makes; the only HTTP server it talks to is
+		// the proxy (via insteadOf), so the header reaches the proxy and never
+		// the upstream.
+		full = append(full, "-c", "http.extraHeader=Authorization: Bearer "+h.Token)
+	}
+	full = append(full, args...)
 	cmd := exec.Command("git", full...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
