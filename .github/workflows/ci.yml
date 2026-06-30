@@ -16,12 +16,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
           cache: false
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          # Build from source with the CI Go toolchain so the linter's
+          # typechecker can parse the current stdlib. The prebuilt v1.64.8
+          # binary is built with go1.24 and cannot typecheck go1.25+ stdlib
+          # files. Pin v1.64.8 to keep the v1 .golangci.yml config format.
+          version: v1.64.8
+          install-mode: source
           args: --timeout 5m
 
   build:
@@ -31,7 +36,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
       - name: go build
         run: go build ./...
 
@@ -42,7 +47,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
       - name: go vet
         run: go vet ./...
       - name: go test
@@ -62,7 +67,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
       - name: install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - name: govulncheck
