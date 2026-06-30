@@ -21,10 +21,14 @@
 //   - An empty pattern set matches nothing. A malformed pattern is dropped
 //     (fail-safe: it never matches and does not panic).
 //
-// Negation (`!`) is NOT implemented in v1. The path_acl use case only needs
-// positive deny patterns; negation adds ordering/last-match-wins complexity and
-// risk for no current benefit. Task 9 may revisit if fetch rules need
-// allow-then-deny overrides. This is documented as a known limitation.
+// Negation (`!`) is NOT implemented in v1 and is documented as a known
+// limitation. The path_acl use case only needs positive deny patterns;
+// negation adds ordering/last-match-wins complexity and risk for no current
+// benefit. A pattern with a leading `!` (the gitignore negation prefix) is
+// rejected as malformed (dropped by New / reported by IsMalformed) rather than
+// compiled as a literal segment that would match only a file literally named
+// `!foo` — for a deny list that would over-match a weirdly-named file. Task 9
+// may revisit if fetch rules need allow-then-deny overrides.
 package pathmatch
 
 import "strings"
@@ -82,10 +86,15 @@ func IsMalformed(pattern string) bool {
 }
 
 // compile parses a single pattern. It returns ok=false if the pattern is empty
-// or malformed (unclosed `[`).
+// or malformed (unclosed `[`, or a leading `!` which is unsupported negation).
 func compile(p string) (pattern, bool) {
 	// A pattern that is empty or only whitespace matches nothing.
 	if strings.TrimSpace(p) == "" {
+		return pattern{}, false
+	}
+	// Negation (`!` prefix) is unsupported in v1. Drop it as malformed so it
+	// does not compile as a literal segment that over-matches a `!`-named file.
+	if strings.HasPrefix(p, "!") {
 		return pattern{}, false
 	}
 	dirOnly := strings.HasSuffix(p, "/")

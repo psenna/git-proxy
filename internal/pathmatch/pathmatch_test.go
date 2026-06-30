@@ -86,6 +86,14 @@ func TestMatcher(t *testing.T) {
 		{name: "malformed does not poison good", patterns: []string{"[abc.txt", "*.env"}, path: "x.env", want: true},
 		{name: "empty pattern dropped", patterns: []string{""}, path: "anything", want: false},
 
+		// Negation (`!`) is unsupported: a `!`-prefixed pattern is dropped as
+		// malformed (matches nothing, even a file literally named `!foo`).
+		{name: "negation prefix dropped", patterns: []string{"!foo"}, path: "!foo", want: false},
+		{name: "negation does not poison good", patterns: []string{"!foo", "*.env"}, path: "x.env", want: true},
+		// A leading `/` anchors, so `/!foo` is an anchored literal `!foo` (not negation).
+		{name: "anchored bang literal matches", patterns: []string{"/!foo"}, path: "!foo", want: true},
+		{name: "anchored bang literal no depth", patterns: []string{"/!foo"}, path: "dir/!foo", want: false},
+
 		// Path normalization: leading slash on the path is stripped.
 		{name: "path leading slash stripped", patterns: []string{"/a/b"}, path: "/a/b", want: true},
 	}
@@ -132,6 +140,11 @@ func TestIsMalformed(t *testing.T) {
 		{name: "unclosed class mid", pattern: "foo[bar", want: true},
 		{name: "unbalanced class", pattern: "foo[!bar", want: true},
 		{name: "root slash only", pattern: "/", want: true},
+		// Negation (`!`) is unsupported: a leading `!` is malformed.
+		{name: "negation prefix", pattern: "!foo", want: true},
+		{name: "negation prefix dir", pattern: "!secrets/", want: true},
+		// A leading `/` anchors, so `/!foo` is NOT negation (the `!` is not leading).
+		{name: "anchored bang literal", pattern: "/!foo", want: false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
