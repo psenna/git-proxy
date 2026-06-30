@@ -192,6 +192,13 @@ func RegisterRule(name string, f RuleFactory) {
 	defaultRegistry.Register(name, f)
 }
 
+// LookupRule returns the factory registered under name on the default
+// registry, or false if no rule is registered with that name. It is the
+// read-side counterpart to RegisterRule.
+func LookupRule(name string) (RuleFactory, bool) {
+	return defaultRegistry.Lookup(name)
+}
+
 // RuleConfig enables a named rule and optionally restricts it to a subset of
 // agents and/or repos. An empty Agents list means "all agents"; an empty Repos
 // list means "all repos". Params is the rule-specific configuration mirrored
