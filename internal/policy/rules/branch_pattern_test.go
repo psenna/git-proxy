@@ -100,6 +100,49 @@ func TestBranchPattern_EmptyAllowDeniesAll(t *testing.T) {
 	ruletest.RunPush(t, rule, cases)
 }
 
+func TestBranchPattern_GlobIsSingleSegment(t *testing.T) {
+	// path.Match `*` does not cross `/`, so refs/heads/feat/* allows
+	// refs/heads/feat/x but NOT refs/heads/feat/x/y. Pin the boundary so a
+	// regression to a crossing-`/` matcher cannot silently over-allow.
+	rule := newBranchPattern("refs/heads/feat/*")
+	cases := []ruletest.PushCase{
+		{
+			Name: "push to feat/x allowed (glob matches one segment)",
+			Req: port.PushRequest{RefUpdates: []port.RefUpdate{
+				{Ref: "refs/heads/feat/x", Old: "a", New: "b"},
+			}},
+			Want: port.VerdictAllow,
+		},
+		{
+			Name: "push to feat/x/y denied (glob does not cross slash)",
+			Req: port.PushRequest{RefUpdates: []port.RefUpdate{
+				{Ref: "refs/heads/feat/x/y", Old: "a", New: "b"},
+			}},
+			Want:       port.VerdictDeny,
+			WantReason: "push to ref \"refs/heads/feat/x/y\" is not allowed by any allow pattern",
+		},
+	}
+	ruletest.RunPush(t, rule, cases)
+}
+
+func TestBranchPattern_MalformedPatternNeverMatches(t *testing.T) {
+	// A malformed pattern (path.Match ErrBadPattern) must fail safe: it never
+	// matches, so a ref is not allowed by it. It must not panic and must not
+	// accidentally allow an unrelated ref. With only a malformed allow pattern,
+	// every push is denied.
+	rule := newBranchPattern("refs/heads/[")
+	ruletest.RunPush(t, rule, []ruletest.PushCase{
+		{
+			Name: "push to main denied when allow pattern is malformed",
+			Req: port.PushRequest{RefUpdates: []port.RefUpdate{
+				{Ref: "refs/heads/main", Old: "a", New: "b"},
+			}},
+			Want:       port.VerdictDeny,
+			WantReason: "push to ref \"refs/heads/main\" is not allowed by any allow pattern",
+		},
+	})
+}
+
 func TestBranchPattern_FetchAlwaysAllows(t *testing.T) {
 	rule := newBranchPattern("refs/heads/main")
 	ruletest.RunFetch(t, rule, []ruletest.FetchCase{

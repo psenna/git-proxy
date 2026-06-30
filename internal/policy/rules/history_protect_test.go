@@ -105,6 +105,48 @@ func TestHistoryProtect_EmptyRefsAllowsAll(t *testing.T) {
 	ruletest.RunPush(t, rule, cases)
 }
 
+func TestHistoryProtect_GlobIsSingleSegment(t *testing.T) {
+	// path.Match `*` does not cross `/`, so refs/heads/release/* protects
+	// refs/heads/release/v1 but NOT refs/heads/release/v1/x. A regression to a
+	// matcher whose `*` crosses `/` would silently over-protect (or, for
+	// branch_pattern, over-allow); this row pins the single-segment boundary.
+	rule := newHistoryProtect("refs/heads/release/*")
+	cases := []ruletest.PushCase{
+		{
+			Name: "force-push to release/v1 denied (glob matches one segment)",
+			Req: port.PushRequest{RefUpdates: []port.RefUpdate{
+				{Ref: "refs/heads/release/v1", Old: "a", New: "b", Force: true},
+			}},
+			Want:       port.VerdictDeny,
+			WantReason: "force-push to protected ref \"refs/heads/release/v1\" is not allowed",
+		},
+		{
+			Name: "force-push to release/v1/x allowed (glob does not cross slash)",
+			Req: port.PushRequest{RefUpdates: []port.RefUpdate{
+				{Ref: "refs/heads/release/v1/x", Old: "a", New: "b", Force: true},
+			}},
+			Want: port.VerdictAllow,
+		},
+	}
+	ruletest.RunPush(t, rule, cases)
+}
+
+func TestHistoryProtect_MalformedPatternNeverMatches(t *testing.T) {
+	// A malformed pattern (path.Match returns ErrBadPattern) must fail safe:
+	// it never matches, so the ref is treated as not protected. It must not
+	// panic and must not accidentally protect an unrelated ref.
+	rule := newHistoryProtect("refs/heads/[")
+	ruletest.RunPush(t, rule, []ruletest.PushCase{
+		{
+			Name: "force-push allowed when protected pattern is malformed",
+			Req: port.PushRequest{RefUpdates: []port.RefUpdate{
+				{Ref: "refs/heads/main", Old: "a", New: "b", Force: true},
+			}},
+			Want: port.VerdictAllow,
+		},
+	})
+}
+
 func TestHistoryProtect_FetchAlwaysAllows(t *testing.T) {
 	rule := newHistoryProtect("refs/heads/main")
 	ruletest.RunFetch(t, rule, []ruletest.FetchCase{
