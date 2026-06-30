@@ -15,6 +15,7 @@ import (
 
 	"github.com/psenna/git-proxy/internal/auth"
 	"github.com/psenna/git-proxy/internal/gitproto"
+	"github.com/psenna/git-proxy/internal/policy"
 	"github.com/psenna/git-proxy/internal/port"
 )
 
@@ -70,6 +71,15 @@ func (f *Frontend) Serve(ctx context.Context) error {
 		}
 		return nil
 	}
+}
+
+// SetEnforcement wires push enforcement into the frontend's proxy: the policy
+// engine, a mirror opener for inspection, and the max receive-pack request body
+// size in bytes. With engine == nil or opener == nil the proxy stays
+// passthrough (policy off). Call before Serve. maxBytes <= 0 uses the proxy
+// default (256 MiB).
+func (f *Frontend) SetEnforcement(engine *policy.Engine, opener gitproto.MirrorOpener, maxBytes int64) {
+	f.proxy.SetEnforcement(engine, opener, maxBytes)
 }
 
 // handle routes a single smart-HTTP request to one of the three endpoints.

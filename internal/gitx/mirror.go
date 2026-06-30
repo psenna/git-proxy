@@ -78,6 +78,13 @@ func Open(ctx context.Context, upstreamURL, repo, root string, creds port.Creden
 			return nil, fmt.Errorf("gitx: open mirror for %q: %w", repo, err)
 		}
 	}
+	// Disable background auto-gc on the mirror: Refresh (fetch) and
+	// IngestPackfile (index-pack) can schedule `git gc --auto` asynchronously,
+	// which races callers that tear the mirror down promptly (e.g. tests) and
+	// is wasted work on a short-lived inspection-only clone. Idempotent.
+	if _, err := runGit(ctx, dir, "config", "gc.auto", "0"); err != nil {
+		return nil, fmt.Errorf("gitx: mirror gc.auto: %w", err)
+	}
 	return &Mirror{dir: dir, upstreamURL: repoURL}, nil
 }
 

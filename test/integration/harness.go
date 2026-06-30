@@ -18,10 +18,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/psenna/git-proxy/internal/auth/token"
+	"github.com/psenna/git-proxy/internal/config"
 	"github.com/psenna/git-proxy/internal/credentials/file"
+	"github.com/psenna/git-proxy/internal/gitproto"
+	"github.com/psenna/git-proxy/internal/gitx"
+	"github.com/psenna/git-proxy/internal/policy"
+	_ "github.com/psenna/git-proxy/internal/policy/rules" // register rules via init()
 	"github.com/psenna/git-proxy/internal/port"
 	httpfront "github.com/psenna/git-proxy/internal/transport/http"
 	"github.com/psenna/git-proxy/internal/upstream/plain"
@@ -77,12 +84,17 @@ func gitHTTPBackendPath(t *testing.T) string {
 func Start(t *testing.T, repo string) *Harness {
 	t.Helper()
 
-	root := t.TempDir()
+	root := tolerantTempDir(t)
 	barePath := filepath.Join(root, repo)
 	mustRun(t, "git", "init", "--bare", "-b", "main", barePath)
 	// Enable push over smart HTTP: git http-backend disables receive-pack by
 	// default; http.receivepack=true on the bare repo turns it on.
 	mustRun(t, "git", "-C", barePath, "config", "http.receivepack", "true")
+	// Disable background auto-gc: git receive-pack may schedule `git gc --auto`
+	// after a push, which runs asynchronously and can leave the bare repo
+	// directory non-empty when the test's TempDir cleanup runs, causing flaky
+	// "directory not empty" cleanup failures.
+	mustRun(t, "git", "-C", barePath, "config", "gc.auto", "0")
 	seedUpstream(t, barePath)
 
 	// Upstream HTTP server: git http-backend over CGI.
@@ -172,6 +184,85 @@ func StartWithAuth(t *testing.T, repo, agentToken string, vaultCreds map[string]
 	h.cancel = cancel
 	h.errCh = errCh
 	return h
+}
+
+// StartWithPolicy brings up the same upstream + proxy pair as Start, but with
+// push enforcement enabled: the policy engine is built from pol via the default
+// rule registry, and a caching inspection mirror opener is wired with its root
+// at a fresh temp directory. The upstream is unauthenticated (no vault, no
+// agent auth), matching the enforcement integration tests. pol's Mirror and
+// Push knobs are read here; Mirror.Dir is overridden to a temp dir regardless.
+//
+// Pass pol as a config.PolicyConfig with the desired rules enabled (and their
+// Params). An empty/nil rule set yields passthrough (use Start instead).
+func StartWithPolicy(t *testing.T, repo string, pol config.PolicyConfig) *Harness {
+	t.Helper()
+
+	h := Start(t, repo)
+	// Stop the passthrough frontend Start built and rebuild with enforcement.
+	if h.cancel != nil {
+		h.cancel()
+		h.cancel = nil
+	}
+	if h.errCh != nil {
+		<-h.errCh
+		h.errCh = nil
+	}
+	if h.ln != nil {
+		_ = h.ln.Close()
+		h.ln = nil
+	}
+
+	eng, err := policy.Resolve(pol.ToPolicy(), nil)
+	if err != nil {
+		t.Fatalf("policy.Resolve: %v", err)
+	}
+
+	mirrorRoot := tolerantTempDir(t)
+	opener := cachingMirrorOpener(h.UpstreamURL, mirrorRoot, nil)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	up := plain.New(h.UpstreamURL, nil)
+	frontend := httpfront.New(ln, up, h.UpstreamURL, map[string]string{h.Repo: h.Repo}, nil, nil)
+	frontend.SetEnforcement(eng, opener, pol.MaxPackfileBytesOrDefault())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- frontend.Serve(ctx) }()
+
+	h.ProxyURL = "http://" + ln.Addr().String()
+	h.ln = ln
+	h.cancel = cancel
+	h.errCh = errCh
+	return h
+}
+
+// cachingMirrorOpener returns a gitproto.MirrorOpener that caches one bare
+// mirror per repo under root, cloning from upstreamURL on first open. The
+// upstream creds (for the fetch leg) are attached when non-nil; the agent never
+// sees them. The cache is safe for concurrent use.
+func cachingMirrorOpener(upstreamURL, root string, creds port.CredentialStore) gitproto.MirrorOpener {
+	var mu sync.Mutex
+	cache := map[string]*gitx.Mirror{}
+	return func(ctx context.Context, repo string) (*gitx.Mirror, error) {
+		mu.Lock()
+		if m, ok := cache[repo]; ok {
+			mu.Unlock()
+			return m, nil
+		}
+		mu.Unlock()
+		m, err := gitx.Open(ctx, upstreamURL, repo, root, creds)
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		cache[repo] = m
+		mu.Unlock()
+		return m, nil
+	}
 }
 
 // writeVault writes a credential vault YAML file and returns its path. The
@@ -274,6 +365,50 @@ func (h *Harness) UpstreamRef(t *testing.T, ref string) string {
 		t.Fatalf("rev-parse %s in upstream: %v", ref, err)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// tolerantTempDir creates a temp directory whose t.Cleanup removal retries on
+// "directory not empty" errors. The upstream git-http-backend spawns git
+// subprocesses (upload-pack/receive-pack) that can briefly hold files in the
+// bare repo after a test completes; a plain t.TempDir cleanup races those
+// subprocesses and fails flakily. Retrying lets the subprocesses exit first.
+// Cleanup failures after the retries are reported via t.Errorf rather than
+// fatal, so a transient race does not abort the whole test binary.
+func tolerantTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "gitproxy-it-*")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	t.Cleanup(func() {
+		for i := 0; i < 5; i++ {
+			if err := os.RemoveAll(dir); err == nil {
+				return
+			} else if !isBusyDirErr(err) {
+				t.Errorf("cleanup temp dir %s: %v", dir, err)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		// Last attempt; report remaining files for diagnosis.
+		if err := os.RemoveAll(dir); err != nil {
+			var left []string
+			_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+				if err == nil {
+					left = append(left, p)
+				}
+				return nil
+			})
+			t.Errorf("cleanup temp dir %s after retries: %v; remaining: %v", dir, err, left)
+		}
+	})
+	return dir
+}
+
+// isBusyDirErr reports whether err is a "directory not empty" style error that
+// is safe to retry (a concurrent subprocess is momentarily holding a file).
+func isBusyDirErr(err error) bool {
+	return strings.Contains(err.Error(), "directory not empty")
 }
 
 // mustRun runs a command and fails the test on error.

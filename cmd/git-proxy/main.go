@@ -1,8 +1,10 @@
 // Command git-proxy is a policy-enforcing gateway between AI coding agents and
-// upstream Git repositories. This M1 build is a passthrough smart-HTTP proxy:
-// it terminates the agent's git traffic and reverse-proxies upload-pack and
-// receive-pack byte streams to a configured upstream git server, with no policy
-// yet.
+// upstream Git repositories. It terminates the agent's git traffic and
+// reverse-proxies upload-pack byte streams to a configured upstream git server
+// (passthrough), while inspecting receive-pack (push) streams against a policy
+// engine: allowed pushes are forwarded verbatim, denied pushes are rejected via
+// a report-status response and the upstream is left unchanged. With no policy
+// rules configured it runs as a pure passthrough proxy.
 package main
 
 import (
@@ -13,11 +15,16 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/psenna/git-proxy/internal/auth/token"
 	"github.com/psenna/git-proxy/internal/config"
 	"github.com/psenna/git-proxy/internal/credentials/file"
+	"github.com/psenna/git-proxy/internal/gitproto"
+	"github.com/psenna/git-proxy/internal/gitx"
+	"github.com/psenna/git-proxy/internal/policy"
+	_ "github.com/psenna/git-proxy/internal/policy/rules" // register rules via init()
 	"github.com/psenna/git-proxy/internal/port"
 	httpfront "github.com/psenna/git-proxy/internal/transport/http"
 	"github.com/psenna/git-proxy/internal/upstream/plain"
@@ -69,8 +76,56 @@ func run(configPath string) error {
 	up := plain.New(cfg.Upstream.URL, creds)
 	frontend := httpfront.New(ln, up, cfg.Upstream.URL, cfg.Repos, auth, creds)
 
+	// Push enforcement: build the policy engine from config when any rule is
+	// enabled. With no enabled rules the proxy stays passthrough (no mirror,
+	// no inspection) — preserving the unauthenticated/passthrough behavior when
+	// policy is unconfigured. The engine is pure (no I/O); the inspection
+	// mirror (git binary) is owned by the mirror opener wired below.
+	if cfg.Policy.HasEnabledRules() {
+		eng, err := policy.Resolve(cfg.Policy.ToPolicy(), nil)
+		if err != nil {
+			return fmt.Errorf("load policy: %w", err)
+		}
+		mirrorDir := cfg.Policy.Mirror.Dir
+		if mirrorDir == "" {
+			return fmt.Errorf("config: policy.mirror.dir is required when policy rules are enabled")
+		}
+		opener := newMirrorOpener(cfg.Upstream.URL, mirrorDir, creds)
+		frontend.SetEnforcement(eng, opener, cfg.Policy.MaxPackfileBytesOrDefault())
+		log.Printf("git-proxy: push enforcement enabled (rules=%d, mirror=%s, max_packfile_bytes=%d)",
+			len(cfg.Policy.Rules), mirrorDir, cfg.Policy.MaxPackfileBytesOrDefault())
+	} else {
+		log.Printf("git-proxy: push enforcement off (no policy rules enabled) — passthrough")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	return frontend.Serve(ctx)
+}
+
+// newMirrorOpener returns a gitproto.MirrorOpener that caches one bare mirror
+// per upstream repo under root, cloning from upstreamURL on first open. The
+// upstream credentials (for the fetch leg) are attached when non-nil; the agent
+// never sees them — they live only inside the mirror's remote config. The cache
+// is safe for concurrent use.
+func newMirrorOpener(upstreamURL, root string, creds port.CredentialStore) gitproto.MirrorOpener {
+	var mu sync.Mutex
+	cache := map[string]*gitx.Mirror{}
+	return func(ctx context.Context, repo string) (*gitx.Mirror, error) {
+		mu.Lock()
+		if m, ok := cache[repo]; ok {
+			mu.Unlock()
+			return m, nil
+		}
+		mu.Unlock()
+		m, err := gitx.Open(ctx, upstreamURL, repo, root, creds)
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		cache[repo] = m
+		mu.Unlock()
+		return m, nil
+	}
 }

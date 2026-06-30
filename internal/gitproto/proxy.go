@@ -14,6 +14,7 @@ import (
 	"log"
 	"strings"
 
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp/sideband"
 	"github.com/psenna/git-proxy/internal/auth"
 	"github.com/psenna/git-proxy/internal/gitproto/pktline"
 	"github.com/psenna/git-proxy/internal/gitx"
@@ -204,14 +205,62 @@ func (p *Proxy) forwardReceivePack(ctx context.Context, repo string, buf []byte,
 // denied push. If the agent did not request report-status, there is no
 // structured channel: write nothing (the agent sees a truncated/empty stream
 // and treats the push as failed). Real git always requests report-status.
+//
+// When the agent requested side-band-64k (the common case), the report-status
+// is multiplexed over sideband channel 1 (PackData) and the sideband stream is
+// terminated with a flush-pkt — matching what a real git server sends. Without
+// sideband, the plain report-status is written directly.
 func (p *Proxy) writeDenyResponse(w io.Writer, req *ReceivePackRequest, dec port.Decision) {
 	if !hasReportStatus(req) {
 		return
 	}
-	refs := deniedRefs(req)
-	if err := EncodeReportStatusDeny(w, refs, dec); err != nil {
+	var buf bytes.Buffer
+	if err := EncodeReportStatusDeny(&buf, deniedRefs(req), dec); err != nil {
 		log.Printf("gitproto: encode report-status deny: %v", err)
+		return
 	}
+	switch sidebandType(req) {
+	case sideband.Sideband64k:
+		m := sideband.NewMuxer(sideband.Sideband64k, w)
+		if _, err := m.Write(buf.Bytes()); err != nil {
+			log.Printf("gitproto: mux report-status deny: %v", err)
+			return
+		}
+		// Terminate the sideband stream with a flush-pkt.
+		if _, err := w.Write([]byte("0000")); err != nil {
+			log.Printf("gitproto: flush sideband deny: %v", err)
+		}
+	case sideband.Sideband:
+		m := sideband.NewMuxer(sideband.Sideband, w)
+		if _, err := m.Write(buf.Bytes()); err != nil {
+			log.Printf("gitproto: mux report-status deny: %v", err)
+			return
+		}
+		if _, err := w.Write([]byte("0000")); err != nil {
+			log.Printf("gitproto: flush sideband deny: %v", err)
+		}
+	default:
+		if _, err := w.Write(buf.Bytes()); err != nil {
+			log.Printf("gitproto: write report-status deny: %v", err)
+		}
+	}
+}
+
+// sidebandType reports which sideband capability (if any) the agent advertised.
+// Returns sideband.Sideband64k for "side-band-64k", sideband.Sideband for
+// "side-band", and an invalid value (defaulted to plain) when neither is present.
+func sidebandType(req *ReceivePackRequest) sideband.Type {
+	for _, cmd := range req.Commands {
+		for _, cap := range cmd.Caps {
+			if cap == "side-band-64k" || strings.HasPrefix(cap, "side-band-64k=") {
+				return sideband.Sideband64k
+			}
+			if cap == "side-band" || strings.HasPrefix(cap, "side-band=") {
+				return sideband.Sideband
+			}
+		}
+	}
+	return sideband.Type(-1) // sentinel: no sideband
 }
 
 // agentName extracts the authenticated agent name from ctx, or "" when no
@@ -235,13 +284,16 @@ func deniedRefs(req *ReceivePackRequest) []string {
 	return refs
 }
 
-// hasReportStatus reports whether the agent's capabilities include report-status
-// (the structured channel the proxy uses to reject refs). Real git always
-// requests it; the rare client that does not gets a bare stream close.
+// hasReportStatus reports whether the agent's capabilities include a
+// report-status capability (the structured channel the proxy uses to reject
+// refs). Real git advertises "report-status" and/or "report-status-v2"; both
+// carry the "ng <ref> <reason>" line the proxy emits. A client that advertises
+// neither gets a bare stream close (the push fails without a structured reason).
 func hasReportStatus(req *ReceivePackRequest) bool {
 	for _, cmd := range req.Commands {
 		for _, cap := range cmd.Caps {
-			if cap == "report-status" || strings.HasPrefix(cap, "report-status=") {
+			if cap == "report-status" || strings.HasPrefix(cap, "report-status=") ||
+				cap == "report-status-v2" || strings.HasPrefix(cap, "report-status-v2=") {
 				return true
 			}
 		}
