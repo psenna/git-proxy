@@ -167,12 +167,12 @@ func TestRegistry_RegisterAndLookup(t *testing.T) {
 	// Use an isolated registry to avoid cross-test pollution with the global
 	// registry used by Resolve.
 	reg := NewRegistry()
-	reg.Register("stub", func() port.Rule { return allow("stub") })
+	reg.Register("stub", func(RuleConfig) port.Rule { return allow("stub") })
 	f, ok := reg.Lookup("stub")
 	if !ok {
 		t.Fatal("Lookup stub: not found")
 	}
-	if r := f(); r.Name() != "stub" {
+	if r := f(RuleConfig{}); r.Name() != "stub" {
 		t.Fatalf("factory produced %q, want stub", r.Name())
 	}
 	if _, ok := reg.Lookup("nope"); ok {
@@ -194,7 +194,7 @@ func TestResolve_UnknownRuleFailClosed(t *testing.T) {
 
 func TestResolve_AppliesAgentRepoFilter(t *testing.T) {
 	reg := NewRegistry()
-	reg.Register("deny_all", func() port.Rule { return deny("deny_all", "blocked") })
+	reg.Register("deny_all", func(RuleConfig) port.Rule { return deny("deny_all", "blocked") })
 
 	// deny_all enabled only for agent "agent-1"; agent "agent-2" should be
 	// exempt → request allowed.

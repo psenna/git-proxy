@@ -141,11 +141,13 @@ func errorMessage(err error) string {
 	return err.Error()
 }
 
-// RuleFactory constructs a fresh instance of a Rule. Factories let the engine
-// build per-request rule instances from a name keyed by config; a factory is
-// registered once (typically from an init() in the rule's package) and may be
-// invoked many times.
-type RuleFactory func() port.Rule
+// RuleFactory constructs a fresh instance of a Rule from its RuleConfig.
+// Factories let the engine build per-request rule instances from a name keyed
+// by config; a factory is registered once (typically from an init() in the
+// rule's package) and may be invoked many times. The config carries the rule's
+// Params block so the factory can decode rule-specific options (e.g. protected
+// refs or allowed branch patterns).
+type RuleFactory func(cfg RuleConfig) port.Rule
 
 // Registry maps rule names to factories. The zero-value Registry is empty and
 // ready to use. A package-level default registry is exposed via RegisterRule
@@ -192,11 +194,14 @@ func RegisterRule(name string, f RuleFactory) {
 
 // RuleConfig enables a named rule and optionally restricts it to a subset of
 // agents and/or repos. An empty Agents list means "all agents"; an empty Repos
-// list means "all repos".
+// list means "all repos". Params is the rule-specific configuration mirrored
+// verbatim from the YAML params block; a rule's factory decodes the keys it
+// understands (e.g. history_protect's "refs", branch_pattern's "allow").
 type RuleConfig struct {
-	Enabled bool     `yaml:"enabled"`
-	Agents  []string `yaml:"agents"`
-	Repos   []string `yaml:"repos"`
+	Enabled bool              `yaml:"enabled"`
+	Agents  []string          `yaml:"agents"`
+	Repos   []string          `yaml:"repos"`
+	Params  map[string]any    `yaml:"params"`
 }
 
 // PolicyConfig selects the evaluation mode and which rules are enabled for
@@ -235,7 +240,7 @@ func Resolve(cfg PolicyConfig, reg *Registry) (*Engine, error) {
 			return nil, fmt.Errorf("policy: rule %q enabled in config but not registered", name)
 		}
 		rc := cfg.Rules[name]
-		entry := ruleEntry{rule: f()}
+		entry := ruleEntry{rule: f(rc)}
 		if len(rc.Agents) > 0 {
 			entry.agents = make(map[string]struct{}, len(rc.Agents))
 			for _, a := range rc.Agents {

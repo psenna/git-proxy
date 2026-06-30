@@ -15,11 +15,13 @@ type PolicyConfig struct {
 }
 
 // RuleConfig enables a named rule and optionally restricts it to a subset of
-// agents and/or repos.
+// agents and/or repos. Params is the rule-specific configuration block decoded
+// as a generic map and forwarded verbatim to the rule's factory.
 type RuleConfig struct {
-	Enabled bool     `yaml:"enabled"`
-	Agents  []string `yaml:"agents"`
-	Repos   []string `yaml:"repos"`
+	Enabled bool           `yaml:"enabled"`
+	Agents  []string       `yaml:"agents"`
+	Repos   []string       `yaml:"repos"`
+	Params  map[string]any `yaml:"params"`
 }
 
 // ToPolicy converts the YAML-facing policy config into the engine's
@@ -35,6 +37,7 @@ func (p PolicyConfig) ToPolicy() policy.PolicyConfig {
 			Enabled: rc.Enabled,
 			Agents:  rc.Agents,
 			Repos:   rc.Repos,
+			Params:  rc.Params,
 		}
 	}
 	return policy.PolicyConfig{Mode: mode, Rules: rules}

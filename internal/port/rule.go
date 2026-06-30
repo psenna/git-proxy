@@ -37,15 +37,43 @@ type Decision struct {
 	Reasons []Reason
 }
 
+// RefUpdate describes a single ref update in a push (git-receive-pack command).
+// The fields are the structured metadata a pure rule needs to decide whether the
+// update is safe; the rule must not shell out to git to walk the DAG. Fast-forward
+// detection is computed by the enforcement path and passed in as the pre-computed
+// Force bool.
+type RefUpdate struct {
+	// Ref is the full ref name, e.g. "refs/heads/main".
+	Ref string
+	// Old is the object id the ref pointed to; zero value ("") for a ref creation.
+	Old string
+	// New is the object id the ref will point to; zero value ("") for a ref deletion.
+	New string
+	// Force is true if the update is a non-fast-forward (rewritten/non-FF history).
+	Force bool
+}
+
+// IsDelete reports whether the update deletes the ref.
+func (u RefUpdate) IsDelete() bool { return u.New == "" }
+
+// IsCreate reports whether the update creates a new ref.
+func (u RefUpdate) IsCreate() bool { return u.Old == "" && u.New != "" }
+
 // PushRequest describes a git push (git-receive-pack) operation to be evaluated
 // against the push rule set. Fields are added as later milestones wire richer
-// push context (refs, commits, blobs); the engine treats the request as opaque
-// and only forwards it to rules.
+// push context (commits, blobs); the engine treats the request as opaque and
+// only forwards it to rules. RefUpdates carries the per-ref metadata
+// (old/new ids, force flag) that push rules such as history_protect and
+// branch_pattern decide over; it may be empty for callers that do not yet
+// populate it.
 type PushRequest struct {
 	// Agent is the authenticated agent name (auth.AgentIdentity.Name).
 	Agent string
 	// Repo is the upstream repository path the push targets.
 	Repo string
+	// RefUpdates is the set of ref updates in this push. Rules iterate it to
+	// decide per-ref verdicts.
+	RefUpdates []RefUpdate
 }
 
 // FetchRequest describes a git fetch/clone (git-upload-pack) operation to be
