@@ -104,7 +104,9 @@ func (f *Frontend) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo s
 	defer func() { _ = resp.Body.Close() }()
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("httpfront: info/refs stream: %v", err)
+	}
 }
 
 // handleService streams a POST service (upload-pack / receive-pack) through the

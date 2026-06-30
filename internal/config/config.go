@@ -22,8 +22,8 @@ import (
 
 // Config is the parsed proxy configuration.
 type Config struct {
-	Listen   string         `yaml:"listen"`
-	Upstream UpstreamConfig `yaml:"upstream"`
+	Listen   string            `yaml:"listen"`
+	Upstream UpstreamConfig    `yaml:"upstream"`
 	Repos    map[string]string `yaml:"repos"`
 }
 
