@@ -71,6 +71,63 @@ func EnforceReceivePack(ctx context.Context, req *ReceivePackRequest, mirror *gi
 		Repo:       repo,
 		RefUpdates: updates,
 	}
+
+	// Populate the new-commits and changed-files context the push rules need
+	// (commit_message, path_acl, secret_scan). Fail-closed: ANY mirror
+	// extraction error yields a Deny carrying the error as a reason — the push
+	// is never allowed when its contents could not be inspected. Mirror errors
+	// are already redacted of upstream credentials by gitx.redactCreds.
+	shas, err := mirror.NewCommits(ctx, updates)
+	if err != nil {
+		return port.Decision{
+			Verdict: port.VerdictDeny,
+			Reasons: []port.Reason{{
+				Rule:    "enforcement",
+				Message: fmt.Sprintf("new-commit extraction failed: %v", err),
+			}},
+		}, err
+	}
+	for _, sha := range shas {
+		msg, err := mirror.CommitMessage(ctx, sha)
+		if err != nil {
+			return port.Decision{
+				Verdict: port.VerdictDeny,
+				Reasons: []port.Reason{{
+					Rule:    "enforcement",
+					Message: fmt.Sprintf("commit-message extraction failed for %s: %v", sha, err),
+				}},
+			}, err
+		}
+		pushReq.Commits = append(pushReq.Commits, port.Commit{SHA: sha, Message: msg})
+	}
+	files, err := mirror.ChangedFiles(ctx, updates)
+	if err != nil {
+		return port.Decision{
+			Verdict: port.VerdictDeny,
+			Reasons: []port.Reason{{
+				Rule:    "enforcement",
+				Message: fmt.Sprintf("changed-files extraction failed: %v", err),
+			}},
+		}, err
+	}
+	for i := range files {
+		if files[i].Status == "D" || files[i].BlobOID == "" {
+			continue
+		}
+		b, err := mirror.BlobContent(ctx, files[i].BlobOID)
+		if err != nil {
+			return port.Decision{
+				Verdict: port.VerdictDeny,
+				Reasons: []port.Reason{{
+					Rule:    "enforcement",
+					Message: fmt.Sprintf("blob-content extraction failed for %s: %v", files[i].Path, err),
+				}},
+			}, err
+		}
+		files[i].Content = b
+	}
+	pushReq.ChangedFiles = files
+
 	dec := eng.EvaluatePush(pushReq)
 	return dec, nil
 }
