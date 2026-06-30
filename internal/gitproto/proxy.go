@@ -110,7 +110,24 @@ func (p *Proxy) UploadPack(ctx context.Context, repo string, body io.Reader, w i
 // The agent identity is read from ctx (auth.FromContext); when auth is off the
 // agent name is "" and rules apply per their applicability logic.
 func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w io.Writer) error {
-	buf, err := io.ReadAll(body)
+	max := p.maxPackfileBytes
+	if max <= 0 {
+		max = DefaultMaxPackfileBytes
+	}
+	enforce := p.engine != nil && p.mirrorOpener != nil
+
+	// When enforcement is on, cap the read at max+1 bytes so a malicious agent
+	// cannot force an unbounded allocation before the size check runs. The +1
+	// lets us detect overflow: a body of exactly max+1 bytes was truncated. In
+	// passthrough mode the body is forwarded verbatim, so read it all.
+	var buf []byte
+	var err error
+	if enforce {
+		lr := &io.LimitedReader{R: body, N: max + 1}
+		buf, err = io.ReadAll(lr)
+	} else {
+		buf, err = io.ReadAll(body)
+	}
 	if err != nil {
 		return fmt.Errorf("gitproto: read receive-pack request: %w", err)
 	}
@@ -122,11 +139,29 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 	// Passthrough when enforcement is off (no engine or no mirror opener).
 	// This preserves the existing passthrough/auth behavior when policy is
 	// unconfigured.
-	if p.engine == nil || p.mirrorOpener == nil {
+	if !enforce {
 		return p.forwardReceivePack(ctx, repo, buf, w)
 	}
 
 	// --- Enforcement on ---
+	// Oversized: deny fail-closed without forwarding. The request header
+	// (commands + capabilities + flush) is small relative to max, so a
+	// truncated body still parses and the report-status reject is emitted; a
+	// pathological tiny max that breaks parsing falls through to the
+	// unparseable branch below (still no forward).
+	if int64(len(buf)) > max {
+		dec := port.Decision{
+			Verdict: port.VerdictDeny,
+			Reasons: []port.Reason{{Rule: "enforcement",
+				Message: "push rejected: packfile too large"}},
+		}
+		log.Printf("gitproto: receive-pack deny: oversize %d > %d for repo %q", len(buf), max, repo)
+		if req != nil {
+			p.writeDenyResponse(w, req, dec)
+		}
+		return nil
+	}
+
 	// Fail-closed on an unparseable request: without commands/refs the proxy
 	// cannot compute a decision, so it must not forward. There is no
 	// structured report-status channel (no parsed capabilities), so close the
@@ -134,20 +169,6 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 	// requests, so this is an edge case.
 	if perr != nil || req == nil {
 		log.Printf("gitproto: receive-pack deny: unparseable request for repo %q: %v", repo, perr)
-		return nil
-	}
-	max := p.maxPackfileBytes
-	if max <= 0 {
-		max = DefaultMaxPackfileBytes
-	}
-	if int64(len(buf)) > max {
-		dec := port.Decision{
-			Verdict: port.VerdictDeny,
-			Reasons: []port.Reason{{Rule: "enforcement",
-				Message: fmt.Sprintf("push rejected: request size %d bytes exceeds max %d", len(buf), max)}},
-		}
-		log.Printf("gitproto: receive-pack deny: oversize %d > %d for repo %q", len(buf), max, repo)
-		p.writeDenyResponse(w, req, dec)
 		return nil
 	}
 

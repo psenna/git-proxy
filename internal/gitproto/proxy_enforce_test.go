@@ -3,6 +3,7 @@ package gitproto_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -239,6 +240,78 @@ func buildPushRequestWithNew(t *testing.T, ref, newSHA string, pack []byte) []by
 		buf.Write(pack)
 	}
 	return buf.Bytes()
+}
+
+// countingReader counts the bytes consumed from an underlying reader, so a test
+// can assert the proxy stopped reading early (LimitedReader) rather than
+// buffering an entire oversized body.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// TestProxyReceivePack_OversizeLimitedRead streams a body far larger than the
+// configured cap through a fake upstream and asserts the proxy:
+//   - denies the push fail-closed (report-status ng line),
+//   - does NOT forward to the fake upstream,
+//   - does NOT open the inspection mirror (the size check fires first), and
+//   - stops reading after at most max+1 bytes (LimitedReader), so a malicious
+//     huge body cannot force a huge allocation before rejection.
+func TestProxyReceivePack_OversizeLimitedRead(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	ref := "refs/heads/feat/x"
+	// Build a parseable create request (header + flush, no pack) then append a
+	// padding much larger than the cap. The header is small (~120 bytes) so it
+	// fits within cap+1 and the request still parses when truncated.
+	header := buildPushRequestWithNew(t, ref, strings.Repeat("1", 40), nil)
+	const capBytes int64 = 1024
+	padding := bytes.Repeat([]byte("X"), 4<<20) // 4 MiB
+	fullBody := append(header, padding...)
+
+	// The mirror opener must never be called: the oversize deny fires first.
+	openerCalled := false
+	opener := func(ctx context.Context, repo string) (*gitx.Mirror, error) {
+		openerCalled = true
+		return nil, fmt.Errorf("mirror opener must not be called on oversize deny")
+	}
+
+	up := &fakeUpstream{resp: cannedReceivePackResponse(t, ref)}
+	eng := enforceEngine(t, map[string]map[string]any{
+		"branch_pattern": {"allow": []string{"refs/heads/feat/*"}},
+	})
+	proxy := gitproto.New(up)
+	proxy.SetEnforcement(eng, opener, capBytes)
+
+	cr := &countingReader{r: bytes.NewReader(fullBody)}
+	var out bytes.Buffer
+	if err := proxy.ReceivePack(ctx, "repo.git", cr, &out); err != nil {
+		t.Fatalf("ReceivePack: %v", err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("ng "+ref+" ")) {
+		t.Fatalf("oversize deny response missing ng line; got %x", out.Bytes())
+	}
+	if len(up.forwarded) != 0 {
+		t.Fatalf("oversized push was forwarded (%d bytes); want 0", len(up.forwarded))
+	}
+	if openerCalled {
+		t.Fatal("mirror opener was called on an oversized push; the size check must fire first")
+	}
+	// The LimitedReader must have stopped reading at cap+1 bytes, not consumed
+	// the whole 4 MiB body.
+	if cr.n > capBytes+1 {
+		t.Fatalf("proxy read %d bytes from the body; want at most cap+1=%d (LimitedReader must cap the read)", cr.n, capBytes+1)
+	}
+	if cr.n >= int64(len(fullBody)) {
+		t.Fatalf("proxy read the entire %d-byte body; want it to stop early", len(fullBody))
+	}
 }
 
 // TestProxyReceivePack_DenyReasonExcludesUpstreamCreds forces a mirror-open
