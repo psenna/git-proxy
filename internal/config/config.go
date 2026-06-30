@@ -26,6 +26,7 @@ type Config struct {
 	Upstream UpstreamConfig    `yaml:"upstream"`
 	Repos    map[string]string `yaml:"repos"`
 	Auth     AuthConfig        `yaml:"auth"`
+	Policy   PolicyConfig      `yaml:"policy"`
 }
 
 // UpstreamConfig describes the upstream git server the proxy forwards to.
