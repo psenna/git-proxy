@@ -18,16 +18,15 @@ jobs:
         with:
           go-version: "1.26"
           cache: false
+      - name: install golangci-lint
+        # Build golangci-lint from source with the CI Go toolchain. The
+        # prebuilt v1.64.8 binary is built with go1.24 and cannot typecheck
+        # go1.25+ stdlib files; GOTOOLCHAIN=local prevents `go install` from
+        # downloading go1.24 per v1.64.8's toolchain directive. Pin v1.64.8
+        # to keep the v1 .golangci.yml config format.
+        run: GOTOOLCHAIN=local go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          # Build from source with the CI Go toolchain so the linter's
-          # typechecker can parse the current stdlib. The prebuilt v1.64.8
-          # binary is built with go1.24 and cannot typecheck go1.25+ stdlib
-          # files. Pin v1.64.8 to keep the v1 .golangci.yml config format.
-          version: v1.64.8
-          install-mode: source
-          args: --timeout 5m
+        run: golangci-lint run --timeout 5m
 
   build:
     name: build

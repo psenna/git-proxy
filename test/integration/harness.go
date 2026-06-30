@@ -20,7 +20,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/psenna/git-proxy/internal/transport/http"
+	httpfront "github.com/psenna/git-proxy/internal/transport/http"
 	"github.com/psenna/git-proxy/internal/upstream/plain"
 )
 
