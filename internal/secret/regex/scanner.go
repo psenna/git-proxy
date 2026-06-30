@@ -6,6 +6,7 @@
 package regex
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"regexp"
@@ -76,7 +77,15 @@ func New(extra []Pattern) (*Scanner, error) {
 // Scan implements port.SecretScanner. It scans content line-by-line for the
 // default and extra patterns plus a high-entropy heuristic. Findings carry the
 // 1-based line number and a REDACTED snippet (the matched secret is masked).
+//
+// Binary content is skipped: a NUL byte is the standard heuristic for a binary
+// file (PNGs, compiled artifacts, etc.), and binary blobs contain long
+// base64-ish runs above the entropy threshold that would yield false-positive
+// high-entropy findings and block legitimate binary pushes.
 func (s *Scanner) Scan(path string, content []byte) []port.SecretFinding {
+	if bytes.IndexByte(content, 0) >= 0 {
+		return nil
+	}
 	var findings []port.SecretFinding
 	// Iterate line-by-line so line numbers and snippets are naturally bounded
 	// to the matching line.

@@ -114,3 +114,35 @@ func TestScanner_PureDeterministic(t *testing.T) {
 		}
 	}
 }
+
+func TestScanner_SkipsBinaryBlobs(t *testing.T) {
+	// A binary blob (NUL byte present) containing a long high-entropy run must
+	// yield NO finding; the same run in a text file must still be flagged so
+	// the entropy heuristic stays effective for text.
+	sc, _ := regex.New(nil)
+	// 60-char base64-ish run: well above the 40-char entropy-run threshold and
+	// high-entropy enough to trip the heuristic.
+	run := "Z9hJ4kL2mN7pQ1rS3tU5vW0xY6aB8cD4eF7gH2iJ3kL6mN9oP0qR"
+	binary := append([]byte("header\n"), []byte(run)...)
+	binary = append(binary, 0, '\n')   // NUL byte => binary
+	binary = append(binary, []byte(run)...)
+
+	if got := sc.Scan("artifact.bin", binary); len(got) != 0 {
+		t.Fatalf("binary blob got findings: %+v", got)
+	}
+
+	text := []byte("header\n" + run + "\n")
+	got := sc.Scan("config.txt", text)
+	if len(got) == 0 {
+		t.Fatalf("text with same high-entropy run got no finding; want at least one")
+	}
+	var sawEntropy bool
+	for _, f := range got {
+		if f.Rule == "high-entropy" {
+			sawEntropy = true
+		}
+	}
+	if !sawEntropy {
+		t.Fatalf("text run did not trip high-entropy; got %+v", got)
+	}
+}
