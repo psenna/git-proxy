@@ -1,11 +1,15 @@
 package integration
 
 import (
+	"bytes"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/psenna/git-proxy/internal/gitproto/pktline"
 	"github.com/psenna/git-proxy/internal/port"
 )
 
@@ -124,21 +128,39 @@ func TestAuth_InvalidTokenRejected(t *testing.T) {
 	}
 }
 
-// assertCredsIsolated verifies the upstream vault credentials never reached the
-// agent's git environment or the clone's git config. The proxy holds the vault;
-// the agent only ever holds its own bearer token.
+// assertCredsIsolated verifies the upstream vault credentials never reach the
+// agent. The proxy holds the vault and attaches it only on the proxy→upstream
+// leg (proven by TestUpstream_AttachesVaultCreds); the agent only ever holds its
+// own bearer token.
+//
+// The real, falsifiable check below drives the proxy→client leg directly: it
+// issues authenticated requests to the proxy's /info/refs and /git-upload-pack
+// endpoints and asserts the upstream secret appears NOWHERE in the bytes the
+// proxy returns to the client (response body AND headers). If the proxy ever
+// leaked the credential into a response — by forwarding an upstream header that
+// echoed it, by including it in an error message, or by any other path — this
+// assertion would fail.
 func assertCredsIsolated(t *testing.T, h *Harness, cloneDir string) {
 	t.Helper()
-	// The agent's git process env must not contain the upstream password.
-	// h.Git builds the env from os.Environ(); the only proxy-derived secret it
-	// carries is the agent token (http.extraHeader). Re-run a no-op git command
-	// and inspect the env we would have passed.
-	cmd := h.Git(cloneDir, "config", "--get", "user.name")
-	for _, env := range cmd.Env {
-		if strings.Contains(env, upstreamSecret) {
-			t.Errorf("agent process env contains upstream secret: %q", env)
-		}
+
+	// 1. Ref advertisement (proxy→client for /info/refs). The body is the
+	//    upload-pack ref advertisement; it must not contain the secret.
+	infoRefsBody := proxyGetBody(t, h, "/test.git/info/refs?service=git-upload-pack")
+	if bytes.Contains(infoRefsBody, []byte(upstreamSecret)) {
+		t.Errorf("proxy→client /info/refs response body contains upstream secret:\n%s", infoRefsBody)
 	}
+
+	// 2. Upload-pack stream (proxy→client for /git-upload-pack). Build a real
+	//    upload-pack request with the upstream tip as the want, POST it through
+	//    the proxy, and assert the packfile/stream the client receives carries
+	//    no secret. This exercises the full client→proxy→upstream→proxy→client
+	//    round trip with Basic auth attached on the proxy→upstream leg only.
+	want := h.UpstreamRef(t, "refs/heads/main")
+	uploadPackBody := proxyUploadPackBody(t, h, want)
+	if bytes.Contains(uploadPackBody, []byte(upstreamSecret)) {
+		t.Errorf("proxy→client /git-upload-pack response body contains upstream secret:\n%s", uploadPackBody)
+	}
+
 	// The clone's git config must not contain the upstream password. (The
 	// insteadOf rewrite and the extraHeader hold the agent token and the proxy
 	// URL — never the upstream creds.)
@@ -159,4 +181,91 @@ func assertCredsIsolated(t *testing.T, h *Harness, cloneDir string) {
 	if h.Token == upstreamSecret {
 		t.Error("agent token equals upstream password; secrets are not distinct")
 	}
+}
+
+// proxyGetBody issues an authenticated GET to the proxy for repoPath and returns
+// the full response body. It fails the test if the proxy does not return 200.
+func proxyGetBody(t *testing.T, h *Harness, repoPath string) []byte {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, h.ProxyURL+"/"+repoPath, nil)
+	if err != nil {
+		t.Fatalf("build GET %s: %v", repoPath, err)
+	}
+	if h.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+h.Token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", repoPath, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read GET %s body: %v", repoPath, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s: status = %d, want 200; body:\n%s", repoPath, resp.StatusCode, body)
+	}
+	// The response headers are also proxy→client bytes; check them too.
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			if strings.Contains(v, upstreamSecret) {
+				t.Errorf("proxy→client /info/refs response header %s contains upstream secret: %q", k, v)
+			}
+		}
+	}
+	return body
+}
+
+// proxyUploadPackBody issues an authenticated upload-pack POST to the proxy for
+// "test.git", asking for the given want SHA, and returns the full response body
+// the proxy streams back to the client (NAK + packfile). It fails the test if
+// the proxy does not return 200.
+func proxyUploadPackBody(t *testing.T, h *Harness, want string) []byte {
+	t.Helper()
+	// Build a protocol-v0 upload-pack request: a single want (carrying
+	// capabilities), a flush, a done, and a final flush.
+	var reqBody bytes.Buffer
+	enc := pktline.NewEncoder(&reqBody)
+	if err := enc.EncodeString("want " + want + " ofs-delta no-progress side-band-64k\n"); err != nil {
+		t.Fatalf("encode want: %v", err)
+	}
+	if err := enc.Flush(); err != nil {
+		t.Fatalf("flush after wants: %v", err)
+	}
+	if err := enc.EncodeString("done\n"); err != nil {
+		t.Fatalf("encode done: %v", err)
+	}
+	if err := enc.Flush(); err != nil {
+		t.Fatalf("flush after done: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, h.ProxyURL+"/test.git/git-upload-pack", &reqBody)
+	if err != nil {
+		t.Fatalf("build upload-pack POST: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
+	if h.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+h.Token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST git-upload-pack: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read upload-pack body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST git-upload-pack: status = %d, want 200; body:\n%s", resp.StatusCode, body)
+	}
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			if strings.Contains(v, upstreamSecret) {
+				t.Errorf("proxy→client upload-pack response header %s contains upstream secret: %q", k, v)
+			}
+		}
+	}
+	return body
 }
