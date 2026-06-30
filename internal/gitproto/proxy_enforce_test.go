@@ -165,6 +165,98 @@ func TestProxyReceivePack_DenyWritesReportStatusNoForward(t *testing.T) {
 	}
 }
 
+// TestProxyReceivePack_DenySideband64kMuxed advertises side-band-64k and asserts
+// the report-status deny is multiplexed over sideband channel 1 (each Data
+// pkt-line payload begins with 0x01) and the sideband stream is terminated by an
+// outer flush-pkt 0000. This pins the muxing format independent of real git
+// (proxy_enforce_test.go otherwise only advertises report-status, leaving the
+// side-band branch covered by the integration test alone).
+func TestProxyReceivePack_DenySideband64kMuxed(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	ref := "refs/heads/main"
+	dir, tips := enforceSourceRepo(t, 1)
+	tip := tips[0]
+	bareRoot := t.TempDir()
+	bare := bareRoot + "/repo.git"
+	mustGit(t, "", "init", "--bare", "-q", "-b", "main", bare)
+	mustGit(t, dir, "push", "-q", "file://"+bare, "main")
+	testBareRoot = bareRoot
+
+	pack := packObjects(t, dir, tip)
+	// Build the request advertising BOTH report-status and side-band-64k.
+	var buf bytes.Buffer
+	e := pktline.NewEncoder(&buf)
+	line := strings.Repeat("0", 40) + " " + tip + " " + ref + "\x00report-status side-band-64k\n"
+	if err := e.EncodeString(line); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if err := e.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if pack != nil {
+		buf.Write(pack)
+	}
+	body := buf.Bytes()
+
+	up := &fakeUpstream{resp: cannedReceivePackResponse(t, ref)}
+	eng := enforceEngine(t, map[string]map[string]any{
+		"branch_pattern": {"allow": nil}, // empty allow list denies all
+	})
+	proxy := gitproto.New(up)
+	proxy.SetEnforcement(eng, testMirrorOpener(t), 1<<28)
+
+	var out bytes.Buffer
+	if err := proxy.ReceivePack(ctx, "repo.git", bytes.NewReader(body), &out); err != nil {
+		t.Fatalf("ReceivePack: %v", err)
+	}
+	if len(up.forwarded) != 0 {
+		t.Fatalf("upstream received %d bytes on a denied push; want 0", len(up.forwarded))
+	}
+
+	// Parse the outer pkt-line stream. Every Data frame must be sideband
+	// channel 1 (payload[0] == 0x01); the demuxed content is the report-status.
+	// The stream ends with exactly one outer flush-pkt.
+	s := pktline.NewScanner(bytes.NewReader(out.Bytes()))
+	var demuxed bytes.Buffer
+	sawData, flushCount := false, 0
+	for s.Scan() {
+		switch s.Marker() {
+		case pktline.Data:
+			sawData = true
+			payload := s.Bytes()
+			if len(payload) == 0 || payload[0] != 0x01 {
+				t.Fatalf("sideband frame not channel-1 (0x01); got %x", payload)
+			}
+			demuxed.Write(payload[1:])
+		case pktline.Flush:
+			flushCount++
+		default:
+			t.Fatalf("unexpected pkt-line marker %v in sideband deny output", s.Marker())
+		}
+	}
+	if err := s.Err(); err != nil {
+		t.Fatalf("scan sideband deny output: %v", err)
+	}
+	if !sawData {
+		t.Fatalf("no sideband data frames in output; got %x", out.Bytes())
+	}
+	if flushCount != 1 {
+		t.Fatalf("expected exactly one outer flush-pkt, got %d; output %x", flushCount, out.Bytes())
+	}
+	if !bytes.HasSuffix(out.Bytes(), []byte("0000")) {
+		t.Fatalf("sideband output not terminated by outer flush-pkt 0000; got %x", out.Bytes())
+	}
+	// The demuxed (channel-1) content is the report-status: unpack ok + ng ref.
+	if !bytes.Contains(demuxed.Bytes(), []byte("unpack ok")) {
+		t.Fatalf("demuxed report-status missing unpack ok; got %x", demuxed.Bytes())
+	}
+	if !bytes.Contains(demuxed.Bytes(), []byte("ng "+ref+" ")) {
+		t.Fatalf("demuxed report-status missing ng line for %s; got %x", ref, demuxed.Bytes())
+	}
+}
+
 // TestProxyReceivePack_OversizeDenies asserts a body exceeding the packfile
 // byte cap is denied (fail-closed, no OOM) and not forwarded.
 func TestProxyReceivePack_OversizeDenies(t *testing.T) {
