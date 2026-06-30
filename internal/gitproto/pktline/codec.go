@@ -49,9 +49,9 @@ var (
 	ErrInvalidPktLen = errors.New("invalid pkt-len")
 )
 
-// Raw pkt-line marker bytes.
+// Raw pkt-line marker bytes for delim and response-end (flush is written via
+// go-git's encoder).
 var (
-	flushPkt       = []byte("0000")
 	delimPkt       = []byte("0001")
 	responseEndPkt = []byte("0002")
 )
