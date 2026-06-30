@@ -276,20 +276,22 @@ func mustBare(t *testing.T, sourceDir string) string {
 
 func packObjects(t *testing.T, dir, tip string) []byte {
 	t.Helper()
+	// Pack the full object closure reachable from tip (commits, trees, blobs) so
+	// the mirror has everything the enforcement path's extraction methods need
+	// (commit messages, changed-file oids, blob contents) — mirroring what a
+	// real client push sends.
+	revList := exec.Command("git", "-C", dir, "rev-list", "--objects", tip)
+	var revOut bytes.Buffer
+	revList.Stdout = &revOut
+	if err := revList.Run(); err != nil {
+		t.Fatalf("rev-list --objects: %v", err)
+	}
 	cmd := exec.Command("git", "-C", dir, "pack-objects", "--stdout")
-	cmd.Stdin = strings.NewReader(tip + "\n")
+	cmd.Stdin = &revOut
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("pack-objects: %v", err)
-	}
-	if out.Len() == 0 {
-		cmd = exec.Command("git", "-C", dir, "pack-objects", "--stdout", "--revs")
-		cmd.Stdin = strings.NewReader("--" + tip + "\n")
-		cmd.Stdout = &out
-		if err := cmd.Run(); err != nil {
-			t.Fatalf("pack-objects --revs: %v", err)
-		}
 	}
 	if out.Len() == 0 {
 		t.Fatalf("pack-objects produced no bytes for tip %s", tip)

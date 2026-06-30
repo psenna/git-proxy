@@ -71,6 +71,56 @@ func EnforceReceivePack(ctx context.Context, req *ReceivePackRequest, mirror *gi
 		Repo:       repo,
 		RefUpdates: updates,
 	}
+
+	// Populate the new-commits and changed-files context the push rules need
+	// (commit_message, path_acl, secret_scan). Fail-closed: ANY mirror
+	// extraction error yields a Deny carrying the error as a reason — the push
+	// is never allowed when its contents could not be inspected. Mirror errors
+	// are already redacted of upstream credentials by gitx.redactCreds.
+	//
+	// Commit SHAs + messages are fetched in a SINGLE git invocation under ONE
+	// lock acquisition (Mirror.NewCommitMessages) rather than one
+	// NewCommits + one CommitMessage call per commit, so a push introducing
+	// many commits does not churn the per-mirror mutex.
+	commits, err := mirror.NewCommitMessages(ctx, updates)
+	if err != nil {
+		return port.Decision{
+			Verdict: port.VerdictDeny,
+			Reasons: []port.Reason{{
+				Rule:    "enforcement",
+				Message: fmt.Sprintf("commit extraction failed: %v", err),
+			}},
+		}, err
+	}
+	pushReq.Commits = commits
+	files, err := mirror.ChangedFiles(ctx, updates)
+	if err != nil {
+		return port.Decision{
+			Verdict: port.VerdictDeny,
+			Reasons: []port.Reason{{
+				Rule:    "enforcement",
+				Message: fmt.Sprintf("changed-files extraction failed: %v", err),
+			}},
+		}, err
+	}
+	for i := range files {
+		if files[i].Status == "D" || files[i].BlobOID == "" {
+			continue
+		}
+		b, err := mirror.BlobContent(ctx, files[i].BlobOID)
+		if err != nil {
+			return port.Decision{
+				Verdict: port.VerdictDeny,
+				Reasons: []port.Reason{{
+					Rule:    "enforcement",
+					Message: fmt.Sprintf("blob-content extraction failed for %s: %v", files[i].Path, err),
+				}},
+			}, err
+		}
+		files[i].Content = b
+	}
+	pushReq.ChangedFiles = files
+
 	dec := eng.EvaluatePush(pushReq)
 	return dec, nil
 }

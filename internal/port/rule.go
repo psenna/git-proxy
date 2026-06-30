@@ -59,13 +59,37 @@ func (u RefUpdate) IsDelete() bool { return u.New == "" }
 // IsCreate reports whether the update creates a new ref.
 func (u RefUpdate) IsCreate() bool { return u.Old == "" && u.New != "" }
 
+// Commit is a commit introduced by a push, with the metadata the rules need.
+type Commit struct {
+	// SHA is the 40-char object id of the commit.
+	SHA string
+	// Message is the full commit message (subject + body).
+	Message string
+}
+
+// ChangedFile is a file touched by a push. Content is the new blob's bytes for
+// Added/Modified files; nil for Deleted. Bounded by the push's packfile size.
+type ChangedFile struct {
+	// Path is the repo-relative path of the file.
+	Path string
+	// Status is "A" (added), "M" (modified), or "D" (deleted).
+	Status string
+	// BlobOID is the new blob oid for A/M; "" for D.
+	BlobOID string
+	// Content is the new blob content for A/M; nil for D.
+	Content []byte
+}
+
 // PushRequest describes a git push (git-receive-pack) operation to be evaluated
 // against the push rule set. Fields are added as later milestones wire richer
 // push context (commits, blobs); the engine treats the request as opaque and
 // only forwards it to rules. RefUpdates carries the per-ref metadata
 // (old/new ids, force flag) that push rules such as history_protect and
 // branch_pattern decide over; it may be empty for callers that do not yet
-// populate it.
+// populate it. Commits and ChangedFiles carry the new commits and touched
+// blobs introduced across all ref updates, populated fail-closed by the
+// enforcement path from the inspection mirror; they are empty for a
+// delete-only push and may be empty for callers that do not populate them.
 type PushRequest struct {
 	// Agent is the authenticated agent name (auth.AgentIdentity.Name).
 	Agent string
@@ -74,6 +98,12 @@ type PushRequest struct {
 	// RefUpdates is the set of ref updates in this push. Rules iterate it to
 	// decide per-ref verdicts.
 	RefUpdates []RefUpdate
+	// Commits is the set of new commits introduced across all ref updates
+	// (deduped by SHA). commit_message and similar rules inspect it.
+	Commits []Commit
+	// ChangedFiles is the set of files added/modified/deleted across all ref
+	// updates (deduped by path+status+oid). path_acl and secret_scan inspect it.
+	ChangedFiles []ChangedFile
 }
 
 // FetchRequest describes a git fetch/clone (git-upload-pack) operation to be
@@ -83,6 +113,11 @@ type FetchRequest struct {
 	Agent string
 	// Repo is the upstream repository path being read.
 	Repo string
+	// Paths is the set of repo-relative file paths the fetch is requesting.
+	// Populated by the read-protection path (Task 9); empty when no path-level
+	// filtering applies. path_acl.EvaluateFetch denies a fetch that requests a
+	// denied path.
+	Paths []string
 }
 
 // Rule evaluates a single push or fetch request and returns a Decision plus an

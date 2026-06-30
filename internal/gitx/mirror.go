@@ -185,3 +185,226 @@ func (m *Mirror) IsAncestor(ctx context.Context, old, new string) (bool, error) 
 
 // Dir returns the mirror's bare repo path (for tests/inspection only).
 func (m *Mirror) Dir() string { return m.dir }
+
+// emptyTreeOID is git's well-known empty-tree object id, used as the diff base
+// for a ref creation (Old == "").
+const emptyTreeOID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+// NewCommits returns the SHAs of commits introduced by the push across the
+// given ref updates (old..new per update; create → all commits reachable from
+// new that are new to the mirror). Delete updates (New == "") contribute no
+// commits. Deduped (by construction via a single rev-list call) and in
+// rev-list order (newest first). The per-mirror mutex is held so the rev-list
+// does not race a concurrent Refresh/IngestPackfile.
+func (m *Mirror) NewCommits(ctx context.Context, updates []port.RefUpdate) ([]string, error) {
+	pos := make([]string, 0, len(updates))
+	for _, u := range updates {
+		if u.New != "" {
+			pos = append(pos, u.New)
+		}
+	}
+	if len(pos) == 0 {
+		return nil, nil
+	}
+	args := append([]string{"rev-list"}, pos...)
+	args = append(args, "--not", "--all")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out, err := runGit(ctx, m.dir, args...)
+	if err != nil {
+		return nil, fmt.Errorf("gitx: new commits: %w", err)
+	}
+	return splitCleanLines(out), nil
+}
+
+// CommitMessage returns the full commit message (subject + body) for sha via
+// `git show -s --format=%B`. The per-mirror mutex is held for serialization.
+func (m *Mirror) CommitMessage(ctx context.Context, sha string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out, err := runGit(ctx, m.dir, "show", "-s", "--format=%B", sha)
+	if err != nil {
+		return "", fmt.Errorf("gitx: commit message %s: %w", sha, err)
+	}
+	// %B emits the raw message followed by a trailing newline; trim it so the
+	// subject is the first line and the body follows naturally.
+	return strings.TrimRight(string(out), "\n"), nil
+}
+
+// NewCommitMessages returns the SHAs and full commit messages of the commits
+// introduced by the push across the given ref updates, in a SINGLE git
+// invocation under ONE lock acquisition. It replaces the per-commit
+// CommitMessage loop (one git call + one lock per commit) used by the
+// enforcement population path so a push introducing many commits does not
+// churn the per-mirror mutex. Delete updates (New == "") contribute no
+// commits. The result is in rev-list order (newest first), matching
+// NewCommits. The per-mirror mutex is held for the duration of the call.
+//
+// The format is `%H%x00%B%x00`: each commit emits `<SHA>\0<body>\0` and git
+// appends a newline after the entry, so the full output is
+// `SHA1\0body1\0\nSHA2\0body2\0\n`. Commit messages cannot contain NUL (git
+// rejects it), so NUL is a safe field/record separator. Bodies carry %B's
+// trailing newline; the message is trimmed of trailing newlines to match
+// CommitMessage.
+func (m *Mirror) NewCommitMessages(ctx context.Context, updates []port.RefUpdate) ([]port.Commit, error) {
+	pos := make([]string, 0, len(updates))
+	for _, u := range updates {
+		if u.New != "" {
+			pos = append(pos, u.New)
+		}
+	}
+	if len(pos) == 0 {
+		return nil, nil
+	}
+	args := append([]string{"log", "--format=%H%x00%B%x00"}, pos...)
+	args = append(args, "--not", "--all")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out, err := runGit(ctx, m.dir, args...)
+	if err != nil {
+		return nil, fmt.Errorf("gitx: new commit messages: %w", err)
+	}
+	return parseCommitMessages(out), nil
+}
+
+// parseCommitMessages parses the output of `git log --format=%H%x00%B%x00`.
+// Each commit record is `<SHA>\0<body>\0` with git appending a newline after
+// each entry, so splitting on NUL yields parts = [SHA1, body1, "\nSHA2", body2,
+// ..., "\n"]. SHAs after the first carry a leading "\n" (git's appended
+// newline); the trailing "\n" after the last body is the final lone part.
+func parseCommitMessages(out []byte) []port.Commit {
+	if len(out) == 0 {
+		return nil
+	}
+	parts := strings.Split(string(out), "\x00")
+	var commits []port.Commit
+	for i := 0; i+1 < len(parts); i += 2 {
+		sha := strings.TrimPrefix(parts[i], "\n")
+		commits = append(commits, port.Commit{
+			SHA:     sha,
+			Message: strings.TrimRight(parts[i+1], "\n"),
+		})
+	}
+	return commits
+}
+
+// ChangedFiles returns the files added/modified/deleted across the push, per
+// update `git diff --raw --no-renames old new` (create → diff against the empty
+// tree). Delete updates (New == "") contribute no files. Deduped by
+// (path, status, oid). The per-mirror mutex is held for serialization.
+func (m *Mirror) ChangedFiles(ctx context.Context, updates []port.RefUpdate) ([]port.ChangedFile, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	seen := make(map[string]struct{})
+	var files []port.ChangedFile
+	for _, u := range updates {
+		if u.New == "" {
+			// Delete-only update: no changed files (a delete-only push yields an
+			// empty ChangedFiles set; history_protect handles ref deletion).
+			continue
+		}
+		old := u.Old
+		if old == "" {
+			old = emptyTreeOID
+		}
+		out, err := runGit(ctx, m.dir, "diff", "--raw", "--no-renames", old, u.New)
+		if err != nil {
+			return nil, fmt.Errorf("gitx: changed files %s..%s: %w", old, u.New, err)
+		}
+		for _, cf := range parseRawDiff(out) {
+			key := cf.Path + "\x00" + cf.Status + "\x00" + cf.BlobOID
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			files = append(files, cf)
+		}
+	}
+	return files, nil
+}
+
+// BlobContent returns the bytes of blob oid via `git cat-file blob`. The
+// per-mirror mutex is held for serialization.
+func (m *Mirror) BlobContent(ctx context.Context, oid string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out, err := runGit(ctx, m.dir, "cat-file", "blob", oid)
+	if err != nil {
+		return nil, fmt.Errorf("gitx: blob content %s: %w", oid, err)
+	}
+	return out, nil
+}
+
+// parseRawDiff parses `git diff --raw --no-renames` output lines into
+// ChangedFile values. Each line has the form:
+//
+//	:<srcmode> <dstmode> <srcsha> <dstsha> <status>\t<path>
+//
+// with the all-zero oid for added/deleted sides. Malformed lines are skipped
+// (fail-safe).
+func parseRawDiff(out []byte) []port.ChangedFile {
+	var files []port.ChangedFile
+	for _, line := range splitCleanLines(out) {
+		// Split off the path after the tab; the header before the tab carries
+		// the modes/oids/status.
+		tab := strings.IndexByte(line, '\t')
+		if tab < 0 {
+			continue
+		}
+		header, path := line[:tab], line[tab+1:]
+		if path == "" {
+			continue
+		}
+		fields := strings.Fields(header)
+		// fields: [":<srcmode>", "<dstmode>", "<srcsha>", "<dstsha>", "<status>"]
+		if len(fields) < 5 {
+			continue
+		}
+		status := fields[4]
+		dstOID := fields[3]
+		// Normalize the all-zero oid (added/deleted side) to "".
+		if isZeroOID(dstOID) {
+			dstOID = ""
+		}
+		// Map git status letters to the A/M/D vocabulary; anything else is
+		// skipped (renames are disabled via --no-renames, so only A/M/D/T arise;
+		// T (type change) is treated as M for rule purposes).
+		switch status {
+		case "A":
+			status = "A"
+		case "M", "T":
+			status = "M"
+		case "D":
+			status = "D"
+			dstOID = ""
+		default:
+			continue
+		}
+		files = append(files, port.ChangedFile{Path: path, Status: status, BlobOID: dstOID})
+	}
+	return files
+}
+
+// isZeroOID reports whether s is the 40-zero object id git uses for absent
+// sides of a diff.
+func isZeroOID(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for i := 0; i < 40; i++ {
+		if s[i] != '0' {
+			return false
+		}
+	}
+	return true
+}
+
+// splitCleanLines splits stdout on newlines, dropping empty trailing lines.
+func splitCleanLines(out []byte) []string {
+	s := strings.TrimRight(string(out), "\n")
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "\n")
+}
