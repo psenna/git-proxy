@@ -70,26 +70,91 @@ func TestPathACL_EmptyDenyAllowsAll(t *testing.T) {
 	})
 }
 
-func TestPathACL_MalformedPatternDropped(t *testing.T) {
-	// A malformed deny pattern is dropped (fail-safe, never matches). The good
-	// pattern still applies.
+func TestPathACL_BlankPatternIsNoOp(t *testing.T) {
+	// A blank deny pattern (empty string) is "nothing configured", not
+	// malformed: it is dropped as a no-op and does NOT trigger fail-closed.
+	// Combined with a good pattern, the good pattern still applies and a blank
+	// pattern does not turn the rule into a deny-all.
+	rule := newPathACL(map[string]any{
+		"deny": []string{"", "secrets/**"},
+	})
+	ruletest.RunPush(t, rule, []ruletest.PushCase{
+		{
+			Name: "blank + good still denies secrets",
+			Req: port.PushRequest{ChangedFiles: []port.ChangedFile{
+				{Path: "secrets/x.key", Status: "A"},
+			}},
+			Want:       port.VerdictDeny,
+			WantReason: `push touches denied path "secrets/x.key" (matched pattern "secrets/**")`,
+		},
+		{
+			Name: "blank + good allows unrelated path",
+			Req: port.PushRequest{ChangedFiles: []port.ChangedFile{
+				{Path: "src/app.go", Status: "M"},
+			}},
+			Want: port.VerdictAllow,
+		},
+	})
+}
+
+func TestPathACL_MalformedPatternFailsClosed(t *testing.T) {
+	// A NON-empty malformed deny pattern is fail-closed: the rule stores a
+	// compile error and returns it from EvaluatePush so the engine denies
+	// rather than silently dropping the bad pattern and allowing the path.
+	// The bad pattern is named in the denial reason.
 	rule := newPathACL(map[string]any{
 		"deny": []string{"[unclosed", "secrets/**"},
 	})
 	ruletest.RunPush(t, rule, []ruletest.PushCase{
 		{
-			Name: "good pattern still denies",
-			Req: port.PushRequest{ChangedFiles: []port.ChangedFile{
-				{Path: "secrets/x.key", Status: "A"},
-			}},
-			Want: port.VerdictDeny,
-		},
-		{
-			Name: "malformed pattern does not deny unrelated path",
+			Name: "malformed deny denies unrelated path",
 			Req: port.PushRequest{ChangedFiles: []port.ChangedFile{
 				{Path: "src/app.go", Status: "M"},
 			}},
-			Want: port.VerdictAllow,
+			Want:       port.VerdictDeny,
+			WantReason: `path_acl: malformed deny pattern "[unclosed"`,
+		},
+		{
+			Name: "malformed deny denies even a matched secret path",
+			Req: port.PushRequest{ChangedFiles: []port.ChangedFile{
+				{Path: "secrets/x.key", Status: "A"},
+			}},
+			Want:       port.VerdictDeny,
+			WantReason: `path_acl: malformed deny pattern "[unclosed"`,
+		},
+	})
+}
+
+func TestPathACL_MalformedPatternFailsClosed_Fetch(t *testing.T) {
+	// Mirror of the push fail-closed test for EvaluateFetch: a malformed deny
+	// pattern yields a compile error the engine turns into a Deny naming the
+	// bad pattern, regardless of the requested path.
+	rule := newPathACL(map[string]any{
+		"deny": []string{"[unclosed", "secrets/**"},
+	})
+	ruletest.RunFetch(t, rule, []ruletest.FetchCase{
+		{
+			Name:       "malformed deny denies fetch of clean path",
+			Req:        port.FetchRequest{Agent: "x", Repo: "r", Paths: []string{"src/main.go"}},
+			Want:       port.VerdictDeny,
+			WantReason: `path_acl: malformed deny pattern "[unclosed"`,
+		},
+	})
+}
+
+func TestPathACL_BangPatternFailsClosed(t *testing.T) {
+	// An unsupported `!`-negation deny pattern is malformed and fail-closed.
+	rule := newPathACL(map[string]any{
+		"deny": []string{"!secrets"},
+	})
+	ruletest.RunPush(t, rule, []ruletest.PushCase{
+		{
+			Name: "negation deny pattern denies fail-closed",
+			Req: port.PushRequest{ChangedFiles: []port.ChangedFile{
+				{Path: "src/app.go", Status: "M"},
+			}},
+			Want:       port.VerdictDeny,
+			WantReason: `path_acl: malformed deny pattern "!secrets"`,
 		},
 	})
 }
