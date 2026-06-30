@@ -156,7 +156,7 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 		dec := port.Decision{
 			Verdict: port.VerdictDeny,
 			Reasons: []port.Reason{{Rule: "enforcement",
-				Message: fmt.Sprintf("push rejected: inspection mirror unavailable: %v", err)}},
+				Message: "push rejected: inspection mirror unavailable"}},
 		}
 		log.Printf("gitproto: receive-pack deny: mirror open for repo %q: %v", repo, err)
 		p.writeDenyResponse(w, req, dec)
@@ -166,7 +166,7 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 		dec := port.Decision{
 			Verdict: port.VerdictDeny,
 			Reasons: []port.Reason{{Rule: "enforcement",
-				Message: fmt.Sprintf("push rejected: inspection mirror refresh failed: %v", err)}},
+				Message: "push rejected: inspection mirror unavailable"}},
 		}
 		log.Printf("gitproto: receive-pack deny: mirror refresh for repo %q: %v", repo, err)
 		p.writeDenyResponse(w, req, dec)
@@ -178,7 +178,7 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 			dec := port.Decision{
 				Verdict: port.VerdictDeny,
 				Reasons: []port.Reason{{Rule: "enforcement",
-					Message: fmt.Sprintf("push rejected: packfile inspection failed: %v", err)}},
+					Message: "push rejected: inspection failed"}},
 			}
 			log.Printf("gitproto: receive-pack deny: ingest packfile for repo %q: %v", repo, err)
 			p.writeDenyResponse(w, req, dec)

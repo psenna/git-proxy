@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/psenna/git-proxy/internal/gitproto"
 	"github.com/psenna/git-proxy/internal/gitproto/pktline"
@@ -35,6 +36,17 @@ func (f *fakeUpstream) ReceivePack(ctx context.Context, repo string, body io.Rea
 	}
 	f.forwarded = b
 	return io.NopCloser(bytes.NewReader(f.resp)), nil
+}
+
+// fakeCredStore is a port.CredentialStore that always returns the same creds,
+// used to embed upstream credentials in a mirror's fetch URL for the
+// creds-isolation deny-reason test.
+type fakeCredStore struct {
+	username, password string
+}
+
+func (f fakeCredStore) CredentialsFor(repo string) (port.Credentials, bool) {
+	return port.Credentials{Username: f.username, Password: f.password}, true
 }
 
 // testBareRoot is set by tests so the mirror opener can find the upstream bare
@@ -227,4 +239,63 @@ func buildPushRequestWithNew(t *testing.T, ref, newSHA string, pack []byte) []by
 		buf.Write(pack)
 	}
 	return buf.Bytes()
+}
+
+// TestProxyReceivePack_DenyReasonExcludesUpstreamCreds forces a mirror-open
+// failure against an unreachable credentialed upstream URL and asserts the
+// agent-facing report-status deny reason contains NEITHER the upstream username
+// NOR the password. This pins the binding invariant: the agent never sees
+// upstream credentials. The full error (with any redacted stderr) is logged
+// server-side only.
+func TestProxyReceivePack_DenyReasonExcludesUpstreamCreds(t *testing.T) {
+	gitBinary(t)
+	// Bound the real git clone attempt so a hung connection cannot stall CI;
+	// connection-refused on 127.0.0.1:1 returns near-instantly in practice.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const (
+		upstreamUser = "ci-leak-bot"
+		upstreamPass = "do-not-leak-upstream-PW-xyz"
+	)
+	ref := "refs/heads/feat/x"
+	// Minimal parseable create command (no pack); the mirror open fails before
+	// any pack inspection, so the new SHA need not exist.
+	body := buildPushRequestWithNew(t, ref, strings.Repeat("1", 40), nil)
+
+	// Mirror opener points at an unreachable HTTP endpoint with embedded creds.
+	// gitx.Open will attempt `git clone --mirror` and fail; git echoes the URL
+	// (redacting only the password) into stderr. The proxy must surface a GENERIC
+	// reason and never the credentialed URL.
+	credOpener := func(ctx context.Context, repo string) (*gitx.Mirror, error) {
+		return gitx.Open(ctx, "http://127.0.0.1:1", repo, t.TempDir(),
+			fakeCredStore{username: upstreamUser, password: upstreamPass})
+	}
+
+	up := &fakeUpstream{resp: cannedReceivePackResponse(t, ref)}
+	eng := enforceEngine(t, map[string]map[string]any{
+		"branch_pattern": {"allow": []string{"refs/heads/feat/*"}},
+	})
+	proxy := gitproto.New(up)
+	proxy.SetEnforcement(eng, credOpener, 1<<28)
+
+	var out bytes.Buffer
+	if err := proxy.ReceivePack(ctx, "repo.git", bytes.NewReader(body), &out); err != nil {
+		t.Fatalf("ReceivePack: %v", err)
+	}
+	// The deny path must have fired (mirror open failed → report-status deny).
+	if !bytes.Contains(out.Bytes(), []byte("ng "+ref+" ")) {
+		t.Fatalf("expected report-status deny for %s; got %x", ref, out.Bytes())
+	}
+	// The agent-facing bytes must not contain the upstream username or password.
+	if bytes.Contains(out.Bytes(), []byte(upstreamUser)) {
+		t.Errorf("agent-facing deny response LEAKED upstream username %q:\n%s", upstreamUser, out.Bytes())
+	}
+	if bytes.Contains(out.Bytes(), []byte(upstreamPass)) {
+		t.Errorf("agent-facing deny response LEAKED upstream password %q:\n%s", upstreamPass, out.Bytes())
+	}
+	// No forward to the upstream on a denied push.
+	if len(up.forwarded) != 0 {
+		t.Errorf("upstream received %d bytes on a denied push; want 0", len(up.forwarded))
+	}
 }

@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"regexp"
 )
 
 // runGit runs `git -C dir <args...>` with ctx, returning stdout. A non-zero exit
@@ -27,7 +28,22 @@ func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("git %s: %w: %s", args[0], err, bytes.TrimSpace(stderr.Bytes()))
+		return nil, fmt.Errorf("git %s: %w: %s", args[0], err, redactCreds(string(bytes.TrimSpace(stderr.Bytes()))))
 	}
 	return stdout.Bytes(), nil
+}
+
+// credURLRe matches the userinfo component of a URL (scheme://user:pass@ or
+// scheme://user@) so it can be stripped from git stderr before an error is
+// returned. Git redacts only the password in its own messages; the username and
+// host can still appear, so we strip the whole userinfo as defense in depth.
+var credURLRe = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)([^\s/@:]+(?::[^\s/@]+)?)@`)
+
+// redactCreds strips URL-embedded credentials (user:pass@ or user@) from s,
+// replacing the userinfo with "***". This is a defense-in-depth measure so that
+// even if a caller wraps a gitx error with %v, no upstream credentials leak into
+// agent-facing strings. Non-credentialed URLs (no userinfo) are returned
+// unchanged.
+func redactCreds(s string) string {
+	return credURLRe.ReplaceAllString(s, "${1}***@")
 }

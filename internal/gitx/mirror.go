@@ -112,7 +112,7 @@ func mirrorExists(dir string) bool {
 func cloneMirror(ctx context.Context, dir, repoURL string) error {
 	cmd := exec.CommandContext(ctx, "git", "clone", "--mirror", "--quiet", repoURL, dir)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("clone --mirror: %w: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("clone --mirror: %w: %s", err, redactCreds(strings.TrimSpace(string(out))))
 	}
 	return nil
 }
@@ -134,7 +134,7 @@ func (m *Mirror) IngestPackfile(ctx context.Context, r io.Reader) error {
 	cmd := exec.CommandContext(ctx, "git", "-C", m.dir, "index-pack", "--stdin")
 	cmd.Stdin = r
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("gitx: index-pack --stdin: %w: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("gitx: index-pack --stdin: %w: %s", err, redactCreds(strings.TrimSpace(string(out))))
 	}
 	return nil
 }
