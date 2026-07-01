@@ -1,6 +1,7 @@
 package gitx
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -181,6 +182,105 @@ func (m *Mirror) IsAncestor(ctx context.Context, old, new string) (bool, error) 
 		return false, fmt.Errorf("gitx: merge-base --is-ancestor %s %s: %w", old, new, err)
 	}
 	return true, nil
+}
+
+// ObjectPath is a single object in the wanted set: the object id and, for
+// blobs and non-root trees, the path `git rev-list --objects` reports it at.
+// Path is "" for commits and the root tree of a commit (which rev-list emits
+// without a path). Used by the read-protection path to enumerate the objects the
+// proxy must pack and to withhold blobs whose path matches the read deny
+// matcher.
+type ObjectPath struct {
+	OID  string
+	Path string
+}
+
+// WantedObjects returns the objects reachable from wants excluding haves, with
+// paths for blobs/trees as `git rev-list --objects <wants> --not <haves>` prints
+// them: each output line is `<oid>` (commits and the root tree, no path) or
+// `<oid> <path>` (blobs and non-root trees, with the path they are reachable at).
+// The per-mirror mutex is held so the rev-list does not race a concurrent
+// Refresh/IngestPackfile. A nil/empty wants list yields an empty result.
+func (m *Mirror) WantedObjects(ctx context.Context, wants, haves []string) ([]ObjectPath, error) {
+	if len(wants) == 0 {
+		return nil, nil
+	}
+	args := make([]string, 0, 2+len(wants)+len(haves)+1)
+	args = append(args, "rev-list", "--objects")
+	args = append(args, wants...)
+	if len(haves) > 0 {
+		args = append(args, "--not")
+		args = append(args, haves...)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out, err := runGit(ctx, m.dir, args...)
+	if err != nil {
+		return nil, fmt.Errorf("gitx: wanted objects: %w", err)
+	}
+	return parseObjectPaths(out), nil
+}
+
+// parseObjectPaths parses `git rev-list --objects` output into ObjectPath values.
+// Each line is `<oid>` or `<oid> <path>`; trailing newlines are stripped from the
+// path. Empty lines are ignored.
+func parseObjectPaths(out []byte) []ObjectPath {
+	lines := splitCleanLines(out)
+	objs := make([]ObjectPath, 0, len(lines))
+	for _, line := range lines {
+		sp := strings.IndexByte(line, ' ')
+		if sp < 0 {
+			objs = append(objs, ObjectPath{OID: line})
+			continue
+		}
+		objs = append(objs, ObjectPath{OID: line[:sp], Path: line[sp+1:]})
+	}
+	return objs
+}
+
+// PackObjects builds a packfile containing exactly the given object ids (no
+// reachability walk) via `git pack-objects --stdout [--thin]` reading the OID
+// list from stdin. With thin=true it produces a thin pack (deltas may reference
+// bases the receiver already has); with thin=false the pack is self-contained.
+// The per-mirror mutex is held so pack-objects does not race a concurrent
+// Refresh/IngestPackfile on the shared bare dir.
+//
+// This is the read-protection packfile-assembly primitive: the caller feeds the
+// ALLOWED OID list (denied blobs omitted), so the resulting packfile genuinely
+// excludes the withheld objects even when trees reference them.
+func (m *Mirror) PackObjects(ctx context.Context, oids []string, thin bool) ([]byte, error) {
+	if len(oids) == 0 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	args := []string{"pack-objects", "--stdout"}
+	if thin {
+		args = append(args, "--thin")
+	}
+	cmd := exec.CommandContext(ctx, "git", fullArgs(m.dir, args...)...)
+	var stdin strings.Builder
+	for _, oid := range oids {
+		stdin.WriteString(oid)
+		stdin.WriteByte('\n')
+	}
+	cmd.Stdin = strings.NewReader(stdin.String())
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("gitx: pack-objects: %w: %s", err, redactCreds(strings.TrimSpace(stderr.String())))
+	}
+	return stdout.Bytes(), nil
+}
+
+// fullArgs prepends `-C dir` to a git argv, mirroring runGit's behavior for the
+// pack-objects path that needs direct stdin/stdout control.
+func fullArgs(dir string, args ...string) []string {
+	full := make([]string, 0, len(args)+2)
+	full = append(full, "-C", dir)
+	full = append(full, args...)
+	return full
 }
 
 // Dir returns the mirror's bare repo path (for tests/inspection only).
