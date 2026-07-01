@@ -256,6 +256,25 @@ func writeV0UploadPackResponse(w io.Writer, pack io.Reader, packWait func() erro
 	return nil
 }
 
+// writeUploadPackErr writes a single v0 upload-pack `ERR <reason>\n` pkt-line to
+// w. v0 upload-pack lets the server send an ERR pkt-line at any point to abort
+// the negotiation with an error the git client surfaces; the on-demand
+// blob-denial path uses it to refuse a denied on-demand blob fetch with a
+// structured reason instead of a silent empty pack (fail-closed: the agent
+// gets a clear error, not an uninspected blob and not a partial packfile).
+//
+// The encoded form is a normal data pkt-line whose payload is exactly
+// "ERR <reason>\n" (the trailing newline is part of the payload, matching git's
+// upload-pack ERR convention). The reason MUST be generic and fail-closed: no
+// upstream credentials, no secret content, no internal OID-path details beyond
+// what is needed to tell the agent the fetch was denied by policy. Returns the
+// underlying encode error if w fails; the caller is expected to also fail
+// closed if the write itself fails.
+func writeUploadPackErr(w io.Writer, reason string) error {
+	e := pktline.NewEncoder(w)
+	return e.EncodeString("ERR " + reason + "\n")
+}
+
 // noSideband is the sentinel sideband type meaning the agent did not negotiate
 // side-band-64k or side-band (compare against uploadPackSidebandType's result).
 const noSideband = sideband.Type(-1)
