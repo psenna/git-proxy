@@ -109,3 +109,63 @@ func TestPolicyMaxPackfileBytesDefault(t *testing.T) {
 		t.Errorf("default = %d, want %d", got, DefaultMaxPackfileBytes)
 	}
 }
+
+func TestParsePolicyReadDeny(t *testing.T) {
+	c, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+policy:
+  read:
+    deny:
+      - "secrets/**"
+      - "*.env"
+      - "config/production.yml"
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(c.Policy.Read.Deny) != 3 {
+		t.Fatalf("read.deny = %v, want 3 entries", c.Policy.Read.Deny)
+	}
+	if !c.Policy.ReadDenyEnabled() {
+		t.Errorf("ReadDenyEnabled = false, want true")
+	}
+	if bad := c.Policy.MalformedReadDenyPatterns(); len(bad) != 0 {
+		t.Errorf("MalformedReadDenyPatterns = %v, want empty", bad)
+	}
+}
+
+func TestReadDenyDisabledWhenAbsent(t *testing.T) {
+	c, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Policy.ReadDenyEnabled() {
+		t.Errorf("ReadDenyEnabled = true on absent read, want false (passthrough)")
+	}
+}
+
+func TestMalformedReadDenyPatternsDetected(t *testing.T) {
+	p := PolicyConfig{Read: ReadConfig{Deny: []string{"secrets/**", "[unclosed", "ok.env", "[also["}}}
+	bad := p.MalformedReadDenyPatterns()
+	if len(bad) != 2 {
+		t.Fatalf("MalformedReadDenyPatterns = %v, want 2 ([unclosed, [also[)", bad)
+	}
+	// A blank pattern is NOT malformed (it means "nothing configured" and is
+	// dropped by pathmatch.New), so it must not surface here.
+	p2 := PolicyConfig{Read: ReadConfig{Deny: []string{"   ", ""}}}
+	if bad := p2.MalformedReadDenyPatterns(); len(bad) != 0 {
+		t.Errorf("blank patterns reported as malformed: %v", bad)
+	}
+	// ReadDenyEnabled is true for a non-empty Deny list even if all entries are
+	// blank — the wiring layer must reject malformed configs before building a
+	// matcher, so ReadDenyEnabled stays a pure "is it configured" check.
+	if !p2.ReadDenyEnabled() {
+		t.Errorf("blank-only Deny: ReadDenyEnabled = false, want true (configured)")
+	}
+}

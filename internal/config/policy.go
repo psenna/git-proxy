@@ -1,6 +1,9 @@
 package config
 
-import "github.com/psenna/git-proxy/internal/policy"
+import (
+	"github.com/psenna/git-proxy/internal/pathmatch"
+	"github.com/psenna/git-proxy/internal/policy"
+)
 
 // PolicyConfig is the YAML-facing policy configuration. It mirrors
 // policy.PolicyConfig but uses a string mode (so YAML reads naturally) and
@@ -10,7 +13,8 @@ import "github.com/psenna/git-proxy/internal/policy"
 //
 // Mirror and Push carry the enforcement-side knobs the engine itself does not
 // need (the engine stays pure): the mirror cache root and the receive-pack
-// request size cap. They are consumed by the wiring in cmd/git-proxy.
+// request size cap. Read carries the proxy-level fetch read-protection path
+// matcher (NOT an engine rule). They are consumed by the wiring in cmd/git-proxy.
 type PolicyConfig struct {
 	// Mode is "first_deny" (default) or "collect_all". An unknown value
 	// resolves to first_deny (the fail-closed default).
@@ -22,6 +26,25 @@ type PolicyConfig struct {
 	Mirror MirrorConfig `yaml:"mirror"`
 	// Push configures receive-pack enforcement limits.
 	Push PushConfig `yaml:"push"`
+	// Read configures proxy-level fetch read-protection (object withholding on
+	// clone/fetch). This is a PROXY-LEVEL per-path filter (pathmatch), NOT an
+	// engine rule: the proxy assembles the packfile and omits blobs whose path
+	// matches Read.Deny. Empty/absent Read → read protection OFF → passthrough
+	// (the proxy forwards to the upstream, which speaks whatever the client
+	// negotiated). The same gitignore-style matcher as the push path_acl rule.
+	Read ReadConfig `yaml:"read"`
+}
+
+// ReadConfig configures proxy-level read protection on fetch/clone. When Deny
+// is non-empty, the proxy assembles the served packfile and withholds blobs
+// whose path matches any Deny pattern (commits and trees are kept). A nil/empty
+// Deny list means read protection is OFF (passthrough).
+type ReadConfig struct {
+	// Deny is a list of gitignore-style path patterns (via internal/pathmatch)
+	// matching blob paths to withhold from the served packfile. A malformed
+	// pattern (e.g. an unclosed `[`) is rejected at config load time so a typo
+	// fails closed rather than silently allowing everything through.
+	Deny []string `yaml:"deny"`
 }
 
 // MirrorConfig configures the inspection mirror cache.
@@ -94,4 +117,40 @@ func (p PolicyConfig) MaxPackfileBytesOrDefault() int64 {
 		return p.Push.MaxPackfileBytes
 	}
 	return DefaultMaxPackfileBytes
+}
+
+// ReadDenyEnabled reports whether read protection is configured (a non-empty
+// Deny list). When false the proxy stays passthrough on fetch (no mirror
+// assembly, no advertisement rewrite).
+func (p PolicyConfig) ReadDenyEnabled() bool {
+	return len(p.Read.Deny) > 0
+}
+
+// MalformedReadDenyPatterns returns the Read.Deny patterns that are structurally
+// malformed (per pathmatch.IsMalformed). A non-empty result means the config is
+// invalid: the wiring layer must fail closed at startup rather than build a
+// matcher that silently drops the malformed pattern (which would under-protect
+// — a typo'd deny pattern must not become "deny nothing"). Blank patterns are
+// NOT malformed (they mean "nothing configured" and are dropped by pathmatch.New
+// as a no-op), so they do not appear here.
+func (p PolicyConfig) MalformedReadDenyPatterns() []string {
+	var bad []string
+	for _, pat := range p.Read.Deny {
+		if pathmatch.IsMalformed(pat) {
+			bad = append(bad, pat)
+		}
+	}
+	return bad
+}
+
+// ReadDenyMatcher builds the pathmatch.Matcher for Read.Deny, or returns nil
+// when read protection is OFF (empty Deny). The caller MUST call
+// MalformedReadDenyPatterns first and fail closed at startup on a non-empty
+// result; this method does not re-validate (pathmatch.New drops malformed
+// patterns fail-safe, which would under-protect a typo'd config).
+func (p PolicyConfig) ReadDenyMatcher() *pathmatch.Matcher {
+	if !p.ReadDenyEnabled() {
+		return nil
+	}
+	return pathmatch.New(p.Read.Deny)
 }
