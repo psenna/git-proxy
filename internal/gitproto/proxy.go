@@ -82,6 +82,14 @@ func (p *Proxy) SetReadDeny(matcher *pathmatch.Matcher) {
 	p.readDenyMatcher = matcher
 }
 
+// ReadDenyOn reports whether read protection is wired on this proxy (the
+// read-deny matcher is non-nil). Transports use it to decide whether to
+// re-emit the upload-pack advertisement as v0 + filter cap (the read-protected
+// path) or pass it through verbatim. It mirrors the per-frontend matcher state
+// the HTTP frontend holds separately (frontend.go readDeny field); the SSH
+// frontend does not hold its own copy and queries the proxy it owns.
+func (p *Proxy) ReadDenyOn() bool { return p.readDenyMatcher != nil }
+
 // UploadPack handles a git-upload-pack (fetch/clone) exchange. With read
 // protection OFF (readDenyMatcher == nil) it is passthrough: the agent's request
 // body is parsed for the inspection seam and forwarded to the upstream, and the
@@ -93,9 +101,22 @@ func (p *Proxy) SetReadDeny(matcher *pathmatch.Matcher) {
 // path returns an error and the caller MUST deny the fetch (no unprotected
 // packfile, no passthrough fallback when read protection is on).
 func (p *Proxy) UploadPack(ctx context.Context, repo string, body io.Reader, w io.Writer) error {
-	buf, err := io.ReadAll(body)
+	// DoS hardening: cap the upload-pack REQUEST read at
+	// MaxUploadPackRequestBytes (1 MiB). A real upload-pack request is tiny
+	// (wants/haves/caps — the packfile is in the *response*, never the request),
+	// so 1 MiB is a generous ceiling. The +1 lets us detect truncation: a body
+	// of exactly max+1 bytes was truncated by the LimitReader. This applies to
+	// BOTH the passthrough and read-protected branches below — an oversized or
+	// truncated request is denied fail-closed (no forward, no assembly). This
+	// is DISTINCT from the 256 MiB push packfile cap (receive-pack path).
+	lr := &io.LimitedReader{R: body, N: MaxUploadPackRequestBytes + 1}
+	buf, err := io.ReadAll(lr)
 	if err != nil {
 		return fmt.Errorf("gitproto: read upload-pack request: %w", err)
+	}
+	if int64(len(buf)) > MaxUploadPackRequestBytes {
+		log.Printf("gitproto: upload-pack deny: request exceeds %d bytes for repo %q", MaxUploadPackRequestBytes, repo)
+		return fmt.Errorf("gitproto: upload-pack request exceeds %d bytes", MaxUploadPackRequestBytes)
 	}
 
 	// Read protection OFF → passthrough (existing behavior preserved). The

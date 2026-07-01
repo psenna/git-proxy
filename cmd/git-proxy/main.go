@@ -18,6 +18,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/psenna/git-proxy/internal/auth/keyauth"
 	"github.com/psenna/git-proxy/internal/auth/token"
 	"github.com/psenna/git-proxy/internal/config"
 	"github.com/psenna/git-proxy/internal/credentials/file"
@@ -27,6 +28,7 @@ import (
 	_ "github.com/psenna/git-proxy/internal/policy/rules" // register rules via init()
 	"github.com/psenna/git-proxy/internal/port"
 	httpfront "github.com/psenna/git-proxy/internal/transport/http"
+	sshfront "github.com/psenna/git-proxy/internal/transport/ssh"
 	"github.com/psenna/git-proxy/internal/upstream/plain"
 	"github.com/psenna/git-proxy/internal/version"
 )
@@ -74,38 +76,48 @@ func run(configPath string) error {
 	}
 
 	up := plain.New(cfg.Upstream.URL, creds)
-	frontend := httpfront.New(ln, up, cfg.Upstream.URL, cfg.Repos, auth, creds)
+	httpFrontend := httpfront.New(ln, up, cfg.Upstream.URL, cfg.Repos, auth, creds)
+
+	// Enforcement state, built once and wired into BOTH the HTTP and SSH
+	// frontends so policy applies identically across transports. The engine is
+	// pure (no I/O); the inspection mirror (git binary) is owned by the mirror
+	// opener. With no enabled rules and no read-deny, enforcement is off
+	// (passthrough) and the SSH frontend (if enabled) shares the same
+	// passthrough behavior.
+	var (
+		eng      *policy.Engine
+		opener   gitproto.MirrorOpener
+		readDeny = cfg.Policy.ReadDenyMatcher()
+		maxBytes = cfg.Policy.MaxPackfileBytesOrDefault()
+	)
 
 	// Push enforcement: build the policy engine from config when any rule is
 	// enabled. With no enabled rules the proxy stays passthrough (no mirror,
 	// no inspection) — preserving the unauthenticated/passthrough behavior when
-	// policy is unconfigured. The engine is pure (no I/O); the inspection
-	// mirror (git binary) is owned by the mirror opener wired below.
+	// policy is unconfigured.
 	if cfg.Policy.HasEnabledRules() {
-		eng, err := policy.Resolve(cfg.Policy.ToPolicy(), nil)
+		e, err := policy.Resolve(cfg.Policy.ToPolicy(), nil)
 		if err != nil {
 			return fmt.Errorf("load policy: %w", err)
 		}
+		eng = e
 		mirrorDir := cfg.Policy.Mirror.Dir
 		if mirrorDir == "" {
 			return fmt.Errorf("config: policy.mirror.dir is required when policy rules are enabled")
 		}
-		opener := newMirrorOpener(cfg.Upstream.URL, mirrorDir, creds)
-		frontend.SetEnforcement(eng, opener, cfg.Policy.MaxPackfileBytesOrDefault())
+		opener = newMirrorOpener(cfg.Upstream.URL, mirrorDir, creds)
+		httpFrontend.SetEnforcement(eng, opener, maxBytes)
 		log.Printf("git-proxy: push enforcement enabled (rules=%d, mirror=%s, max_packfile_bytes=%d)",
-			len(cfg.Policy.Rules), mirrorDir, cfg.Policy.MaxPackfileBytesOrDefault())
+			len(cfg.Policy.Rules), mirrorDir, maxBytes)
 	} else {
 		log.Printf("git-proxy: push enforcement off (no policy rules enabled) — passthrough")
 	}
 
 	// Read protection: build the proxy-level fetch path matcher from
-	// policy.read.deny. With no deny patterns read protection is OFF (the proxy
-	// forwards fetch/clone to the upstream, which speaks whatever the client
-	// negotiated). When set, the proxy assembles the packfile and withholds
-	// blobs whose path matches. Fail closed at startup on a malformed deny
-	// pattern (a typo must not become "deny nothing"). Read protection needs a
-	// mirror opener to compute the object set; if push enforcement is also off
-	// (no mirror wired yet), wire one from policy.mirror.dir (required).
+	// policy.read.deny. With no deny patterns read protection is OFF. When set,
+	// the proxy assembles the packfile and withholds blobs whose path matches.
+	// Fail closed at startup on a malformed deny pattern. Read protection needs
+	// a mirror opener; if push enforcement is also off, wire one.
 	if cfg.Policy.ReadDenyEnabled() {
 		if bad := cfg.Policy.MalformedReadDenyPatterns(); len(bad) > 0 {
 			return fmt.Errorf("config: policy.read.deny has malformed pattern(s): %q", bad)
@@ -118,20 +130,72 @@ func run(configPath string) error {
 		// one for the read-protection fetch path. When push enforcement is on,
 		// the opener from SetEnforcement is reused (the proxy already holds it).
 		if !cfg.Policy.HasEnabledRules() {
-			opener := newMirrorOpener(cfg.Upstream.URL, mirrorDir, creds)
-			frontend.SetEnforcement(nil, opener, cfg.Policy.MaxPackfileBytesOrDefault())
+			opener = newMirrorOpener(cfg.Upstream.URL, mirrorDir, creds)
+			httpFrontend.SetEnforcement(nil, opener, maxBytes)
 		}
-		frontend.SetReadDeny(cfg.Policy.ReadDenyMatcher())
+		httpFrontend.SetReadDeny(readDeny)
 		log.Printf("git-proxy: read protection enabled (deny patterns=%d, mirror=%s)",
 			len(cfg.Policy.Read.Deny), mirrorDir)
 	} else {
 		log.Printf("git-proxy: read protection off (no policy.read.deny) — passthrough")
 	}
 
+	// SSH frontend: enabled only when ssh.listen is configured. It holds its
+	// own *gitproto.Proxy (built via gitproto.New(up)) and is wired with the
+	// SAME engine / opener / readDeny / maxBytes as the HTTP frontend so policy
+	// applies identically over SSH. Auth is SSH public key → agent identity via
+	// keyauth (the HTTP Bearer authenticator is unchanged). SSH disabled when
+	// ssh.listen is empty (today's HTTP-only behavior).
+	var transports []port.Transport
+	transports = append(transports, httpFrontend)
+	if cfg.SSH.Listen != "" {
+		sshAuthn, err := keyauth.New(cfg.SSH.AuthorizedKeys)
+		if err != nil {
+			return fmt.Errorf("load ssh authorized keys: %w", err)
+		}
+		sshLn, err := net.Listen("tcp", cfg.SSH.Listen)
+		if err != nil {
+			return fmt.Errorf("ssh listen: %w", err)
+		}
+		sshFE, err := sshfront.New(sshLn, up, cfg.Repos, sshAuthn, cfg.SSH.HostKey)
+		if err != nil {
+			return fmt.Errorf("ssh frontend: %w", err)
+		}
+		sshFE.SetEnforcement(eng, opener, maxBytes)
+		sshFE.SetReadDeny(readDeny)
+		transports = append(transports, sshFE)
+		log.Printf("git-proxy: SSH frontend enabled: listen=%s", cfg.SSH.Listen)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	return frontend.Serve(ctx)
+	return serveTransports(ctx, stop, transports)
+}
+
+// serveTransports runs all wired transports concurrently and returns when ctx
+// is canceled (graceful shutdown) or any transport returns a fatal error. On a
+// fatal error from any transport, stop is called so the others shut down; the
+// first non-nil error is surfaced. A transport returning nil (e.g. listener
+// closed) does not by itself shut down the others — only ctx cancel or a fatal
+// error does.
+func serveTransports(ctx context.Context, stop context.CancelFunc, transports []port.Transport) error {
+	if len(transports) == 0 {
+		<-ctx.Done()
+		return nil
+	}
+	errCh := make(chan error, len(transports))
+	for _, t := range transports {
+		go func(tt port.Transport) { errCh <- tt.Serve(ctx) }(t)
+	}
+	var firstErr error
+	for i := 0; i < len(transports); i++ {
+		if err := <-errCh; err != nil && firstErr == nil {
+			firstErr = err
+			stop() // cancel ctx so the remaining transports shut down
+		}
+	}
+	return firstErr
 }
 
 // newMirrorOpener returns a gitproto.MirrorOpener that caches one bare mirror

@@ -27,6 +27,7 @@ type Config struct {
 	Repos    map[string]string `yaml:"repos"`
 	Auth     AuthConfig        `yaml:"auth"`
 	Policy   PolicyConfig      `yaml:"policy"`
+	SSH      SSHConfig         `yaml:"ssh"`
 }
 
 // UpstreamConfig describes the upstream git server the proxy forwards to.
@@ -35,7 +36,27 @@ type UpstreamConfig struct {
 	CredentialsFile string `yaml:"credentials_file"`
 }
 
-// AuthConfig configures agent authentication on the proxy frontend.
+// SSHConfig configures the optional SSH transport frontend. When Listen is
+// empty/absent the SSH frontend is disabled (HTTP-only operation — today's
+// behavior). When Listen is set, the SSH frontend is enabled and
+// AuthorizedKeys MUST be non-empty (an enabled SSH frontend with no authorized
+// keys would deny everyone, which is a likely misconfiguration — require the
+// map explicitly). HostKey is the SSH host private-key file path; if empty,
+// the frontend generates an ephemeral ed25519 key at startup (dev/test only,
+// logged as a warning — not for production).
+type SSHConfig struct {
+	// Listen is the SSH server listen address (e.g. "127.0.0.1:2222").
+	// Empty/absent → SSH frontend disabled.
+	Listen string `yaml:"listen"`
+	// HostKey is the filesystem path to an SSH host private key (PEM). Empty
+	// → ephemeral ed25519 (dev/test only).
+	HostKey string `yaml:"host_key"`
+	// AuthorizedKeys maps agent-name → authorized public key string (in
+	// authorized_keys form, e.g. "ssh-ed25519 AAAA... comment"). The SSH
+	// frontend maps a presented client key (by fingerprint) to the agent
+	// identity. Required when Listen is set.
+	AuthorizedKeys map[string]string `yaml:"authorized_keys"`
+}
 type AuthConfig struct {
 	// Tokens maps a bearer token to the agent name it authenticates. A request
 	// is authorized if it presents any token in this map. Empty (the default)
@@ -75,6 +96,14 @@ func (c *Config) validate() error {
 	}
 	if c.Upstream.URL == "" {
 		return fmt.Errorf("config: upstream.url is required")
+	}
+	// SSH frontend: disabled when Listen is empty (HTTP-only operation). When
+	// enabled, AuthorizedKeys MUST be non-empty (fail closed: an enabled SSH
+	// frontend with no authorized keys is a misconfiguration — require the map
+	// explicitly rather than silently denying everyone). HostKey is optional
+	// (ephemeral fallback for dev/test, warned at startup).
+	if c.SSH.Listen != "" && len(c.SSH.AuthorizedKeys) == 0 {
+		return fmt.Errorf("config: ssh.authorized_keys is required when ssh.listen is set (an enabled SSH frontend with no authorized keys denies everyone)")
 	}
 	return nil
 }
