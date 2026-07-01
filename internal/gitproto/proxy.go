@@ -49,7 +49,9 @@ type Proxy struct {
 	maxPackfileBytes int64             // cap when enforcement is on; 0 → default
 	readDenyMatcher  *pathmatch.Matcher // nil → passthrough (read protection off)
 	audit            port.AuditSink    // nil → no audit (preserves existing behavior)
+	alerts           port.AlertSink    // nil → no alerts (preserves existing behavior)
 	transport        string            // "http" | "ssh" — which frontend carried the op
+	dryRun           bool              // dry-run: forward on clean engine Deny (policy denies only, NOT inspection errors)
 }
 
 // New returns a Proxy that forwards through up in passthrough mode (no policy).
@@ -95,6 +97,30 @@ func (p *Proxy) SetAuditSink(s port.AuditSink) { p.audit = s }
 // events. Each frontend owns its own *Proxy and stamps its tag once at wiring.
 // The default "" is valid (the field is informational in the audit record).
 func (p *Proxy) SetTransport(tag string) { p.transport = tag }
+
+// SetDryRun enables/disables dry-run mode. When dry-run is ON, the proxy
+// FORWARDS a clean engine push-deny to the upstream (instead of writing the
+// deny response) and records the TRUE verdict (deny) with DryRun=true, so
+// teams observe violations before turning on enforcement. Dry-run softens
+// POLICY denies only, NOT inspection failures: an inspection-error deny
+// (mirror/ancestry/ingest/parse — the proxy could not inspect the push) STILL
+// fail-closes even in dry-run (you cannot safely forward an uninspected push,
+// even to observe it). Read-protection dry-run is OUT of v1 scope: read
+// protection withholds/denies regardless of dry-run (never serve a denied
+// blob to "observe"). Call before Serve. The engine stays pure — it returns
+// the true verdict regardless; dry-run is a proxy-level concern. Default
+// false preserves the existing enforce-on-deny behavior.
+func (p *Proxy) SetDryRun(on bool) { p.dryRun = on }
+
+// SetAlertSink wires an optional alert sink. A nil sink means no alerts (the
+// pre-alert behavior is preserved — no Alert is fired). Call before Serve.
+// The sink is best-effort: an Alert error is logged and does NOT change the
+// verdict, block the op, or alter the forward/deny (the decision stands
+// regardless of whether the alert was delivered). The Alert carries only
+// generic reasons/paths/OIDs — never blob content, raw secrets, upstream
+// URLs/creds, or packfile bytes (no-leak contract; the webhook leaves the
+// proxy, so the payload is a leak surface).
+func (p *Proxy) SetAlertSink(s port.AlertSink) { p.alerts = s }
 
 // ReadDenyOn reports whether read protection is wired on this proxy (the
 // read-deny matcher is non-nil). Transports use it to decide whether to
@@ -154,7 +180,7 @@ func (p *Proxy) UploadPack(ctx context.Context, repo string, body io.Reader, w i
 	if p.mirrorOpener == nil {
 		log.Printf("gitproto: upload-pack deny: read protection on but no mirror opener for repo %q", repo)
 		p.recordAudit(ctx, "git-upload-pack", agent, repo, "deny",
-			[]string{"read protection on but no mirror opener"}, nil, nil, nil)
+			[]string{"read protection on but no mirror opener"}, nil, nil, nil, false)
 		return fmt.Errorf("gitproto: upload-pack enforce: mirror unavailable")
 	}
 	// Parse the request strictly. An unparseable request cannot be safely
@@ -163,27 +189,32 @@ func (p *Proxy) UploadPack(ctx context.Context, repo string, body io.Reader, w i
 	if perr != nil {
 		log.Printf("gitproto: upload-pack deny: unparseable request for repo %q: %v", repo, perr)
 		p.recordAudit(ctx, "git-upload-pack", agent, repo, "deny",
-			[]string{"unparseable upload-pack request"}, nil, nil, nil)
+			[]string{"unparseable upload-pack request"}, nil, nil, nil, false)
 		return fmt.Errorf("gitproto: upload-pack enforce: parse request: %w", perr)
 	}
 	mirror, err := p.mirrorOpener(ctx, repo)
 	if err != nil {
 		log.Printf("gitproto: upload-pack deny: mirror open for repo %q: %v", repo, err)
 		p.recordAudit(ctx, "git-upload-pack", agent, repo, "deny",
-			[]string{"inspection mirror unavailable"}, nil, nil, nil)
+			[]string{"inspection mirror unavailable"}, nil, nil, nil, false)
 		return fmt.Errorf("gitproto: upload-pack enforce: mirror open: %w", err)
 	}
 	result, err := ServeUploadPackEnforced(ctx, w, req, mirror, p.readDenyMatcher, repo)
 	if err != nil {
 		log.Printf("gitproto: upload-pack deny: enforce for repo %q: %v", repo, err)
 		p.recordAudit(ctx, "git-upload-pack", agent, repo, "deny",
-			[]string{"upload-pack enforce failed"}, nil, nil, nil)
+			[]string{"upload-pack enforce failed"}, nil, nil, nil, false)
 		return fmt.Errorf("gitproto: upload-pack enforce: %w", err)
 	}
 	// Success: decide the audit verdict from the withheld/denied summary. A
 	// fully-allowed read-protected fetch (zero denials) records an "allow" event
 	// with empty DeniedPaths/OIDs so the log shows the op happened (flagged
 	// choice). Any withheld path or on-demand-denied OID → "deny" event.
+	//
+	// Read-protection dry-run is OUT of v1 scope (binding — flagged): read
+	// protection withholds/denies regardless of p.dryRun (never serve a denied
+	// blob to "observe"). So dryRun is always false here — the deny is enforced
+	// and the alert carries DryRun=false. Documented limitation.
 	verdict := "allow"
 	var reasons []string
 	if len(result.DeniedOIDs) > 0 {
@@ -194,7 +225,7 @@ func (p *Proxy) UploadPack(ctx context.Context, repo string, body io.Reader, w i
 		reasons = []string{"blob withheld by read policy"}
 	}
 	p.recordAudit(ctx, "git-upload-pack", agent, repo, verdict, reasons, nil,
-		result.DeniedPaths, result.DeniedOIDs)
+		result.DeniedPaths, result.DeniedOIDs, false)
 	return nil
 }
 
@@ -249,7 +280,7 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 	// document the gap; for v1 the bare allow is cheap and observability-useful.
 	if !enforce {
 		p.recordAudit(ctx, "git-receive-pack", agentName(ctx), repo, "allow",
-			nil, auditRefsFromRequest(req), nil, nil)
+			nil, auditRefsFromRequest(req), nil, nil, false)
 		return p.forwardReceivePack(ctx, repo, buf, w)
 	}
 
@@ -269,7 +300,7 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 		if req != nil {
 			p.writeDenyResponse(w, req, dec)
 		}
-		p.recordPushAudit(ctx, repo, req, dec)
+		p.recordPushAudit(ctx, repo, req, dec, false)
 		return nil
 	}
 
@@ -277,11 +308,12 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 	// cannot compute a decision, so it must not forward. There is no
 	// structured report-status channel (no parsed capabilities), so close the
 	// stream; the agent sees a failed push. Real git always sends parseable
-	// requests, so this is an edge case.
+	// requests, so this is an edge case. Dry-run does NOT soften this: it is an
+	// inspection failure (parse error), and dry-run only softens POLICY denies.
 	if perr != nil || req == nil {
 		log.Printf("gitproto: receive-pack deny: unparseable request for repo %q: %v", repo, perr)
 		p.recordAudit(ctx, "git-receive-pack", agentName(ctx), repo, "deny",
-			[]string{"push rejected: unparseable request"}, nil, nil, nil)
+			[]string{"push rejected: unparseable request"}, nil, nil, nil, false)
 		return nil
 	}
 
@@ -294,7 +326,7 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 		}
 		log.Printf("gitproto: receive-pack deny: mirror open for repo %q: %v", repo, err)
 		p.writeDenyResponse(w, req, dec)
-		p.recordPushAudit(ctx, repo, req, dec)
+		p.recordPushAudit(ctx, repo, req, dec, false)
 		return nil
 	}
 	if err := mirror.Refresh(ctx); err != nil {
@@ -305,7 +337,7 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 		}
 		log.Printf("gitproto: receive-pack deny: mirror refresh for repo %q: %v", repo, err)
 		p.writeDenyResponse(w, req, dec)
-		p.recordPushAudit(ctx, repo, req, dec)
+		p.recordPushAudit(ctx, repo, req, dec, false)
 		return nil
 	}
 	if req.PackfileOffset >= 0 && int64(len(buf)) > req.PackfileOffset {
@@ -318,7 +350,7 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 			}
 			log.Printf("gitproto: receive-pack deny: ingest packfile for repo %q: %v", repo, err)
 			p.writeDenyResponse(w, req, dec)
-			p.recordPushAudit(ctx, repo, req, dec)
+			p.recordPushAudit(ctx, repo, req, dec, false)
 			return nil
 		}
 	}
@@ -329,12 +361,29 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 		log.Printf("gitproto: receive-pack enforcement error for repo %q: %v", repo, enErr)
 	}
 	if dec.Verdict == port.VerdictAllow {
-		p.recordPushAudit(ctx, repo, req, dec)
+		p.recordPushAudit(ctx, repo, req, dec, false)
+		return p.forwardReceivePack(ctx, repo, buf, w)
+	}
+	// Deny. Dry-run softens POLICY denies only, NOT inspection failures (binding
+	// — flagged). A CLEAN engine deny (enErr == nil — the engine evaluated the
+	// push and said deny) is FORWARDED in dry-run so teams observe the violation
+	// without enforcing it: the audit records the TRUE verdict (deny) with
+	// DryRun=true and an alert fires with DryRun=true. An inspection-error deny
+	// (enErr != nil — ancestry/commit/blob extraction failed; the proxy could
+	// not inspect the push) STILL fail-closes even in dry-run: the proxy writes
+	// the deny response and records DryRun=false, because forwarding an
+	// uninspected push is unsafe regardless of dry-run (you observe policy
+	// verdicts, not bypass inspection). The engine stays pure — it returns the
+	// true verdict; dry-run is a proxy-level forwarding decision.
+	if p.dryRun && enErr == nil {
+		log.Printf("gitproto: receive-pack dry-run forward for repo %q agent %q (would-deny): %v",
+			repo, agent, dec.Reasons)
+		p.recordPushAudit(ctx, repo, req, dec, true)
 		return p.forwardReceivePack(ctx, repo, buf, w)
 	}
 	log.Printf("gitproto: receive-pack deny for repo %q agent %q: %v", repo, agent, dec.Reasons)
 	p.writeDenyResponse(w, req, dec)
-	p.recordPushAudit(ctx, repo, req, dec)
+	p.recordPushAudit(ctx, repo, req, dec, false)
 	return nil
 }
 
@@ -426,26 +475,68 @@ func agentName(ctx context.Context) string {
 // decision is enforced independently of audit (audit is observability, not a
 // gate — a disk-full audit must NOT change the verdict or block the git op).
 // The event is stamped with time.Now here (in the I/O layer, NOT in the pure
-// policy engine) and the frontend's transport tag.
+// policy engine) and the frontend's transport tag. dryRun is set on the event
+// (true only on the dry-run forward path — a deny forwarded despite the
+// verdict; false for enforced denies and all allows). When verdict is "deny",
+// recordAudit ALSO fires an alert via recordAlert (best-effort, same fields),
+// so operators are notified of every policy violation in real time.
 func (p *Proxy) recordAudit(ctx context.Context, service, agent, repo, verdict string,
+	reasons []string, refs []port.AuditRef, deniedPaths, deniedOIDs []string, dryRun bool) {
+	if p.audit != nil {
+		e := port.AuditEvent{
+			Time:        time.Now(),
+			Transport:   p.transport,
+			Agent:       agent,
+			Repo:        repo,
+			Service:     service,
+			Verdict:     verdict,
+			Reasons:     reasons,
+			Refs:        refs,
+			DeniedPaths: deniedPaths,
+			DeniedOIDs:  deniedOIDs,
+			DryRun:      dryRun,
+		}
+		if err := p.audit.Record(ctx, e); err != nil {
+			log.Printf("gitproto: audit record: %v", err)
+		}
+	}
+	// Fire an alert on every deny (enforced or dry-run). Alerts are observability
+	// (best-effort, non-fatal); a nil alert sink → no-op. The alert carries the
+	// same generic fields as the audit event (no-leak contract).
+	if verdict == "deny" {
+		p.recordAlert(ctx, service, agent, repo, dryRun, reasons, refs, deniedPaths, deniedOIDs)
+	}
+}
+
+// recordAlert is the best-effort alert recorder. A nil sink → no-op (preserves
+// the pre-alert behavior). An Alert error is LOGGED and swallowed: the policy
+// decision is enforced independently of alerting (alerting is observability,
+// not a gate — a down webhook MUST NOT change the verdict or block the git op).
+// The alert is stamped with time.Now here (in the I/O layer, NOT in the pure
+// policy engine) and the frontend's transport tag. The Alert carries only
+// generic reasons/paths/OIDs — never blob content, raw secrets, upstream
+// URLs/creds, or packfile bytes (no-leak contract; the webhook leaves the
+// proxy, so the payload is a leak surface).
+func (p *Proxy) recordAlert(ctx context.Context, service, agent, repo string, dryRun bool,
 	reasons []string, refs []port.AuditRef, deniedPaths, deniedOIDs []string) {
-	if p.audit == nil {
+	if p.alerts == nil {
 		return
 	}
-	e := port.AuditEvent{
+	a := port.Alert{
 		Time:        time.Now(),
 		Transport:   p.transport,
 		Agent:       agent,
 		Repo:        repo,
 		Service:     service,
-		Verdict:     verdict,
+		Verdict:     "deny",
+		DryRun:      dryRun,
 		Reasons:     reasons,
 		Refs:        refs,
 		DeniedPaths: deniedPaths,
 		DeniedOIDs:  deniedOIDs,
 	}
-	if err := p.audit.Record(ctx, e); err != nil {
-		log.Printf("gitproto: audit record: %v", err)
+	if err := p.alerts.Alert(ctx, a); err != nil {
+		log.Printf("gitproto: alert: %v", err)
 	}
 }
 
@@ -490,10 +581,11 @@ func verdictString(v port.Verdict) string {
 
 // recordPushAudit records a push (git-receive-pack) decision. It carries the
 // agent, repo, verdict, the pushed refs, and the generic reasons. nil sink →
-// no-op. Best-effort: a Record error is logged, never returned.
-func (p *Proxy) recordPushAudit(ctx context.Context, repo string, req *ReceivePackRequest, dec port.Decision) {
+// no-op. Best-effort: a Record error is logged, never returned. dryRun is set
+// on the event (true only on the dry-run forward path). Fires an alert on deny.
+func (p *Proxy) recordPushAudit(ctx context.Context, repo string, req *ReceivePackRequest, dec port.Decision, dryRun bool) {
 	p.recordAudit(ctx, "git-receive-pack", agentName(ctx), repo,
-		verdictString(dec.Verdict), reasonsFromDecision(dec), auditRefsFromRequest(req), nil, nil)
+		verdictString(dec.Verdict), reasonsFromDecision(dec), auditRefsFromRequest(req), nil, nil, dryRun)
 }
 
 // deniedRefs returns the refs of every command in the request, for use as the
