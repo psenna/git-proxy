@@ -27,6 +27,9 @@ type fakeUpstream struct {
 func (f *fakeUpstream) ListRefs(ctx context.Context, repo string) (port.Refs, error) {
 	return port.Refs{}, nil
 }
+func (f *fakeUpstream) ListRefsService(ctx context.Context, repo, service string) (port.Refs, error) {
+	return port.Refs{}, nil
+}
 func (f *fakeUpstream) UploadPack(ctx context.Context, repo string, body io.Reader) (io.ReadCloser, error) {
 	return nil, nil
 }

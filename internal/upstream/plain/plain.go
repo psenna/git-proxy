@@ -35,11 +35,22 @@ func New(baseURL string, creds port.CredentialStore) *Upstream {
 	}
 }
 
-// ListRefs performs ref discovery for repo. Passthrough uses the upload-pack
-// service advertisement; the seam is reserved for later milestones that
-// inspect refs.
+// ListRefs performs ref discovery for repo using the git-upload-pack service
+// advertisement. It delegates to ListRefsService(ctx, repo, "git-upload-pack")
+// (the SSH frontend uses ListRefsService directly to also fetch the
+// git-receive-pack advertisement).
 func (u *Upstream) ListRefs(ctx context.Context, repo string) (port.Refs, error) {
-	url := u.BaseURL + "/" + repo + "/info/refs?service=git-upload-pack"
+	return u.ListRefsService(ctx, repo, "git-upload-pack")
+}
+
+// ListRefsService fetches the ref advertisement for repo for the given git
+// service ("git-upload-pack" | "git-receive-pack") as a raw smart-HTTP stream
+// (with the "# service=" preamble). It does NOT send a Git-Protocol header so
+// the upstream returns v0 (the SSH frontend fetches as v0 and parses +
+// re-emits raw). Vault creds are attached on the proxy→upstream leg; the
+// agent never sees them.
+func (u *Upstream) ListRefsService(ctx context.Context, repo, service string) (port.Refs, error) {
+	url := u.BaseURL + "/" + repo + "/info/refs?service=" + service
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return port.Refs{}, err
