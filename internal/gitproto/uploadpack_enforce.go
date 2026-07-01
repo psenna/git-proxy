@@ -56,6 +56,35 @@ func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRe
 		return fmt.Errorf("gitproto: upload-pack enforce: refresh mirror: %w", err)
 	}
 
+	// --- Task 10: on-demand blob fetch classification (M7b) ---
+	//
+	// An on-demand fetch's want is a BLOB oid (the agent's git, after a
+	// --filter=blob:none clone, lazily fetching a specific blob it needs). A
+	// full clone's want is a commit (or tag) oid. Classify each want oid by
+	// type and, for blob wants, resolve the OID back to its path(s) so the
+	// read deny matcher can evaluate them. The existing Task 9 withholding
+	// path below works over the wanted SET and cannot deny an on-demand blob:
+	// `git rev-list --objects <blob-oid>` yields the blob with NO path, so
+	// the deny matcher has nothing to match and the blob would be served. The
+	// on-demand path closes that gap.
+	//
+	// Fail-closed (binding):
+	//   - ANY on-demand blob whose resolving path matches the deny matcher →
+	//     REFUSE the whole fetch with an `ERR <reason>\n` pkt-line (no NAK, no
+	//     packfile). A mixed request (commit want + denied blob want) is also
+	//     REFUSED — never partially serve a fetch containing a denied blob.
+	//   - A blob want whose path(s) cannot be resolved (Resolve error OR zero
+	//     paths) → REFUSE with ERR. The proxy cannot prove an unresolvable
+	//     blob is not a denied blob, so it DENIES it (the safer choice for a
+	//     security filter). This is the documented fail-closed decision; it is
+	//     stricter than fail-open and may over-deny, but never under-deny.
+	//   - Commit/tag/tree wants and allowed blob wants fall through to the
+	//     existing withholding path, which serves the (allowed) blob.
+	if reason, deny := onDemandBlobDenyReason(ctx, mirror, req.Wants, readDenyMatcher, repo); deny {
+		log.Printf("gitproto: upload-pack enforce: refusing on-demand fetch for repo %q: %s", repo, reason)
+		return writeUploadPackErr(w, reason)
+	}
+
 	objs, err := mirror.WantedObjects(ctx, req.Wants, req.Haves)
 	if err != nil {
 		return fmt.Errorf("gitproto: upload-pack enforce: wanted objects: %w", err)
@@ -273,6 +302,84 @@ func writeV0UploadPackResponse(w io.Writer, pack io.Reader, packWait func() erro
 func writeUploadPackErr(w io.Writer, reason string) error {
 	e := pktline.NewEncoder(w)
 	return e.EncodeString("ERR " + reason + "\n")
+}
+
+// onDemandBlobDenyReason classifies the want OIDs by git object type and, for
+// each BLOB want (an on-demand blob fetch), resolves the OID back to its
+// path(s) via oidpath.Resolve and checks the read deny matcher. It returns
+// (reason, true) when the fetch MUST be refused with an ERR pkt-line:
+//
+//   - ANY on-demand blob whose resolved path matches the deny matcher (a blob
+//     at multiple paths is denied if ANY path is denied);
+//   - ANY on-demand blob whose OID does not resolve to a path (zero paths) —
+//     fail-closed: the proxy cannot prove an unresolvable blob is not denied;
+//   - ANY on-demand blob whose Resolve call errors — fail-closed.
+//
+// A request mixing commit/tag/tree wants with a denied blob want is refused
+// whole (the first denied blob want short-circuits). Commit/tag/tree wants and
+// allowed blob wants do not deny; the caller then runs the existing Task 9
+// withholding path, which serves allowed blobs and withholds denied-path blobs
+// from the full-clone reachable set.
+//
+// A nil/empty wants list denies nothing (the existing path handles it). A nil
+// matcher (read protection off at the path level) denies nothing — but this
+// function is only reached when readDenyMatcher is non-nil (proxy.go routes
+// nil-matcher fetches through passthrough), so the nil branch is defensive.
+//
+// The reason is generic and fail-closed: it names the OID the agent sent and
+// the policy, and reveals NO upstream credentials, NO secret content, and NO
+// internal path details (a uniform reason for denied-by-path, unresolvable, and
+// resolve-error avoids leaking which paths exist).
+func onDemandBlobDenyReason(ctx context.Context, mirror *gitx.Mirror, wants []string, readDenyMatcher *pathmatch.Matcher, repo string) (reason string, deny bool) {
+	if len(wants) == 0 || readDenyMatcher == nil {
+		return "", false
+	}
+	types, err := mirror.ObjectTypes(ctx, wants)
+	if err != nil {
+		// Fail-closed: if the proxy cannot classify the wants, it cannot safely
+		// serve any of them. Report a generic reason for the first want.
+		// (This path is unusual — the existing withholding path would also
+		// fail — but we refuse with a structured ERR rather than a bare 500.)
+		return fmt.Sprintf("access to object %s denied by read policy", firstNonEmpty(wants)), true
+	}
+	for _, oid := range wants {
+		if types[oid] != "blob" {
+			continue // commit/tag/tree want → full-clone path (existing withholding)
+		}
+		// On-demand blob want: resolve its path(s) and check the deny matcher.
+		paths, rerr := gitx.Resolve(ctx, mirror, oid)
+		if rerr != nil {
+			reason := fmt.Sprintf("access to object %s denied by read policy", oid)
+			log.Printf("gitproto: upload-pack enforce: on-demand resolve error for blob %s in repo %q: %v (denying fail-closed)", oid, repo, rerr)
+			return reason, true
+		}
+		if len(paths) == 0 {
+			// Fail-closed: an unresolvable blob (no tree references it) cannot
+			// be proven to be non-denied. Deny with a uniform reason.
+			log.Printf("gitproto: upload-pack enforce: on-demand blob %s in repo %q resolves to no path (denying fail-closed)", oid, repo)
+			return fmt.Sprintf("access to object %s denied by read policy", oid), true
+		}
+		for _, p := range paths {
+			if readDenyMatcher.Match(p) {
+				log.Printf("gitproto: upload-pack enforce: on-demand blob %s in repo %q denied by path %q (paths=%v)", oid, repo, p, paths)
+				return fmt.Sprintf("access to object %s denied by read policy", oid), true
+			}
+		}
+		// Allowed blob want: fall through to the existing withholding path,
+		// which serves it.
+	}
+	return "", false
+}
+
+// firstNonEmpty returns the first non-empty string in s, or "" if all are
+// empty. Used to pick a representative OID for a generic deny reason.
+func firstNonEmpty(s []string) string {
+	for _, v := range s {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // noSideband is the sentinel sideband type meaning the agent did not negotiate

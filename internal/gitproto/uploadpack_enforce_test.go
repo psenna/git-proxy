@@ -95,6 +95,73 @@ func uploadPackRequest(t *testing.T, tip string, sideband bool) *gitproto.Upload
 	return req
 }
 
+// uploadPackRequestWants builds a v0 upload-pack request wanting the given OIDs
+// (one want line each; caps attach to the first). Used by the on-demand tests to
+// send a BLOB oid as a want (what the agent's git sends after a
+// --filter=blob:none clone when it lazily fetches a specific blob). When
+// sideband=false, side-band-64k is omitted.
+func uploadPackRequestWants(t *testing.T, sideband bool, wants ...string) *gitproto.UploadPackRequest {
+	t.Helper()
+	if len(wants) == 0 {
+		t.Fatalf("uploadPackRequestWants: at least one want required")
+	}
+	var buf bytes.Buffer
+	e := pktline.NewEncoder(&buf)
+	caps := "ofs-delta thin-pack"
+	if sideband {
+		caps += " side-band-64k"
+	}
+	caps += " no-progress"
+	for i, w := range wants {
+		line := "want " + w
+		if i == 0 {
+			line += " " + caps
+		}
+		line += "\n"
+		if err := e.EncodeString(line); err != nil {
+			t.Fatalf("encode want: %v", err)
+		}
+	}
+	if err := e.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if err := e.EncodeString("done\n"); err != nil {
+		t.Fatalf("encode done: %v", err)
+	}
+	if err := e.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	req, err := gitproto.ParseUploadPackRequest(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return req
+}
+
+// assertUploadPackErr asserts resp is a single `ERR <reason>\n` data pkt-line
+// with no NAK, no packfile, and no flush — the on-demand deny response. Returns
+// the decoded reason for further assertions.
+func assertUploadPackErr(t *testing.T, resp []byte) string {
+	t.Helper()
+	r := bytes.NewReader(resp)
+	s := pktline.NewScanner(r)
+	if !s.Scan() {
+		t.Fatalf("no ERR pkt-line; scan err=%v", s.Err())
+	}
+	if s.Marker() != pktline.Data {
+		t.Fatalf("first pkt-line marker=%v, want Data (ERR)", s.Marker())
+	}
+	const prefix = "ERR "
+	payload := string(s.Bytes())
+	if !strings.HasPrefix(payload, prefix) || !strings.HasSuffix(payload, "\n") {
+		t.Fatalf("ERR pkt-line payload = %q, want \"ERR <reason>\\n\"", payload)
+	}
+	if s.Scan() {
+		t.Fatalf("unexpected second pkt-line after ERR (no packfile/NAK/flush expected): marker=%v bytes=%q", s.Marker(), s.Bytes())
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(payload, prefix), "\n")
+}
+
 // demuxSidebandPack expects resp to begin with a NAK pkt-line followed by a
 // side-band-64k muxed packfile and a terminating flush; it returns the demuxed
 // packfile bytes (channel 1).
@@ -532,4 +599,162 @@ func sortedKeysGitProto(m map[string]bool) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// --- Task 10: on-demand blob fetch classification (M7b) ---
+//
+// An on-demand fetch's want is a BLOB oid (the agent's git, after a
+// --filter=blob:none clone, lazily fetching a specific blob). ServeUploadPack
+// Enforced classifies want oids by type: a blob want is the on-demand path
+// (resolve OID->path, deny with ERR if any path is denied, else serve); a
+// commit/tag/tree want is the full-clone path (existing Task 9 withholding).
+// Mixed wants with any denied on-demand blob REFUSE the whole fetch (fail
+// closed). Fail-closed on resolve error AND on a blob want that resolves to
+// no path (cannot prove it is not a denied blob).
+
+// TestServeUploadPackEnforced_OnDemandBlob_Allow verifies an on-demand blob
+// fetch for an ALLOWED blob is SERVED: the response is a normal NAK +
+// side-band-64k packfile containing the requested blob (the on-demand path
+// resolves the blob's path, finds it is not denied, and falls through to the
+// existing packfile-assembly path).
+func TestServeUploadPackEnforced_OnDemandBlob_Allow(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, _ := readRepoForProtection(t)
+	m := readProtectionMirror(t, source)
+
+	// The README.md blob is public; its path "README.md" is not under secrets/**.
+	readmeOID := strings.TrimSpace(mustOutput(t, "git", "-C", h_BarePath(t, m), "rev-parse", "HEAD:README.md"))
+
+	// Matcher denies only secrets/** ; README.md is allowed.
+	matcher := pathmatch.New([]string{"secrets/**"})
+	req := uploadPackRequestWants(t, true, readmeOID) // blob want
+
+	var out bytes.Buffer
+	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced: %v", err)
+	}
+	pack := demuxSidebandPack(t, out.Bytes())
+	assertPackHasBlobOIDs(t, m.Dir(), pack, []string{readmeOID}, nil)
+}
+
+// TestServeUploadPackEnforced_OnDemandBlob_DenyByPath verifies an on-demand
+// blob fetch for a DENIED blob is REFUSED with an ERR pkt-line: the blob's
+// path matches the deny matcher, so the proxy writes `ERR <reason>\n` and
+// returns with no NAK and no packfile (the agent's git surfaces the error).
+func TestServeUploadPackEnforced_OnDemandBlob_DenyByPath(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, _ := readRepoForProtection(t)
+	m := readProtectionMirror(t, source)
+
+	secretOID := strings.TrimSpace(mustOutput(t, "git", "-C", h_BarePath(t, m), "rev-parse", "HEAD:secrets/secret.txt"))
+
+	matcher := pathmatch.New([]string{"secrets/**"})
+	req := uploadPackRequestWants(t, true, secretOID) // blob want (denied)
+
+	var out bytes.Buffer
+	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced should return nil after writing ERR, got err=%v", err)
+	}
+	reason := assertUploadPackErr(t, out.Bytes())
+	if !strings.Contains(reason, "denied") {
+		t.Errorf("ERR reason = %q, want it to mention denial", reason)
+	}
+	// The denied OID must NOT appear as a leakable token, and no packfile may
+	// have been written. The ERR helper writes exactly one pkt-line (asserted).
+	if strings.Contains(reason, "TOP-SECRET") {
+		t.Errorf("ERR reason leaked secret content: %q", reason)
+	}
+}
+
+// TestServeUploadPackEnforced_OnDemandBlob_UnresolvableDeny verifies the
+// fail-closed decision for a blob want that resolves to NO path: a blob the
+// proxy cannot map to any path must be DENIED (ERR), because the proxy cannot
+// prove it is not a denied blob. An orphan blob (present in the mirror's
+// object store but referenced by no tree) triggers this.
+func TestServeUploadPackEnforced_OnDemandBlob_UnresolvableDeny(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, _ := readRepoForProtection(t)
+	m := readProtectionMirror(t, source)
+
+	// Write an orphan blob into the MIRROR's object store, not referenced by
+	// any tree, so oidpath.Resolve returns no paths.
+	cmd := exec.Command("git", "-C", m.Dir(), "hash-object", "-w", "--stdin")
+	cmd.Stdin = strings.NewReader("orphan-on-demand-blob\n")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("hash-object -w into mirror: %v", err)
+	}
+	orphanOID := strings.TrimSpace(string(out))
+
+	matcher := pathmatch.New([]string{"secrets/**"})
+	req := uploadPackRequestWants(t, true, orphanOID) // blob want, no resolvable path
+
+	var buf bytes.Buffer
+	if err := gitproto.ServeUploadPackEnforced(ctx, &buf, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced should return nil after writing ERR, got err=%v", err)
+	}
+	reason := assertUploadPackErr(t, buf.Bytes())
+	if !strings.Contains(reason, "denied") {
+		t.Errorf("ERR reason = %q, want it to mention denial (fail-closed for unresolvable blob)", reason)
+	}
+}
+
+// TestServeUploadPackEnforced_OnDemandBlob_MixedWantWithDeniedBlob verifies
+// that a request mixing a commit want (full clone) with a denied on-demand
+// blob want REFUSES the whole fetch with ERR (fail-closed — never partially
+// serve a fetch that contains a denied blob the agent explicitly requested).
+func TestServeUploadPackEnforced_OnDemandBlob_MixedWantWithDeniedBlob(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, tip := readRepoForProtection(t)
+	m := readProtectionMirror(t, source)
+
+	secretOID := strings.TrimSpace(mustOutput(t, "git", "-C", h_BarePath(t, m), "rev-parse", "HEAD:secrets/secret.txt"))
+
+	matcher := pathmatch.New([]string{"secrets/**"})
+	// commit want (full clone) + denied blob want (on-demand) in one request.
+	req := uploadPackRequestWants(t, true, tip, secretOID)
+
+	var out bytes.Buffer
+	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced should return nil after writing ERR, got err=%v", err)
+	}
+	assertUploadPackErr(t, out.Bytes())
+	// No packfile: the ERR is the only pkt-line (assertUploadPackErr checks).
+}
+
+// mustOutput runs a command and returns trimmed stdout, failing the test on a
+// non-zero exit (local to this file; the integration package has its own).
+func mustOutput(t *testing.T, name string, args ...string) string {
+	t.Helper()
+	out, err := exec.Command(name, args...).Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			t.Fatalf("%s %s: %v\n%s", name, strings.Join(args, " "), err, ee.Stderr)
+		}
+		t.Fatalf("%s %s: %v", name, strings.Join(args, " "), err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// h_BarePath returns the filesystem path to the bare upstream the mirror was
+// cloned from (re-derived from the mirror's remote). The on-demand tests use
+// it to rev-parse blob OIDs directly from the upstream bare repo.
+func h_BarePath(t *testing.T, m *gitx.Mirror) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", m.Dir(), "config", "--get", "remote.origin.url").Output()
+	if err != nil {
+		t.Fatalf("get remote.origin.url: %v", err)
+	}
+	u := strings.TrimSpace(string(out))
+	// The mirror was opened with file://<bareRoot> and repo "repo.git"; the
+	// remote URL is file://<bareRoot>/repo.git. Strip file:// to get the path.
+	return strings.TrimPrefix(u, "file://")
 }
