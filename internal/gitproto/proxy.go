@@ -82,6 +82,14 @@ func (p *Proxy) SetReadDeny(matcher *pathmatch.Matcher) {
 	p.readDenyMatcher = matcher
 }
 
+// ReadDenyOn reports whether read protection is wired on this proxy (the
+// read-deny matcher is non-nil). Transports use it to decide whether to
+// re-emit the upload-pack advertisement as v0 + filter cap (the read-protected
+// path) or pass it through verbatim. It mirrors the per-frontend matcher state
+// the HTTP frontend holds separately (frontend.go readDeny field); the SSH
+// frontend does not hold its own copy and queries the proxy it owns.
+func (p *Proxy) ReadDenyOn() bool { return p.readDenyMatcher != nil }
+
 // UploadPack handles a git-upload-pack (fetch/clone) exchange. With read
 // protection OFF (readDenyMatcher == nil) it is passthrough: the agent's request
 // body is parsed for the inspection seam and forwarded to the upstream, and the

@@ -304,6 +304,17 @@ func writeUploadPackErr(w io.Writer, reason string) error {
 	return e.EncodeString("ERR " + reason + "\n")
 }
 
+// WriteUploadPackErr writes a single v0 upload-pack `ERR <reason>\n` pkt-line to
+// w. It is the exported form of writeUploadPackErr, reused by the SSH frontend
+// to abort a fetch with a structured error when the ref advertisement fetch,
+// parse, or emit fails (fail-closed: the agent gets a clear error and the
+// session does NOT proceed to negotiation, so no unprotected objects are
+// served). The reason MUST be generic and fail-closed (no upstream creds, no
+// secret content).
+func WriteUploadPackErr(w io.Writer, reason string) error {
+	return writeUploadPackErr(w, reason)
+}
+
 // onDemandBlobDenyReason classifies the want OIDs by git object type and, for
 // each BLOB want (an on-demand blob fetch), resolves the OID back to its
 // path(s) via oidpath.Resolve and checks the read deny matcher. It returns
