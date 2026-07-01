@@ -210,7 +210,7 @@ func (f *Frontend) handleInfoRefsReadProtected(w http.ResponseWriter, r *http.Re
 	// with a truncated/partial v0 advertisement; buffer + 502-on-error so the
 	// client sees a real failure instead of a malformed advertisement.
 	var buf bytes.Buffer
-	if err := gitproto.EmitRefAdvertisementV0(&buf, adv, []string{"filter"}); err != nil {
+	if err := gitproto.EmitRefAdvertisementV0(&buf, adv, []string{"filter", "allow-reachable-sha1-in-want"}); err != nil {
 		log.Printf("httpfront: read-protected info/refs emit for repo %q: %v", repo, err)
 		http.Error(w, "advertisement emit failed", http.StatusBadGateway)
 		return
