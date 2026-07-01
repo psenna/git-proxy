@@ -248,6 +248,12 @@ func parseObjectPaths(out []byte) []ObjectPath {
 // This is the read-protection packfile-assembly primitive: the caller feeds the
 // ALLOWED OID list (denied blobs omitted), so the resulting packfile genuinely
 // excludes the withheld objects even when trees reference them.
+//
+// NOTE: PackObjects materializes the ENTIRE packfile in memory and is retained
+// for tests / small-pack callers. The read-enforce SERVING path uses
+// PackObjectsStream instead, which streams pack-objects output through a pipe
+// so memory is bounded by the chunk size regardless of packfile size (no
+// unbounded in-memory accumulation).
 func (m *Mirror) PackObjects(ctx context.Context, oids []string, thin bool) ([]byte, error) {
 	if len(oids) == 0 {
 		return nil, nil
@@ -272,6 +278,74 @@ func (m *Mirror) PackObjects(ctx context.Context, oids []string, thin bool) ([]b
 		return nil, fmt.Errorf("gitx: pack-objects: %w: %s", err, redactCreds(strings.TrimSpace(stderr.String())))
 	}
 	return stdout.Bytes(), nil
+}
+
+// PackObjectsStream runs `git pack-objects --stdout [--thin]` reading the OID
+// list from stdin and returns a reader over the packfile plus a wait function.
+// The wait function MUST be called after the reader is fully drained (or
+// closed/abandoned) and returns the pack-objects exit error (nil on success);
+// it closes the reader end if needed so a partially-drained stream cannot
+// deadlock the per-mirror goroutine.
+//
+// Memory is bounded by the pipe buffer and the consumer's read buffer: the full
+// packfile is NEVER materialized in memory regardless of its size. This is the
+// serving path used by the read-enforce flow so a large read-protected repo
+// cannot OOM the proxy while assembling the pack (the push path caps request
+// size via maxPackfileBytes/LimitReader; the read path caps served size by
+// streaming instead of buffering).
+//
+// The per-mirror mutex is held until the command completes; the caller MUST
+// drain or abandon the reader (via the wait function) so the goroutine can
+// finish and release the mutex.
+//
+// thin MUST stay false on the read-enforce path: a thin pack re-includes
+// withheld blobs as delta bases, breaking read protection (see readEnforceThin).
+func (m *Mirror) PackObjectsStream(ctx context.Context, oids []string, thin bool) (io.Reader, func() error, error) {
+	if len(oids) == 0 {
+		return bytes.NewReader(nil), func() error { return nil }, nil
+	}
+	m.mu.Lock()
+	args := []string{"pack-objects", "--stdout"}
+	if thin {
+		args = append(args, "--thin")
+	}
+	cmd := exec.CommandContext(ctx, "git", fullArgs(m.dir, args...)...)
+	var stdin strings.Builder
+	for _, oid := range oids {
+		stdin.WriteString(oid)
+		stdin.WriteByte('\n')
+	}
+	cmd.Stdin = strings.NewReader(stdin.String())
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+
+	var cmdErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer m.mu.Unlock()
+		cmdErr = cmd.Run()
+		if cmdErr != nil {
+			cmdErr = fmt.Errorf("gitx: pack-objects: %w: %s", cmdErr, redactCreds(strings.TrimSpace(stderr.String())))
+		}
+		// Closing the writer signals EOF to the reader once the process has
+		// exited and all stdout has been copied through the pipe.
+		_ = pw.Close()
+	}()
+
+	wait := func() error {
+		// Close the reader to unblock the writer goroutine if the stream was
+		// not fully drained (e.g. pack-objects failed or the consumer stopped
+		// reading). Idempotent: a second close on an already-closed pipe reader
+		// is a no-op error that we discard.
+		_ = pr.Close()
+		<-done
+		return cmdErr
+	}
+	return pr, wait, nil
 }
 
 // fullArgs prepends `-C dir` to a git argv, mirroring runGit's behavior for the

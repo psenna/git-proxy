@@ -2,6 +2,7 @@ package gitproto
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -119,22 +120,85 @@ func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRe
 	// acceptable to a client that advertised thin-pack (thin-pack is a "may"
 	// capability the server may decline, not a "must"); the client's checkout
 	// only needs the objects it actually received. Documented v1 deviation from
-	// the "pass --thin when the client requested it" guidance.
-	pack, err := mirror.PackObjects(ctx, allowed, false)
+	// the "pass --thin when the client requested it" guidance. The
+	// readEnforceThin constant hardens against accidental re-enablement.
+	packReader, packWait, err := mirror.PackObjectsStream(ctx, allowed, false)
 	if err != nil {
 		return fmt.Errorf("gitproto: upload-pack enforce: pack-objects: %w", err)
 	}
 
-	return writeV0UploadPackResponse(w, pack, req.Caps)
+	return writeV0UploadPackResponse(w, packReader, packWait, req.Caps)
 }
 
-// writeV0UploadPackResponse writes a v0 upload-pack response containing pack
-// to w: a NAK pkt-line, then the packfile muxed over side-band-64k (or
-// side-band) channel 1 with a terminating flush-pkt when the client requested a
-// sideband capability, or the packfile raw after the NAK pkt-line when no
-// sideband was negotiated. A real git clone always requests side-band-64k, so
-// the muxed path is the validated one; the raw path covers non-sideband clients.
-func writeV0UploadPackResponse(w io.Writer, pack []byte, caps []string) error {
+// writeV0UploadPackResponse writes a v0 upload-pack response to w: a NAK
+// pkt-line, then the packfile (read from pack and produced by pack-objects)
+// muxed over side-band-64k (or side-band) channel 1 with a terminating
+// flush-pkt when the client requested a sideband capability, or the packfile
+// raw after the NAK pkt-line when no sideband was negotiated. A real git clone
+// always requests side-band-64k, so the muxed path is the validated one; the
+// raw path covers non-sideband clients.
+//
+// STREAMING + FAIL-CLOSED: the packfile is streamed through the side-band muxer
+// in bounded chunks (the muxer splits each Write into MaxPackedSize64k frames;
+// io.Copy uses a 32 KiB read buffer) so the full packfile is NEVER materialized
+// in memory — memory is bounded by the chunk size regardless of packfile size,
+// closing the read-path OOM gap (the push path caps request size; the read path
+// caps served size by streaming).
+//
+// To preserve fail-closed semantics with streaming, the function:
+//  1. Reads the FIRST chunk of pack-objects output BEFORE writing anything to w.
+//     If pack-objects fails to start (no output + a wait error), the error is
+//     returned and NOTHING is written — the caller denies the fetch, no
+//     unprotected/partial packfile reaches the agent.
+//  2. Once a non-empty head chunk is in hand, commits to streaming (writes the
+//     NAK + head + remainder). If pack-objects then fails MID-STREAM, the wait
+//     error is surfaced and the sideband flush-pkt ("0000") is NOT written, so
+//     the agent receives a truncated, trailer-less packfile that does not look
+//     complete rather than a valid-looking pack — fail-closed in the sense that
+//     no valid complete pack is served. The returned error lets the caller log
+//     the failure.
+//
+// packWait MUST be called exactly once after the reader is drained or abandoned;
+// it closes the reader (unblocking the producer goroutine) and returns the
+// pack-objects exit error.
+func writeV0UploadPackResponse(w io.Writer, pack io.Reader, packWait func() error, caps []string) error {
+	// Read the first chunk to detect a pack-objects startup failure BEFORE
+	// committing any bytes to w. 4 KiB is large enough to be meaningful yet
+	// bounded; the muxer re-chunks the remainder regardless.
+	const headSize = 4096
+	head := make([]byte, headSize)
+	n, readErr := io.ReadFull(pack, head)
+	// io.ReadFull returns io.EOF when no bytes were read at all (empty pack)
+	// and io.ErrUnexpectedEOF when some but fewer than headSize bytes were read
+	// (pack smaller than headSize); both are normal end-of-input, not errors.
+	if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+		// Genuine read error before any data: fail closed without writing.
+		_ = packWait()
+		return fmt.Errorf("gitproto: read pack head: %w", readErr)
+	}
+
+	// Empty pack (n == 0): nothing to stream. Check packWait for a hidden
+	// error, then emit NAK + sideband flush only (or NAK only for raw).
+	if n == 0 {
+		if werr := packWait(); werr != nil {
+			return fmt.Errorf("gitproto: pack-objects: %w", werr)
+		}
+		e := pktline.NewEncoder(w)
+		if err := e.EncodeString("NAK\n"); err != nil {
+			return fmt.Errorf("gitproto: encode NAK: %w", err)
+		}
+		if uploadPackSidebandType(caps) != noSideband {
+			if _, err := w.Write([]byte("0000")); err != nil {
+				return fmt.Errorf("gitproto: flush sideband (empty): %w", err)
+			}
+		}
+		return nil
+	}
+
+	// n > 0: commit to streaming. Write the NAK, then stream the head chunk and
+	// the remainder through the muxer (or raw). The muxer splits each Write into
+	// MaxPackedSize64k (or MaxPackedSize) frames internally, so memory stays
+	// bounded by io.Copy's 32 KiB buffer + one muxer frame.
 	e := pktline.NewEncoder(w)
 	if err := e.EncodeString("NAK\n"); err != nil {
 		return fmt.Errorf("gitproto: encode NAK: %w", err)
@@ -142,28 +206,59 @@ func writeV0UploadPackResponse(w io.Writer, pack []byte, caps []string) error {
 	switch uploadPackSidebandType(caps) {
 	case sideband.Sideband64k:
 		m := sideband.NewMuxer(sideband.Sideband64k, w)
-		if _, err := m.Write(pack); err != nil {
-			return fmt.Errorf("gitproto: mux packfile (64k): %w", err)
+		if _, err := m.Write(head[:n]); err != nil {
+			_ = packWait()
+			return fmt.Errorf("gitproto: mux packfile head (64k): %w", err)
+		}
+		if _, err := io.Copy(m, pack); err != nil {
+			_ = packWait()
+			return fmt.Errorf("gitproto: stream packfile (64k): %w", err)
+		}
+		// Fail-closed: check the producer's exit error BEFORE the final flush.
+		// On mid-stream pack-objects failure, return WITHOUT writing the
+		// flush-pkt so the agent sees a truncated, incomplete packfile.
+		if werr := packWait(); werr != nil {
+			return fmt.Errorf("gitproto: pack-objects failed mid-stream: %w", werr)
 		}
 		if _, err := w.Write([]byte("0000")); err != nil {
 			return fmt.Errorf("gitproto: flush sideband (64k): %w", err)
 		}
 	case sideband.Sideband:
 		m := sideband.NewMuxer(sideband.Sideband, w)
-		if _, err := m.Write(pack); err != nil {
-			return fmt.Errorf("gitproto: mux packfile: %w", err)
+		if _, err := m.Write(head[:n]); err != nil {
+			_ = packWait()
+			return fmt.Errorf("gitproto: mux packfile head: %w", err)
+		}
+		if _, err := io.Copy(m, pack); err != nil {
+			_ = packWait()
+			return fmt.Errorf("gitproto: stream packfile: %w", err)
+		}
+		if werr := packWait(); werr != nil {
+			return fmt.Errorf("gitproto: pack-objects failed mid-stream: %w", werr)
 		}
 		if _, err := w.Write([]byte("0000")); err != nil {
 			return fmt.Errorf("gitproto: flush sideband: %w", err)
 		}
 	default:
 		// No sideband negotiated: write the packfile raw after the NAK pkt-line.
-		if _, err := w.Write(pack); err != nil {
-			return fmt.Errorf("gitproto: write packfile: %w", err)
+		if _, err := w.Write(head[:n]); err != nil {
+			_ = packWait()
+			return fmt.Errorf("gitproto: write packfile head: %w", err)
+		}
+		if _, err := io.Copy(w, pack); err != nil {
+			_ = packWait()
+			return fmt.Errorf("gitproto: stream packfile: %w", err)
+		}
+		if werr := packWait(); werr != nil {
+			return fmt.Errorf("gitproto: pack-objects failed mid-stream: %w", werr)
 		}
 	}
 	return nil
 }
+
+// noSideband is the sentinel sideband type meaning the agent did not negotiate
+// side-band-64k or side-band (compare against uploadPackSidebandType's result).
+const noSideband = sideband.Type(-1)
 
 // uploadPackSidebandType reports which sideband capability (if any) the agent
 // advertised in its upload-pack request capabilities. Returns sideband.Sideband64k

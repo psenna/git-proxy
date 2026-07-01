@@ -3,6 +3,7 @@ package gitproto_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"os"
@@ -347,6 +348,128 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// readRepoWithLargeFile builds a source repo whose payload file is large enough
+// that `git pack-objects` produces a packfile LARGER than a single side-band-64k
+// muxer frame (MaxPackedSize64k = 65520 bytes). Incompressible random bytes are
+// used so compression cannot shrink the pack below the chunk threshold. Returns
+// the source dir and the tip SHA.
+func readRepoWithLargeFile(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	mustGit(t, "", "init", "-q", "-b", "main", dir)
+	mustGit(t, dir, "config", "user.email", "test@example.com")
+	mustGit(t, dir, "config", "user.name", "Test")
+	// 256 KiB of pseudo-random (deterministic) bytes — incompressible, so the
+	// resulting pack exceeds the 64k muxer frame size and forces multi-chunk
+	// streaming. A SHA-256 chain (each block = hash of the previous) yields
+	// deterministic, high-entropy bytes that do not compress.
+	const total = 256 * 1024
+	payload := make([]byte, total)
+	h := sha256.Sum256([]byte("git-proxy streaming test seed"))
+	for off := 0; off < total; off += sha256.Size {
+		h = sha256.Sum256(h[:])
+		n := copy(payload[off:], h[:])
+		_ = n
+	}
+	if err := os.WriteFile(filepath.Join(dir, "big.bin"), payload, 0o644); err != nil {
+		t.Fatalf("write big.bin: %v", err)
+	}
+	mustGit(t, dir, "add", "big.bin")
+	mustGit(t, dir, "commit", "-q", "-m", "add large incompressible file")
+	return dir, revParseHead(t, dir)
+}
+
+// TestServeUploadPackEnforced_StreamsMultiChunkPack is the OOM/streaming
+// regression test. The served packfile (256 KiB of incompressible data) is
+// larger than both the side-band-64k muxer frame (MaxPackedSize64k = 65520) and
+// the writeV0UploadPackResponse head-chunk read (4096), so the streaming path
+// must split it across multiple muxer frames / io.Copy iterations. It asserts:
+//
+//   - The side-band-64k (muxed) path produces a response whose demuxed packfile
+//     is byte-identical to the buffered PackObjects output (streaming does not
+//     corrupt the pack), and the pack is larger than MaxPackedSize64k (proving
+//     the multi-chunk path was actually exercised).
+//   - The raw (non-sideband) path produces a response whose packfile (after the
+//     NAK pkt-line) is byte-identical to the buffered PackObjects output.
+//
+// This keeps memory bounded by the chunk size regardless of packfile size (no
+// unbounded in-memory accumulation), closing the read-path OOM gap.
+func TestServeUploadPackEnforced_StreamsMultiChunkPack(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, tip := readRepoWithLargeFile(t)
+	m := readProtectionMirror(t, source)
+
+	// Resolve the full OID list the enforce path would pack (no deny matcher →
+	// nothing withheld, so the served pack equals the full-object pack).
+	objs, err := m.WantedObjects(ctx, []string{tip}, nil)
+	if err != nil {
+		t.Fatalf("WantedObjects: %v", err)
+	}
+	allOIDs := make([]string, 0, len(objs))
+	for _, op := range objs {
+		allOIDs = append(allOIDs, op.OID)
+	}
+	// Reference packfile from the buffered path — the streaming output MUST
+	// match it byte-for-byte.
+	wantPack, err := m.PackObjects(ctx, allOIDs, false)
+	if err != nil {
+		t.Fatalf("PackObjects reference: %v", err)
+	}
+	if len(wantPack) <= 65520 {
+		t.Fatalf("reference pack %d bytes is not larger than MaxPackedSize64k (65520); test setup insufficient to exercise multi-chunk streaming", len(wantPack))
+	}
+
+	// --- Side-band-64k (muxed) streaming path ---
+	matcher := pathmatch.New(nil) // deny nothing → full pack served
+	req := uploadPackRequest(t, tip, true)
+
+	var out bytes.Buffer
+	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced (sideband): %v", err)
+	}
+	if !bytes.HasPrefix(out.Bytes(), []byte("0008NAK\n")) {
+		t.Fatalf("sideband response missing NAK pkt-line prefix; got %x", out.Bytes()[:min(16, out.Len())])
+	}
+	if !bytes.HasSuffix(out.Bytes(), []byte("0000")) {
+		t.Fatalf("sideband response not terminated by flush-pkt 0000; got %x", out.Bytes()[max(0, out.Len()-8):])
+	}
+	gotPack := demuxSidebandPack(t, out.Bytes())
+	if !bytes.Equal(gotPack, wantPack) {
+		t.Fatalf("sideband streamed pack = %d bytes, want %d (byte-identical to buffered PackObjects); first diff at %d",
+			len(gotPack), len(wantPack), firstDiffOffset(gotPack, wantPack))
+	}
+
+	// --- Raw (non-sideband) streaming path ---
+	reqRaw := uploadPackRequest(t, tip, false)
+	var outRaw bytes.Buffer
+	if err := gitproto.ServeUploadPackEnforced(ctx, &outRaw, reqRaw, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced (raw): %v", err)
+	}
+	gotRawPack := rawPackAfterNAK(t, outRaw.Bytes())
+	if !bytes.Equal(gotRawPack, wantPack) {
+		t.Fatalf("raw streamed pack = %d bytes, want %d (byte-identical to buffered PackObjects); first diff at %d",
+			len(gotRawPack), len(wantPack), firstDiffOffset(gotRawPack, wantPack))
+	}
+}
+
+// firstDiffOffset returns the index of the first differing byte between a and b,
+// or -1 if one is a prefix of the other (or equal). Used by the streaming test to
+// pinpoint a corruption offset.
+func firstDiffOffset(a, b []byte) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return -1
 }
 
 // writeFile writes content to dir/name (helper local to this file since the
