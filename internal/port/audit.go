@@ -61,6 +61,14 @@ type AuditEvent struct {
 	// DeniedOIDs are on-demand blob OIDs refused with ERR (Task 10). nil for
 	// push and for non-read-protected fetches.
 	DeniedOIDs []string
+
+	// DryRun is true when the op was forwarded despite a deny verdict (dry-run
+	// mode, Task 13: observe-before-enforce — the proxy records the would-be
+	// deny but forwards the push so teams can see violations before turning on
+	// enforcement). false when the deny was enforced (the op was blocked) and
+	// for all allow events. Additive field (default false) — preserves the
+	// Task 12 audit behavior when dry-run is off.
+	DryRun bool
 }
 
 // AuditRef is one ref update in a pushed receive-pack command, for the audit
