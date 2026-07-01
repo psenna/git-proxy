@@ -27,6 +27,7 @@
 package sshfront
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -196,8 +197,15 @@ func (f *Frontend) handleSession(ctx context.Context, sconn *ssh.ServerConn, cha
 		case "exec":
 			f.handleExec(ctx, sconn, channel, req)
 			return
+		case "env":
+			// git sends an env request to negotiate protocol v2
+			// (GIT_PROTOCOL=version=2). We do NOT honor it (v2-over-SSH is out
+			// of scope for v1) — replying false makes git fall back to v0, which
+			// is what we advertise. Acknowledging it would make git expect a v2
+			// advertisement and hang on our v0 one.
+			_ = req.Reply(false, nil)
 		default:
-			// Reject shell, pty, env, subsystem, etc. Git only exec's.
+			// Reject shell, pty, subsystem, etc. Git only exec's.
 			_ = req.Reply(false, nil)
 		}
 	}
@@ -213,12 +221,14 @@ func (f *Frontend) handleExec(ctx context.Context, sconn *ssh.ServerConn, channe
 	// Acknowledge the exec request; the payload is the command string.
 	_ = req.Reply(true, nil)
 
-	cmdBytes := req.Payload
-	if len(cmdBytes) == 0 {
-		f.failSession(channel, "sshfront: empty exec command")
+	// The exec request payload is an SSH string: uint32 length + command
+	// bytes. Parse it; a malformed payload (too short / wrong length) is
+	// rejected fail-closed (unknown command).
+	cmd, parsed := parseSSHString(req.Payload)
+	if !parsed || cmd == "" {
+		f.failSession(channel, "sshfront: empty or malformed exec command")
 		return
 	}
-	cmd := string(cmdBytes)
 	service, repo, ok := parseExecCommand(cmd)
 	if !ok {
 		f.failSession(channel, fmt.Sprintf("sshfront: refusing unknown command: %q", cmd))
@@ -255,10 +265,32 @@ func (f *Frontend) runGitSession(ctx context.Context, channel ssh.Channel, servi
 		return err
 	}
 	// Hand the channel's stdin/stdout to the proxy for negotiation + packfile.
+	//
+	// upload-pack: the git client does NOT send EOF after `done` (it keeps the
+	// channel open for the response), but Proxy.UploadPack does io.ReadAll(body)
+	// (shaped for an HTTP request body that self-terminates). So the SSH frontend
+	// frames the channel's stdin into the bounded upload-pack request (until
+	// done+flush) and hands a bytes.Reader of that framed request as the body.
+	// The proxy forwards the framed bytes to the upstream verbatim and streams
+	// the packfile back to the channel — exactly the HTTP frontend's path. This
+	// is the necessary SSH-specific adaptation beyond the ref advertisement
+	// (the brief named the advertisement as the only SSH-specific piece; the
+	// stdin framing is an unavoidable consequence of the duplex channel vs the
+	// bounded HTTP body — flagged as a deviation). v0-only, single-round fetch.
+	//
+	// receive-pack: the client sends commands + flush + packfile, then EOFs
+	// (closes the write side) after the packfile — so io.ReadAll(channel) returns
+	// the full push and the raw channel can be handed directly (no framing).
 	var streamErr error
 	switch service {
 	case "git-upload-pack":
-		streamErr = f.proxy.UploadPack(ctx, repo, channel, channel)
+		body, rerr := readUploadPackRequest(channel)
+		if rerr != nil {
+			writeSessionError(channel, service, rerr)
+			_ = sendExitStatus(channel, 1)
+			return rerr
+		}
+		streamErr = f.proxy.UploadPack(ctx, repo, bytes.NewReader(body), channel)
 	case "git-receive-pack":
 		streamErr = f.proxy.ReceivePack(ctx, repo, channel, channel)
 	}
@@ -291,8 +323,12 @@ func (f *Frontend) writeAdvertisement(ctx context.Context, w io.Writer, service,
 	if service == "git-upload-pack" && f.proxy.ReadDenyOn() {
 		extraCaps = []string{"filter", "allow-reachable-sha1-in-want"}
 	}
-	if err := gitproto.EmitRefAdvertisementRaw(w, adv, extraCaps); err != nil {
+	var buf bytes.Buffer
+	if err := gitproto.EmitRefAdvertisementRaw(&buf, adv, extraCaps); err != nil {
 		return fmt.Errorf("sshfront: emit advertisement: %w", err)
+	}
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		return fmt.Errorf("sshfront: write advertisement: %w", err)
 	}
 	return nil
 }
@@ -342,9 +378,12 @@ func (f *Frontend) repoPath(repo string) string {
 // parseExecCommand parses the SSH exec command string into the git service
 // ("git-upload-pack" | "git-receive-pack") and the repository path. Git sends
 // the path single-quoted, e.g. `git-upload-pack '/repo.git'`. The repo path may
-// be unquoted in some clients; both forms are accepted. Returns ok=false for
-// an unrecognized command (fail-closed). The scp-style `git-upload-pack` with
-// no path argument (used by some older clients) is rejected.
+// be unquoted in some clients; both forms are accepted. A leading slash on the
+// repo path (as sent for ssh:// URLs, e.g. '/repo.git') is stripped so the path
+// matches the HTTP frontend's repo map keys (which have no leading slash —
+// HTTP parsePath strips the host's leading '/'); scp-style paths have no
+// leading slash and are unaffected. Returns ok=false for an unrecognized
+// command (fail-closed).
 func parseExecCommand(cmd string) (service, repo string, ok bool) {
 	cmd = strings.TrimSpace(cmd)
 	for _, svc := range []string{"git-upload-pack", "git-receive-pack"} {
@@ -356,6 +395,12 @@ func parseExecCommand(cmd string) (service, repo string, ok bool) {
 		if strings.HasPrefix(cmd, prefix) {
 			arg := strings.TrimSpace(strings.TrimPrefix(cmd, prefix))
 			repo = unquoteRepo(arg)
+			if repo == "" {
+				return "", "", false
+			}
+			// Normalize a leading slash (ssh:// URL form) so the repo map keys
+			// match the HTTP frontend's (no leading slash).
+			repo = strings.TrimPrefix(repo, "/")
 			if repo == "" {
 				return "", "", false
 			}
@@ -374,4 +419,19 @@ func unquoteRepo(arg string) string {
 		}
 	}
 	return arg
+}
+
+// parseSSHString decodes an SSH string payload (uint32 big-endian length prefix
+// + bytes) as used by the "exec" channel request. Returns the string and
+// ok=false when the payload is too short or the length field exceeds the
+// remaining bytes (malformed — fail-closed).
+func parseSSHString(payload []byte) (string, bool) {
+	if len(payload) < 4 {
+		return "", false
+	}
+	n := binary.BigEndian.Uint32(payload[:4])
+	if int(n) > len(payload)-4 {
+		return "", false
+	}
+	return string(payload[4 : 4+n]), true
 }
