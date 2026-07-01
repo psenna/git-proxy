@@ -228,6 +228,14 @@ func StartWithPolicy(t *testing.T, repo string, pol config.PolicyConfig) *Harnes
 	up := plain.New(h.UpstreamURL, nil)
 	frontend := httpfront.New(ln, up, h.UpstreamURL, map[string]string{h.Repo: h.Repo}, nil, nil)
 	frontend.SetEnforcement(eng, opener, pol.MaxPackfileBytesOrDefault())
+	// Read protection: wire the proxy-level fetch path matcher when configured.
+	// Fail-closed on malformed patterns (mirrors main.go startup validation).
+	if pol.ReadDenyEnabled() {
+		if bad := pol.MalformedReadDenyPatterns(); len(bad) > 0 {
+			t.Fatalf("read protection: malformed deny pattern(s): %q", bad)
+		}
+		frontend.SetReadDeny(pol.ReadDenyMatcher())
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)

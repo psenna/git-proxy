@@ -98,6 +98,36 @@ func run(configPath string) error {
 		log.Printf("git-proxy: push enforcement off (no policy rules enabled) — passthrough")
 	}
 
+	// Read protection: build the proxy-level fetch path matcher from
+	// policy.read.deny. With no deny patterns read protection is OFF (the proxy
+	// forwards fetch/clone to the upstream, which speaks whatever the client
+	// negotiated). When set, the proxy assembles the packfile and withholds
+	// blobs whose path matches. Fail closed at startup on a malformed deny
+	// pattern (a typo must not become "deny nothing"). Read protection needs a
+	// mirror opener to compute the object set; if push enforcement is also off
+	// (no mirror wired yet), wire one from policy.mirror.dir (required).
+	if cfg.Policy.ReadDenyEnabled() {
+		if bad := cfg.Policy.MalformedReadDenyPatterns(); len(bad) > 0 {
+			return fmt.Errorf("config: policy.read.deny has malformed pattern(s): %q", bad)
+		}
+		mirrorDir := cfg.Policy.Mirror.Dir
+		if mirrorDir == "" {
+			return fmt.Errorf("config: policy.mirror.dir is required when read protection is enabled")
+		}
+		// If push enforcement is off, no mirror opener has been wired yet; build
+		// one for the read-protection fetch path. When push enforcement is on,
+		// the opener from SetEnforcement is reused (the proxy already holds it).
+		if !cfg.Policy.HasEnabledRules() {
+			opener := newMirrorOpener(cfg.Upstream.URL, mirrorDir, creds)
+			frontend.SetEnforcement(nil, opener, cfg.Policy.MaxPackfileBytesOrDefault())
+		}
+		frontend.SetReadDeny(cfg.Policy.ReadDenyMatcher())
+		log.Printf("git-proxy: read protection enabled (deny patterns=%d, mirror=%s)",
+			len(cfg.Policy.Read.Deny), mirrorDir)
+	} else {
+		log.Printf("git-proxy: read protection off (no policy.read.deny) — passthrough")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

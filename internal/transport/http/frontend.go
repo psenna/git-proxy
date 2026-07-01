@@ -4,6 +4,7 @@
 package httpfront
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/psenna/git-proxy/internal/auth"
 	"github.com/psenna/git-proxy/internal/gitproto"
+	"github.com/psenna/git-proxy/internal/pathmatch"
 	"github.com/psenna/git-proxy/internal/policy"
 	"github.com/psenna/git-proxy/internal/port"
 )
@@ -29,6 +31,7 @@ type Frontend struct {
 	server      *http.Server
 	creds       port.CredentialStore
 	auth        port.Authenticator
+	readDeny    *pathmatch.Matcher // nil → info/refs passthrough (read protection off)
 }
 
 // New returns a Frontend that listens on ln, forwards POST streams through up,
@@ -82,6 +85,17 @@ func (f *Frontend) SetEnforcement(engine *policy.Engine, opener gitproto.MirrorO
 	f.proxy.SetEnforcement(engine, opener, maxBytes)
 }
 
+// SetReadDeny wires read-protection into the frontend and its proxy. When
+// matcher is non-nil, info/refs for git-upload-pack is re-emitted as v0 with the
+// filter capability (the client falls back to v0 and may request a partial
+// clone), and the proxy's UploadPack assembles a filtered packfile. When nil,
+// read protection is OFF and info/refs stays reverse-proxied (passthrough) —
+// existing fetch/clone behavior is preserved. Call before Serve.
+func (f *Frontend) SetReadDeny(matcher *pathmatch.Matcher) {
+	f.readDeny = matcher
+	f.proxy.SetReadDeny(matcher)
+}
+
 // handle routes a single smart-HTTP request to one of the three endpoints.
 func (f *Frontend) handle(w http.ResponseWriter, r *http.Request) {
 	if f.auth != nil {
@@ -118,10 +132,20 @@ func (f *Frontend) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleInfoRefs reverse-proxies ref discovery to the upstream, preserving the
-// service query parameter. Both upload-pack and receive-pack advertisements
-// flow through untouched.
+// handleInfoRefs handles ref discovery. With read protection OFF
+// (f.readDeny == nil) it reverse-proxies the upstream advertisement untouched
+// (both upload-pack and receive-pack). With read protection ON and the service
+// is git-upload-pack, the proxy CONTROLS the advertisement: it fetches the
+// upstream advertisement WITHOUT forwarding the client's Git-Protocol header
+// (so the upstream returns v0), parses it, and re-emits it as v0 with the filter
+// capability so the client may request a partial clone and negotiates v0 (the
+// read-protected upload-pack response is v0-only in v1). git-receive-pack
+// advertisements are always passthrough (push is enforced separately).
 func (f *Frontend) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo string) {
+	if f.readDeny != nil && r.URL.Query().Get("service") == "git-upload-pack" {
+		f.handleInfoRefsReadProtected(w, r, repo)
+		return
+	}
 	url := f.upstreamURL + "/" + repo + "/info/refs"
 	if r.URL.RawQuery != "" {
 		url += "?" + r.URL.RawQuery
@@ -142,6 +166,59 @@ func (f *Frontend) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo s
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		log.Printf("httpfront: info/refs stream: %v", err)
+	}
+}
+
+// handleInfoRefsReadProtected fetches the upstream git-upload-pack advertisement
+// as v0 (dropping the client's Git-Protocol header so the upstream does not
+// return v2), parses it, and re-emits it as v0 with the filter capability.
+// Fail-closed: any upstream/parse/encode error yields a 502 (the agent never sees
+// a usable advertisement that would let it fetch unprotected objects).
+func (f *Frontend) handleInfoRefsReadProtected(w http.ResponseWriter, r *http.Request, repo string) {
+	url := f.upstreamURL + "/" + repo + "/info/refs?service=git-upload-pack"
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	f.applyUpstreamCreds(req, repo)
+	// Deliberately do NOT forward the client's Git-Protocol header: without it
+	// the upstream returns a v0 advertisement, which the proxy can parse and
+	// re-emit as v0 + filter cap. Forwarding version=2 would force the upstream
+	// into v2 format and break the v0 downgrade.
+	resp, err := f.client.Do(req)
+	if err != nil {
+		log.Printf("httpfront: read-protected info/refs upstream fetch for repo %q: %v", repo, err)
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("httpfront: read-protected info/refs upstream status %s for repo %q", resp.Status, repo)
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+		return
+	}
+	adv, err := gitproto.ParseRefAdvertisement(resp.Body)
+	if err != nil {
+		log.Printf("httpfront: read-protected info/refs parse for repo %q: %v", repo, err)
+		http.Error(w, "advertisement parse failed", http.StatusBadGateway)
+		return
+	}
+	// Buffer the re-emitted advertisement and only commit headers (status +
+	// Content-Type) + body on a successful emit. Writing Content-Type before
+	// EmitRefAdvertisementV0 and only logging an emit error would send a 200
+	// with a truncated/partial v0 advertisement; buffer + 502-on-error so the
+	// client sees a real failure instead of a malformed advertisement.
+	var buf bytes.Buffer
+	if err := gitproto.EmitRefAdvertisementV0(&buf, adv, []string{"filter"}); err != nil {
+		log.Printf("httpfront: read-protected info/refs emit for repo %q: %v", repo, err)
+		http.Error(w, "advertisement emit failed", http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		log.Printf("httpfront: read-protected info/refs write for repo %q: %v", repo, err)
 	}
 }
 

@@ -1,6 +1,7 @@
 package gitx
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -181,6 +182,229 @@ func (m *Mirror) IsAncestor(ctx context.Context, old, new string) (bool, error) 
 		return false, fmt.Errorf("gitx: merge-base --is-ancestor %s %s: %w", old, new, err)
 	}
 	return true, nil
+}
+
+// ObjectPath is a single object in the wanted set: the object id and, for
+// blobs and non-root trees, the path `git rev-list --objects` reports it at.
+// Path is "" for commits and the root tree of a commit (which rev-list emits
+// without a path). Used by the read-protection path to enumerate the objects the
+// proxy must pack and to withhold blobs whose path matches the read deny
+// matcher.
+type ObjectPath struct {
+	OID  string
+	Path string
+}
+
+// WantedObjects returns the objects reachable from wants excluding haves, with
+// paths for blobs/trees as `git rev-list --objects <wants> --not <haves>` prints
+// them: each output line is `<oid>` (commits and the root tree, no path) or
+// `<oid> <path>` (blobs and non-root trees, with the path they are reachable at).
+// The per-mirror mutex is held so the rev-list does not race a concurrent
+// Refresh/IngestPackfile. A nil/empty wants list yields an empty result.
+func (m *Mirror) WantedObjects(ctx context.Context, wants, haves []string) ([]ObjectPath, error) {
+	if len(wants) == 0 {
+		return nil, nil
+	}
+	args := make([]string, 0, 2+len(wants)+len(haves)+1)
+	args = append(args, "rev-list", "--objects")
+	args = append(args, wants...)
+	if len(haves) > 0 {
+		args = append(args, "--not")
+		args = append(args, haves...)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out, err := runGit(ctx, m.dir, args...)
+	if err != nil {
+		return nil, fmt.Errorf("gitx: wanted objects: %w", err)
+	}
+	return parseObjectPaths(out), nil
+}
+
+// parseObjectPaths parses `git rev-list --objects` output into ObjectPath values.
+// Each line is `<oid>` or `<oid> <path>`; trailing newlines are stripped from the
+// path. Empty lines are ignored.
+func parseObjectPaths(out []byte) []ObjectPath {
+	lines := splitCleanLines(out)
+	objs := make([]ObjectPath, 0, len(lines))
+	for _, line := range lines {
+		sp := strings.IndexByte(line, ' ')
+		if sp < 0 {
+			objs = append(objs, ObjectPath{OID: line})
+			continue
+		}
+		objs = append(objs, ObjectPath{OID: line[:sp], Path: line[sp+1:]})
+	}
+	return objs
+}
+
+// ReadEnforceThin is the thin flag the read-enforce path MUST pass to
+// PackObjects/PackObjectsStream. A thin pack re-includes withheld blobs as
+// delta bases (`git pack-objects --thin` without a receiver have-set walks the
+// listed objects' references and INCLUDES the referenced-but-unlisted blobs),
+// which would break the read-protection guarantee. This exported constant
+// hardens against a future maintainer accidentally re-enabling thin on the
+// read-enforce path: the call site reads `gitx.ReadEnforceThin` instead of a
+// bare `false`, making the constraint self-documenting at the point of use.
+const ReadEnforceThin = false
+
+// PackObjects builds a packfile containing exactly the given object ids (no
+// reachability walk) via `git pack-objects --stdout [--thin]` reading the OID
+// list from stdin. With thin=true it produces a thin pack (deltas may reference
+// bases the receiver already has); with thin=false the pack is self-contained.
+// The per-mirror mutex is held so pack-objects does not race a concurrent
+// Refresh/IngestPackfile on the shared bare dir.
+//
+// This is the read-protection packfile-assembly primitive: the caller feeds the
+// ALLOWED OID list (denied blobs omitted), so the resulting packfile genuinely
+// excludes the withheld objects even when trees reference them.
+//
+// thin MUST stay false on the read-enforce path: a thin pack re-includes
+// withheld blobs as delta bases, breaking read protection (see
+// ReadEnforceThin). The thin=true path is exercised by tests for pack-validity
+// only; do NOT route the enforce path through it.
+//
+// NOTE: PackObjects materializes the ENTIRE packfile in memory and is retained
+// for tests / small-pack callers. The read-enforce SERVING path uses
+// PackObjectsStream instead, which streams pack-objects output through a pipe
+// so memory is bounded by the chunk size regardless of packfile size (no
+// unbounded in-memory accumulation).
+func (m *Mirror) PackObjects(ctx context.Context, oids []string, thin bool) ([]byte, error) {
+	if len(oids) == 0 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	args := []string{"pack-objects", "--stdout"}
+	if thin {
+		args = append(args, "--thin")
+	}
+	cmd := exec.CommandContext(ctx, "git", fullArgs(m.dir, args...)...)
+	var stdin strings.Builder
+	for _, oid := range oids {
+		stdin.WriteString(oid)
+		stdin.WriteByte('\n')
+	}
+	cmd.Stdin = strings.NewReader(stdin.String())
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("gitx: pack-objects: %w: %s", err, redactCreds(strings.TrimSpace(stderr.String())))
+	}
+	return stdout.Bytes(), nil
+}
+
+// PackObjectsStream runs `git pack-objects --stdout [--thin]` reading the OID
+// list from stdin and returns a reader over the packfile plus a wait function.
+// The wait function MUST be called after the reader is fully drained (or
+// closed/abandoned) and returns the pack-objects exit error (nil on success);
+// it closes the reader end if needed so a partially-drained stream cannot
+// deadlock the per-mirror goroutine.
+//
+// Memory is bounded by the pipe buffer and the consumer's read buffer: the full
+// packfile is NEVER materialized in memory regardless of its size. This is the
+// serving path used by the read-enforce flow so a large read-protected repo
+// cannot OOM the proxy while assembling the pack (the push path caps request
+// size via maxPackfileBytes/LimitReader; the read path caps served size by
+// streaming instead of buffering).
+//
+// The per-mirror mutex is held until the command completes; the caller MUST
+// drain or abandon the reader (via the wait function) so the goroutine can
+// finish and release the mutex.
+//
+// thin MUST stay false on the read-enforce path: a thin pack re-includes
+// withheld blobs as delta bases, breaking read protection (see ReadEnforceThin).
+func (m *Mirror) PackObjectsStream(ctx context.Context, oids []string, thin bool) (io.Reader, func() error, error) {
+	if len(oids) == 0 {
+		return bytes.NewReader(nil), func() error { return nil }, nil
+	}
+	m.mu.Lock()
+	args := []string{"pack-objects", "--stdout"}
+	if thin {
+		args = append(args, "--thin")
+	}
+	cmd := exec.CommandContext(ctx, "git", fullArgs(m.dir, args...)...)
+	var stdin strings.Builder
+	for _, oid := range oids {
+		stdin.WriteString(oid)
+		stdin.WriteByte('\n')
+	}
+	cmd.Stdin = strings.NewReader(stdin.String())
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+
+	var cmdErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer m.mu.Unlock()
+		cmdErr = cmd.Run()
+		if cmdErr != nil {
+			cmdErr = fmt.Errorf("gitx: pack-objects: %w: %s", cmdErr, redactCreds(strings.TrimSpace(stderr.String())))
+		}
+		// Closing the writer signals EOF to the reader once the process has
+		// exited and all stdout has been copied through the pipe.
+		_ = pw.Close()
+	}()
+
+	wait := func() error {
+		// Close the reader to unblock the writer goroutine if the stream was
+		// not fully drained (e.g. pack-objects failed or the consumer stopped
+		// reading). Idempotent: a second close on an already-closed pipe reader
+		// is a no-op error that we discard.
+		_ = pr.Close()
+		<-done
+		return cmdErr
+	}
+	return pr, wait, nil
+}
+
+// fullArgs prepends `-C dir` to a git argv, mirroring runGit's behavior for the
+// pack-objects path that needs direct stdin/stdout control.
+func fullArgs(dir string, args ...string) []string {
+	full := make([]string, 0, len(args)+2)
+	full = append(full, "-C", dir)
+	full = append(full, args...)
+	return full
+}
+
+// ObjectTypes returns the git object type ("commit", "tree", "blob", "tag") for
+// each oid via `git cat-file --batch-check --stdin`. A missing object reports
+// "missing". Used by the read-protection path to identify blobs (so only blobs
+// are withheld; subtrees with a non-empty path are kept, preserving the tree
+// structure the agent navigates). The per-mirror mutex is held for
+// serialization. A nil/empty oid list yields nil with no error.
+func (m *Mirror) ObjectTypes(ctx context.Context, oids []string) (map[string]string, error) {
+	if len(oids) == 0 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cmd := exec.CommandContext(ctx, "git", fullArgs(m.dir, "cat-file", "--batch-check")...)
+	var stdin strings.Builder
+	for _, oid := range oids {
+		stdin.WriteString(oid)
+		stdin.WriteByte('\n')
+	}
+	cmd.Stdin = strings.NewReader(stdin.String())
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("gitx: object types: %w: %s", err, redactCreds(strings.TrimSpace(stderr.String())))
+	}
+	types := make(map[string]string, len(oids))
+	for _, line := range splitCleanLines(stdout.Bytes()) {
+		f := strings.Fields(line)
+		if len(f) >= 2 {
+			types[f[0]] = f[1]
+		}
+	}
+	return types, nil
 }
 
 // Dir returns the mirror's bare repo path (for tests/inspection only).

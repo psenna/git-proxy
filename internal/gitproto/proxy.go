@@ -18,6 +18,7 @@ import (
 	"github.com/psenna/git-proxy/internal/auth"
 	"github.com/psenna/git-proxy/internal/gitproto/pktline"
 	"github.com/psenna/git-proxy/internal/gitx"
+	"github.com/psenna/git-proxy/internal/pathmatch"
 	"github.com/psenna/git-proxy/internal/policy"
 	"github.com/psenna/git-proxy/internal/port"
 )
@@ -41,10 +42,11 @@ type MirrorOpener func(ctx context.Context, repo string) (*gitx.Mirror, error)
 // are forwarded verbatim, denied pushes are rejected via a report-status
 // response and the upstream is left unchanged.
 type Proxy struct {
-	up              port.Upstream
-	engine          *policy.Engine // nil → passthrough (policy off)
-	mirrorOpener    MirrorOpener   // nil → passthrough
-	maxPackfileBytes int64          // cap when enforcement is on; 0 → default
+	up               port.Upstream
+	engine           *policy.Engine    // nil → passthrough (policy off)
+	mirrorOpener     MirrorOpener      // nil → passthrough
+	maxPackfileBytes int64             // cap when enforcement is on; 0 → default
+	readDenyMatcher  *pathmatch.Matcher // nil → passthrough (read protection off)
 }
 
 // New returns a Proxy that forwards through up in passthrough mode (no policy).
@@ -66,27 +68,74 @@ func (p *Proxy) SetEnforcement(engine *policy.Engine, opener MirrorOpener, maxBy
 	p.maxPackfileBytes = maxBytes
 }
 
-// UploadPack handles a git-upload-pack (fetch/clone) exchange. The agent's
-// request body (want/have negotiation) is parsed for the inspection seam and
-// forwarded to the upstream; the upstream's response is parsed and forwarded
-// byte-exact to the agent.
+// SetReadDeny wires the read-protection fetch path: when matcher is non-nil, the
+// proxy ASSEMBLES the upload-pack packfile (it does not forward) and withholds
+// blobs whose path matches the matcher, serving a v0 response. When matcher is
+// nil, read protection is OFF and UploadPack stays passthrough (forward to
+// upstream, which speaks whatever the client negotiated) — existing
+// fetch/clone/passthrough behavior is preserved. Read protection is a
+// PROXY-LEVEL path matcher (pathmatch), NOT the engine's all-or-nothing
+// EvaluateFetch; it is not routed through the policy engine. The mirror opener
+// (shared with push enforcement) is used to fetch the object set; if it is nil
+// when a matcher is set, every read-protected fetch fails closed (deny).
+func (p *Proxy) SetReadDeny(matcher *pathmatch.Matcher) {
+	p.readDenyMatcher = matcher
+}
+
+// UploadPack handles a git-upload-pack (fetch/clone) exchange. With read
+// protection OFF (readDenyMatcher == nil) it is passthrough: the agent's request
+// body is parsed for the inspection seam and forwarded to the upstream, and the
+// upstream's response is streamed back byte-exact. With read protection ON
+// (readDenyMatcher != nil) the proxy ASSEMBLES the packfile (it does not
+// forward): it opens the inspection mirror, computes the wanted object set,
+// withholds blobs whose path matches the deny matcher, packs the rest, and
+// serves a v0 upload-pack response. Fail-closed: any error in the read-enforce
+// path returns an error and the caller MUST deny the fetch (no unprotected
+// packfile, no passthrough fallback when read protection is on).
 func (p *Proxy) UploadPack(ctx context.Context, repo string, body io.Reader, w io.Writer) error {
 	buf, err := io.ReadAll(body)
 	if err != nil {
 		return fmt.Errorf("gitproto: read upload-pack request: %w", err)
 	}
-	// Parse the request for the inspection seam. Failures are non-fatal:
-	// passthrough must not break on an unparseable request, and no policy is
-	// applied yet.
-	if _, perr := ParseUploadPackRequest(bytes.NewReader(buf)); perr != nil {
-		log.Printf("gitproto: upload-pack request parse: %v", perr)
+
+	// Read protection OFF → passthrough (existing behavior preserved). The
+	// request is parsed for the inspection seam but failures are non-fatal.
+	if p.readDenyMatcher == nil {
+		if _, perr := ParseUploadPackRequest(bytes.NewReader(buf)); perr != nil {
+			log.Printf("gitproto: upload-pack request parse: %v", perr)
+		}
+		rc, err := p.up.UploadPack(ctx, repo, bytes.NewReader(buf))
+		if err != nil {
+			return fmt.Errorf("gitproto: upload-pack: %w", err)
+		}
+		defer func() { _ = rc.Close() }()
+		return forwardStream(rc, w)
 	}
-	rc, err := p.up.UploadPack(ctx, repo, bytes.NewReader(buf))
+
+	// --- Read protection ON (fail-closed) ---
+	// A read-protected fetch requires a mirror to compute the object set. No
+	// mirror opener means the proxy cannot safely assemble a packfile → deny.
+	if p.mirrorOpener == nil {
+		log.Printf("gitproto: upload-pack deny: read protection on but no mirror opener for repo %q", repo)
+		return fmt.Errorf("gitproto: upload-pack enforce: mirror unavailable")
+	}
+	// Parse the request strictly. An unparseable request cannot be safely
+	// enforced → fail closed (do not forward an uninspected request).
+	req, perr := ParseUploadPackRequest(bytes.NewReader(buf))
+	if perr != nil {
+		log.Printf("gitproto: upload-pack deny: unparseable request for repo %q: %v", repo, perr)
+		return fmt.Errorf("gitproto: upload-pack enforce: parse request: %w", perr)
+	}
+	mirror, err := p.mirrorOpener(ctx, repo)
 	if err != nil {
-		return fmt.Errorf("gitproto: upload-pack: %w", err)
+		log.Printf("gitproto: upload-pack deny: mirror open for repo %q: %v", repo, err)
+		return fmt.Errorf("gitproto: upload-pack enforce: mirror open: %w", err)
 	}
-	defer func() { _ = rc.Close() }()
-	return forwardStream(rc, w)
+	if err := ServeUploadPackEnforced(ctx, w, req, mirror, p.readDenyMatcher, repo); err != nil {
+		log.Printf("gitproto: upload-pack deny: enforce for repo %q: %v", repo, err)
+		return fmt.Errorf("gitproto: upload-pack enforce: %w", err)
+	}
+	return nil
 }
 
 // ReceivePack handles a git-receive-pack (push) exchange. The agent's request
