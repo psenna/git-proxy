@@ -253,7 +253,7 @@ func TestServeUploadPackEnforced_DenyWithholdsSecretBlob(t *testing.T) {
 	req := uploadPackRequest(t, tip, true)
 
 	var out bytes.Buffer
-	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
 		t.Fatalf("ServeUploadPackEnforced: %v", err)
 	}
 
@@ -302,7 +302,7 @@ func TestServeUploadPackEnforced_AllowWhenNoDeny(t *testing.T) {
 	req := uploadPackRequest(t, tip, true)
 
 	var out bytes.Buffer
-	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
 		t.Fatalf("ServeUploadPackEnforced: %v", err)
 	}
 	pack := demuxSidebandPack(t, out.Bytes())
@@ -325,7 +325,7 @@ func TestServeUploadPackEnforced_NonSidebandRawPack(t *testing.T) {
 	req := uploadPackRequest(t, tip, false) // no side-band-64k
 
 	var out bytes.Buffer
-	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
 		t.Fatalf("ServeUploadPackEnforced: %v", err)
 	}
 	pack := rawPackAfterNAK(t, out.Bytes())
@@ -365,7 +365,7 @@ func TestServeUploadPackEnforced_FailClosedOnBogusWant(t *testing.T) {
 	req := uploadPackRequest(t, strings.Repeat("1", 40), true) // bogus want
 
 	var out bytes.Buffer
-	err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git")
+	_, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git")
 	if err == nil {
 		t.Fatalf("expected fail-closed error for bogus want, got nil; response %x", out.Bytes())
 	}
@@ -390,7 +390,7 @@ func TestServeUploadPackEnforced_FailClosedOnContextCancel(t *testing.T) {
 	req := uploadPackRequest(t, tip, true)
 
 	var out bytes.Buffer
-	err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git")
+	_, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git")
 	if err == nil {
 		t.Fatalf("expected error on canceled context, got nil")
 	}
@@ -495,7 +495,7 @@ func TestServeUploadPackEnforced_StreamsMultiChunkPack(t *testing.T) {
 	req := uploadPackRequest(t, tip, true)
 
 	var out bytes.Buffer
-	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
 		t.Fatalf("ServeUploadPackEnforced (sideband): %v", err)
 	}
 	if !bytes.HasPrefix(out.Bytes(), []byte("0008NAK\n")) {
@@ -513,7 +513,7 @@ func TestServeUploadPackEnforced_StreamsMultiChunkPack(t *testing.T) {
 	// --- Raw (non-sideband) streaming path ---
 	reqRaw := uploadPackRequest(t, tip, false)
 	var outRaw bytes.Buffer
-	if err := gitproto.ServeUploadPackEnforced(ctx, &outRaw, reqRaw, m, matcher, "repo.git"); err != nil {
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &outRaw, reqRaw, m, matcher, "repo.git"); err != nil {
 		t.Fatalf("ServeUploadPackEnforced (raw): %v", err)
 	}
 	gotRawPack := rawPackAfterNAK(t, outRaw.Bytes())
@@ -632,7 +632,7 @@ func TestServeUploadPackEnforced_OnDemandBlob_Allow(t *testing.T) {
 	req := uploadPackRequestWants(t, true, readmeOID) // blob want
 
 	var out bytes.Buffer
-	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
 		t.Fatalf("ServeUploadPackEnforced: %v", err)
 	}
 	pack := demuxSidebandPack(t, out.Bytes())
@@ -656,7 +656,7 @@ func TestServeUploadPackEnforced_OnDemandBlob_DenyByPath(t *testing.T) {
 	req := uploadPackRequestWants(t, true, secretOID) // blob want (denied)
 
 	var out bytes.Buffer
-	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
 		t.Fatalf("ServeUploadPackEnforced should return nil after writing ERR, got err=%v", err)
 	}
 	reason := assertUploadPackErr(t, out.Bytes())
@@ -696,7 +696,7 @@ func TestServeUploadPackEnforced_OnDemandBlob_UnresolvableDeny(t *testing.T) {
 	req := uploadPackRequestWants(t, true, orphanOID) // blob want, no resolvable path
 
 	var buf bytes.Buffer
-	if err := gitproto.ServeUploadPackEnforced(ctx, &buf, req, m, matcher, "repo.git"); err != nil {
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &buf, req, m, matcher, "repo.git"); err != nil {
 		t.Fatalf("ServeUploadPackEnforced should return nil after writing ERR, got err=%v", err)
 	}
 	reason := assertUploadPackErr(t, buf.Bytes())
@@ -723,7 +723,7 @@ func TestServeUploadPackEnforced_OnDemandBlob_MixedWantWithDeniedBlob(t *testing
 	req := uploadPackRequestWants(t, true, tip, secretOID)
 
 	var out bytes.Buffer
-	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
 		t.Fatalf("ServeUploadPackEnforced should return nil after writing ERR, got err=%v", err)
 	}
 	assertUploadPackErr(t, out.Bytes())

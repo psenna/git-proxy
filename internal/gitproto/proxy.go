@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp/sideband"
 	"github.com/psenna/git-proxy/internal/auth"
@@ -47,6 +48,8 @@ type Proxy struct {
 	mirrorOpener     MirrorOpener      // nil → passthrough
 	maxPackfileBytes int64             // cap when enforcement is on; 0 → default
 	readDenyMatcher  *pathmatch.Matcher // nil → passthrough (read protection off)
+	audit            port.AuditSink    // nil → no audit (preserves existing behavior)
+	transport        string            // "http" | "ssh" — which frontend carried the op
 }
 
 // New returns a Proxy that forwards through up in passthrough mode (no policy).
@@ -81,6 +84,17 @@ func (p *Proxy) SetEnforcement(engine *policy.Engine, opener MirrorOpener, maxBy
 func (p *Proxy) SetReadDeny(matcher *pathmatch.Matcher) {
 	p.readDenyMatcher = matcher
 }
+
+// SetAuditSink wires an optional audit sink. A nil sink means no audit (the
+// pre-audit behavior is preserved — no event is recorded). Call before Serve.
+// The sink is best-effort: a Record error is logged and does NOT change the
+// verdict or block the git op (the decision stands regardless of audit).
+func (p *Proxy) SetAuditSink(s port.AuditSink) { p.audit = s }
+
+// SetTransport stamps the frontend tag ("http" or "ssh") carried in audit
+// events. Each frontend owns its own *Proxy and stamps its tag once at wiring.
+// The default "" is valid (the field is informational in the audit record).
+func (p *Proxy) SetTransport(tag string) { p.transport = tag }
 
 // ReadDenyOn reports whether read protection is wired on this proxy (the
 // read-deny matcher is non-nil). Transports use it to decide whether to
@@ -136,8 +150,11 @@ func (p *Proxy) UploadPack(ctx context.Context, repo string, body io.Reader, w i
 	// --- Read protection ON (fail-closed) ---
 	// A read-protected fetch requires a mirror to compute the object set. No
 	// mirror opener means the proxy cannot safely assemble a packfile → deny.
+	agent := agentName(ctx)
 	if p.mirrorOpener == nil {
 		log.Printf("gitproto: upload-pack deny: read protection on but no mirror opener for repo %q", repo)
+		p.recordAudit(ctx, "git-upload-pack", agent, repo, "deny",
+			[]string{"read protection on but no mirror opener"}, nil, nil, nil)
 		return fmt.Errorf("gitproto: upload-pack enforce: mirror unavailable")
 	}
 	// Parse the request strictly. An unparseable request cannot be safely
@@ -145,17 +162,39 @@ func (p *Proxy) UploadPack(ctx context.Context, repo string, body io.Reader, w i
 	req, perr := ParseUploadPackRequest(bytes.NewReader(buf))
 	if perr != nil {
 		log.Printf("gitproto: upload-pack deny: unparseable request for repo %q: %v", repo, perr)
+		p.recordAudit(ctx, "git-upload-pack", agent, repo, "deny",
+			[]string{"unparseable upload-pack request"}, nil, nil, nil)
 		return fmt.Errorf("gitproto: upload-pack enforce: parse request: %w", perr)
 	}
 	mirror, err := p.mirrorOpener(ctx, repo)
 	if err != nil {
 		log.Printf("gitproto: upload-pack deny: mirror open for repo %q: %v", repo, err)
+		p.recordAudit(ctx, "git-upload-pack", agent, repo, "deny",
+			[]string{"inspection mirror unavailable"}, nil, nil, nil)
 		return fmt.Errorf("gitproto: upload-pack enforce: mirror open: %w", err)
 	}
-	if err := ServeUploadPackEnforced(ctx, w, req, mirror, p.readDenyMatcher, repo); err != nil {
+	result, err := ServeUploadPackEnforced(ctx, w, req, mirror, p.readDenyMatcher, repo)
+	if err != nil {
 		log.Printf("gitproto: upload-pack deny: enforce for repo %q: %v", repo, err)
+		p.recordAudit(ctx, "git-upload-pack", agent, repo, "deny",
+			[]string{"upload-pack enforce failed"}, nil, nil, nil)
 		return fmt.Errorf("gitproto: upload-pack enforce: %w", err)
 	}
+	// Success: decide the audit verdict from the withheld/denied summary. A
+	// fully-allowed read-protected fetch (zero denials) records an "allow" event
+	// with empty DeniedPaths/OIDs so the log shows the op happened (flagged
+	// choice). Any withheld path or on-demand-denied OID → "deny" event.
+	verdict := "allow"
+	var reasons []string
+	if len(result.DeniedOIDs) > 0 {
+		verdict = "deny"
+		reasons = []string{"on-demand blob denied by read policy"}
+	} else if len(result.DeniedPaths) > 0 {
+		verdict = "deny"
+		reasons = []string{"blob withheld by read policy"}
+	}
+	p.recordAudit(ctx, "git-upload-pack", agent, repo, verdict, reasons, nil,
+		result.DeniedPaths, result.DeniedOIDs)
 	return nil
 }
 
@@ -203,8 +242,14 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 
 	// Passthrough when enforcement is off (no engine or no mirror opener).
 	// This preserves the existing passthrough/auth behavior when policy is
-	// unconfigured.
+	// unconfigured. Audit decision (flagged): record a bare "allow" event so
+	// the audit log reflects all git traffic (useful for forensics) — the event
+	// carries the pushed refs (if the request parsed) and NO reasons. If this
+	// adds risk in a future compliance mode, scope to policy-active ops and
+	// document the gap; for v1 the bare allow is cheap and observability-useful.
 	if !enforce {
+		p.recordAudit(ctx, "git-receive-pack", agentName(ctx), repo, "allow",
+			nil, auditRefsFromRequest(req), nil, nil)
 		return p.forwardReceivePack(ctx, repo, buf, w)
 	}
 
@@ -224,6 +269,7 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 		if req != nil {
 			p.writeDenyResponse(w, req, dec)
 		}
+		p.recordPushAudit(ctx, repo, req, dec)
 		return nil
 	}
 
@@ -234,6 +280,8 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 	// requests, so this is an edge case.
 	if perr != nil || req == nil {
 		log.Printf("gitproto: receive-pack deny: unparseable request for repo %q: %v", repo, perr)
+		p.recordAudit(ctx, "git-receive-pack", agentName(ctx), repo, "deny",
+			[]string{"push rejected: unparseable request"}, nil, nil, nil)
 		return nil
 	}
 
@@ -246,6 +294,7 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 		}
 		log.Printf("gitproto: receive-pack deny: mirror open for repo %q: %v", repo, err)
 		p.writeDenyResponse(w, req, dec)
+		p.recordPushAudit(ctx, repo, req, dec)
 		return nil
 	}
 	if err := mirror.Refresh(ctx); err != nil {
@@ -256,6 +305,7 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 		}
 		log.Printf("gitproto: receive-pack deny: mirror refresh for repo %q: %v", repo, err)
 		p.writeDenyResponse(w, req, dec)
+		p.recordPushAudit(ctx, repo, req, dec)
 		return nil
 	}
 	if req.PackfileOffset >= 0 && int64(len(buf)) > req.PackfileOffset {
@@ -268,6 +318,7 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 			}
 			log.Printf("gitproto: receive-pack deny: ingest packfile for repo %q: %v", repo, err)
 			p.writeDenyResponse(w, req, dec)
+			p.recordPushAudit(ctx, repo, req, dec)
 			return nil
 		}
 	}
@@ -278,10 +329,12 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 		log.Printf("gitproto: receive-pack enforcement error for repo %q: %v", repo, enErr)
 	}
 	if dec.Verdict == port.VerdictAllow {
+		p.recordPushAudit(ctx, repo, req, dec)
 		return p.forwardReceivePack(ctx, repo, buf, w)
 	}
 	log.Printf("gitproto: receive-pack deny for repo %q agent %q: %v", repo, agent, dec.Reasons)
 	p.writeDenyResponse(w, req, dec)
+	p.recordPushAudit(ctx, repo, req, dec)
 	return nil
 }
 
@@ -366,6 +419,81 @@ func agentName(ctx context.Context) string {
 		return a.Name
 	}
 	return ""
+}
+
+// recordAudit is the best-effort audit recorder. A nil sink → no-op (preserves
+// the pre-audit behavior). A Record error is LOGGED and swallowed: the policy
+// decision is enforced independently of audit (audit is observability, not a
+// gate — a disk-full audit must NOT change the verdict or block the git op).
+// The event is stamped with time.Now here (in the I/O layer, NOT in the pure
+// policy engine) and the frontend's transport tag.
+func (p *Proxy) recordAudit(ctx context.Context, service, agent, repo, verdict string,
+	reasons []string, refs []port.AuditRef, deniedPaths, deniedOIDs []string) {
+	if p.audit == nil {
+		return
+	}
+	e := port.AuditEvent{
+		Time:        time.Now(),
+		Transport:   p.transport,
+		Agent:       agent,
+		Repo:        repo,
+		Service:     service,
+		Verdict:     verdict,
+		Reasons:     reasons,
+		Refs:        refs,
+		DeniedPaths: deniedPaths,
+		DeniedOIDs:  deniedOIDs,
+	}
+	if err := p.audit.Record(ctx, e); err != nil {
+		log.Printf("gitproto: audit record: %v", err)
+	}
+}
+
+// auditRefsFromRequest builds the AuditRef list from a parsed receive-pack
+// request's commands. The ref/old/new OIDs are not blob content — safe to log.
+// Force is left false here: the wire command carries no force flag (force is a
+// derived property computed inside EnforceReceivePack's ancestry walk, not
+// re-derived for the audit record). The ref/old/new are the load-bearing
+// fields for forensics.
+func auditRefsFromRequest(req *ReceivePackRequest) []port.AuditRef {
+	if req == nil {
+		return nil
+	}
+	refs := make([]port.AuditRef, 0, len(req.Commands))
+	for _, c := range req.Commands {
+		refs = append(refs, port.AuditRef{Ref: c.Ref, Old: c.Old, New: c.New})
+	}
+	return refs
+}
+
+// reasonsFromDecision extracts the agent-facing reason messages from a Decision.
+// These are the generic, already-redacted port.Reason.Message strings — never
+// blob content or upstream creds (the no-leak contract).
+func reasonsFromDecision(dec port.Decision) []string {
+	if len(dec.Reasons) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(dec.Reasons))
+	for _, r := range dec.Reasons {
+		out = append(out, r.Message)
+	}
+	return out
+}
+
+// verdictString maps a port.Verdict to the audit verdict string.
+func verdictString(v port.Verdict) string {
+	if v == port.VerdictDeny {
+		return "deny"
+	}
+	return "allow"
+}
+
+// recordPushAudit records a push (git-receive-pack) decision. It carries the
+// agent, repo, verdict, the pushed refs, and the generic reasons. nil sink →
+// no-op. Best-effort: a Record error is logged, never returned.
+func (p *Proxy) recordPushAudit(ctx context.Context, repo string, req *ReceivePackRequest, dec port.Decision) {
+	p.recordAudit(ctx, "git-receive-pack", agentName(ctx), repo,
+		verdictString(dec.Verdict), reasonsFromDecision(dec), auditRefsFromRequest(req), nil, nil)
 }
 
 // deniedRefs returns the refs of every command in the request, for use as the
