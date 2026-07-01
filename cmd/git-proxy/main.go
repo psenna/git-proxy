@@ -18,10 +18,11 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/psenna/git-proxy/internal/audit/file"
 	"github.com/psenna/git-proxy/internal/auth/keyauth"
 	"github.com/psenna/git-proxy/internal/auth/token"
 	"github.com/psenna/git-proxy/internal/config"
-	"github.com/psenna/git-proxy/internal/credentials/file"
+	credfile "github.com/psenna/git-proxy/internal/credentials/file"
 	"github.com/psenna/git-proxy/internal/gitproto"
 	"github.com/psenna/git-proxy/internal/gitx"
 	"github.com/psenna/git-proxy/internal/policy"
@@ -59,7 +60,7 @@ func run(configPath string) error {
 	// startup.
 	var creds port.CredentialStore
 	if cfg.Upstream.CredentialsFile != "" {
-		store, err := file.New(cfg.Upstream.CredentialsFile)
+		store, err := credfile.New(cfg.Upstream.CredentialsFile)
 		if err != nil {
 			return fmt.Errorf("load credentials: %w", err)
 		}
@@ -77,6 +78,25 @@ func run(configPath string) error {
 
 	up := plain.New(cfg.Upstream.URL, creds)
 	httpFrontend := httpfront.New(ln, up, cfg.Upstream.URL, cfg.Repos, auth, creds)
+
+	// Audit sink: append-only JSONL file. Built once and wired into BOTH
+	// frontends' proxies (each owns its own *gitproto.Proxy). Empty
+	// audit.file → disabled (nil sink, the proxy skips recording — existing
+	// behavior). When set, fail fast at startup if the file cannot be opened
+	// (fail-closed at startup, NOT per-op: a misconfigured audit path is a
+	// startup error, not a silent gap). The sink is closed on shutdown.
+	var auditSink *file.Sink
+	if cfg.Audit.File != "" {
+		s, err := file.New(cfg.Audit.File)
+		if err != nil {
+			return fmt.Errorf("audit: open %s: %w", cfg.Audit.File, err)
+		}
+		auditSink = s
+		httpFrontend.SetAuditSink(auditSink, "http")
+		log.Printf("git-proxy: audit enabled (file=%s)", cfg.Audit.File)
+	} else {
+		log.Printf("git-proxy: audit off (no audit.file) — audit disabled")
+	}
 
 	// Enforcement state, built once and wired into BOTH the HTTP and SSH
 	// frontends so policy applies identically across transports. The engine is
@@ -163,6 +183,11 @@ func run(configPath string) error {
 		}
 		sshFE.SetEnforcement(eng, opener, maxBytes)
 		sshFE.SetReadDeny(readDeny)
+		// Audit the SSH frontend with its own transport tag (the sink is shared
+		// with HTTP; each frontend stamps its tag into its events).
+		if auditSink != nil {
+			sshFE.SetAuditSink(auditSink, "ssh")
+		}
 		transports = append(transports, sshFE)
 		log.Printf("git-proxy: SSH frontend enabled: listen=%s", cfg.SSH.Listen)
 	}
@@ -170,7 +195,15 @@ func run(configPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	return serveTransports(ctx, stop, transports)
+	err = serveTransports(ctx, stop, transports)
+	// Graceful shutdown: close the audit sink (flush-safe; the file is
+	// append-only so close never loses already-written lines). Best-effort.
+	if auditSink != nil {
+		if cerr := auditSink.Close(); cerr != nil {
+			log.Printf("git-proxy: close audit sink: %v", cerr)
+		}
+	}
+	return err
 }
 
 // serveTransports runs all wired transports concurrently and returns when ctx

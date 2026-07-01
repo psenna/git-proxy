@@ -32,6 +32,7 @@ import (
 	"github.com/psenna/git-proxy/internal/port"
 	httpfront "github.com/psenna/git-proxy/internal/transport/http"
 	"github.com/psenna/git-proxy/internal/upstream/plain"
+	fileaudit "github.com/psenna/git-proxy/internal/audit/file"
 )
 
 // Harness holds a running upstream git HTTP server and proxy pair.
@@ -52,11 +53,19 @@ type Harness struct {
 	// VaultPath is the filesystem path to the credential vault file when the
 	// proxy is started with a vault (StartWithAuth). Empty when no vault.
 	VaultPath string
+	// AuditFile is the filesystem path to the JSONL audit log when the proxy is
+	// started with audit enabled (StartWithPolicyAndAudit). Empty when no audit.
+	AuditFile string
 
 	upstreamSrv *httptest.Server
 	ln          net.Listener
 	cancel      context.CancelFunc
 	errCh       chan error
+	// onClose is invoked from Close AFTER the frontend has fully stopped (the
+	// errCh drain returns), so any buffered writes (e.g. audit events) land
+	// before the hook runs. nil when nothing needs closing. Set by builders
+	// that wire extra resources whose lifetime must follow the frontend.
+	onClose func()
 }
 
 // gitHTTPBackendPath locates the git-http-backend CGI executable.
@@ -197,6 +206,24 @@ func StartWithAuth(t *testing.T, repo, agentToken string, vaultCreds map[string]
 // Params). An empty/nil rule set yields passthrough (use Start instead).
 func StartWithPolicy(t *testing.T, repo string, pol config.PolicyConfig) *Harness {
 	t.Helper()
+	return startWithPolicy(t, repo, pol, "")
+}
+
+// StartWithPolicyAndAudit is StartWithPolicy plus an append-only JSONL audit
+// sink wired into the proxy's frontend with the "http" transport tag. The
+// audit file is created at auditFile (parent dirs created); the harness closes
+// the sink on Close. h.AuditFile is set so tests can read the JSONL events.
+// Use to assert audit events for push allow/deny and read-protected fetch.
+func StartWithPolicyAndAudit(t *testing.T, repo string, pol config.PolicyConfig, auditFile string) *Harness {
+	t.Helper()
+	return startWithPolicy(t, repo, pol, auditFile)
+}
+
+// startWithPolicy is the shared builder for StartWithPolicy and
+// StartWithPolicyAndAudit. auditFile is empty → no audit; non-empty → a file
+// sink is opened (fail-closed at test startup on open error) and wired in.
+func startWithPolicy(t *testing.T, repo string, pol config.PolicyConfig, auditFile string) *Harness {
+	t.Helper()
 
 	h := Start(t, repo)
 	// Stop the passthrough frontend Start built and rebuild with enforcement.
@@ -236,6 +263,20 @@ func StartWithPolicy(t *testing.T, repo string, pol config.PolicyConfig) *Harnes
 		}
 		frontend.SetReadDeny(pol.ReadDenyMatcher())
 	}
+	// Audit: wire an append-only JSONL file sink when an audit path is given.
+	// Fail-closed at test startup on open error (mirrors main.go). The sink is
+	// closed after the frontend stops so all buffered writes land before the
+	// test reads the file.
+	var auditSink *fileaudit.Sink
+	if auditFile != "" {
+		s, err := fileaudit.New(auditFile)
+		if err != nil {
+			t.Fatalf("audit: open %s: %v", auditFile, err)
+		}
+		auditSink = s
+		frontend.SetAuditSink(auditSink, "http")
+		h.AuditFile = auditFile
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -245,6 +286,18 @@ func StartWithPolicy(t *testing.T, repo string, pol config.PolicyConfig) *Harnes
 	h.ln = ln
 	h.cancel = cancel
 	h.errCh = errCh
+	if auditSink != nil {
+		// Close the audit sink after the frontend has fully stopped (the
+		// errCh drain in Close returns), so all buffered audit writes land
+		// before the test reads the JSONL file. errCh is drained exactly once,
+		// in Close — we must NOT consume it here (that would deadlock Close).
+		auditSink := auditSink // capture for the closure
+		h.onClose = func() {
+			if cerr := auditSink.Close(); cerr != nil {
+				t.Logf("close audit sink: %v", cerr)
+			}
+		}
+	}
 	return h
 }
 
@@ -305,6 +358,13 @@ func (h *Harness) Close() {
 	if h.errCh != nil {
 		<-h.errCh
 		h.errCh = nil
+	}
+	// onClose runs after the frontend has fully stopped (the errCh drain
+	// above), so any buffered writes (e.g. audit events) land before the hook
+	// closes its sink. Single place that drains errCh; no double read.
+	if h.onClose != nil {
+		h.onClose()
+		h.onClose = nil
 	}
 	if h.upstreamSrv != nil {
 		h.upstreamSrv.Close()

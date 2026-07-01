@@ -14,12 +14,26 @@ import (
 	"github.com/psenna/git-proxy/internal/pathmatch"
 )
 
+// UploadPackEnforceResult summarizes a read-protected fetch enforcement pass
+// for audit: DeniedPaths are the blob paths withheld from the packfile (Task 9),
+// DeniedOIDs are the on-demand blob OIDs refused with ERR (Task 10). A zero
+// value (both empty) means the fetch was fully allowed — no withholdings, no
+// on-demand denials. The caller (proxy.go) uses it to build the audit event:
+// any non-empty DeniedPaths/DeniedOIDs → verdict deny; both empty → allow.
+// Paths and OIDs are not blob content — safe to log (no-leak contract).
+type UploadPackEnforceResult struct {
+	DeniedPaths []string // blob paths withheld from the packfile (Task 9)
+	DeniedOIDs  []string // on-demand blob OIDs refused with ERR (Task 10)
+}
+
 // ServeUploadPackEnforced assembles a filtered packfile for a read-protected
 // fetch and writes a v0 upload-pack response to w. It withholds blobs whose path
 // matches readDenyMatcher, keeping commits and trees intact, so the agent sees
 // the tree entry pointing at a now-missing blob (the on-demand fetch for that
 // blob is denied by Task 10). The proxy — not the client — assembles the
-// packfile, so denial is enforced regardless of client cooperation.
+// packfile, so denial is enforced regardless of client cooperation. It returns
+// an UploadPackEnforceResult summarizing what was withheld/denied for audit
+// (the caller records the audit event — recording stays in the I/O layer).
 //
 // Behavior (mirrors the push enforce fail-closed discipline):
 //  1. Refresh the inspection mirror (fail-closed on error).
@@ -50,10 +64,10 @@ import (
 // so the client negotiates v0 here. v2 fetch support is a documented v1
 // follow-up.
 func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRequest,
-	mirror *gitx.Mirror, readDenyMatcher *pathmatch.Matcher, repo string) error {
+	mirror *gitx.Mirror, readDenyMatcher *pathmatch.Matcher, repo string) (UploadPackEnforceResult, error) {
 
 	if err := mirror.Refresh(ctx); err != nil {
-		return fmt.Errorf("gitproto: upload-pack enforce: refresh mirror: %w", err)
+		return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: refresh mirror: %w", err)
 	}
 
 	// --- Task 10: on-demand blob fetch classification (M7b) ---
@@ -80,14 +94,15 @@ func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRe
 	//     stricter than fail-open and may over-deny, but never under-deny.
 	//   - Commit/tag/tree wants and allowed blob wants fall through to the
 	//     existing withholding path, which serves the (allowed) blob.
-	if reason, deny := onDemandBlobDenyReason(ctx, mirror, req.Wants, readDenyMatcher, repo); deny {
+	if reason, deniedOID, deny := onDemandBlobDenyReason(ctx, mirror, req.Wants, readDenyMatcher, repo); deny {
 		log.Printf("gitproto: upload-pack enforce: refusing on-demand fetch for repo %q: %s", repo, reason)
-		return writeUploadPackErr(w, reason)
+		err := writeUploadPackErr(w, reason)
+		return UploadPackEnforceResult{DeniedOIDs: []string{deniedOID}}, err
 	}
 
 	objs, err := mirror.WantedObjects(ctx, req.Wants, req.Haves)
 	if err != nil {
-		return fmt.Errorf("gitproto: upload-pack enforce: wanted objects: %w", err)
+		return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: wanted objects: %w", err)
 	}
 
 	// Collect unique OIDs (in first-seen order) and their resolving paths. Only
@@ -106,7 +121,7 @@ func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRe
 
 	types, err := mirror.ObjectTypes(ctx, oidOrder)
 	if err != nil {
-		return fmt.Errorf("gitproto: upload-pack enforce: object types: %w", err)
+		return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: object types: %w", err)
 	}
 
 	// Build the allowed OID list: keep commits and trees unconditionally; for
@@ -114,6 +129,7 @@ func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRe
 	// matcher matches nothing (read protection off at the path level).
 	allowed := make([]string, 0, len(oidOrder))
 	withheld := 0
+	deniedPaths := make([]string, 0)
 	for _, oid := range oidOrder {
 		if types[oid] != "blob" {
 			allowed = append(allowed, oid)
@@ -130,6 +146,7 @@ func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRe
 			}
 			if denied {
 				withheld++
+				deniedPaths = append(deniedPaths, paths...)
 				log.Printf("gitproto: upload-pack enforce: withholding blob %s in repo %q (denied path(s): %v)",
 					oid, repo, paths)
 				continue
@@ -153,10 +170,13 @@ func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRe
 	// readEnforceThin constant hardens against accidental re-enablement.
 	packReader, packWait, err := mirror.PackObjectsStream(ctx, allowed, gitx.ReadEnforceThin)
 	if err != nil {
-		return fmt.Errorf("gitproto: upload-pack enforce: pack-objects: %w", err)
+		return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: pack-objects: %w", err)
 	}
 
-	return writeV0UploadPackResponse(w, packReader, packWait, req.Caps)
+	if err := writeV0UploadPackResponse(w, packReader, packWait, req.Caps); err != nil {
+		return UploadPackEnforceResult{DeniedPaths: deniedPaths}, err
+	}
+	return UploadPackEnforceResult{DeniedPaths: deniedPaths}, nil
 }
 
 // writeV0UploadPackResponse writes a v0 upload-pack response to w: a NAK
@@ -341,9 +361,9 @@ func WriteUploadPackErr(w io.Writer, reason string) error {
 // the policy, and reveals NO upstream credentials, NO secret content, and NO
 // internal path details (a uniform reason for denied-by-path, unresolvable, and
 // resolve-error avoids leaking which paths exist).
-func onDemandBlobDenyReason(ctx context.Context, mirror *gitx.Mirror, wants []string, readDenyMatcher *pathmatch.Matcher, repo string) (reason string, deny bool) {
+func onDemandBlobDenyReason(ctx context.Context, mirror *gitx.Mirror, wants []string, readDenyMatcher *pathmatch.Matcher, repo string) (reason string, deniedOID string, deny bool) {
 	if len(wants) == 0 || readDenyMatcher == nil {
-		return "", false
+		return "", "", false
 	}
 	types, err := mirror.ObjectTypes(ctx, wants)
 	if err != nil {
@@ -351,7 +371,8 @@ func onDemandBlobDenyReason(ctx context.Context, mirror *gitx.Mirror, wants []st
 		// serve any of them. Report a generic reason for the first want.
 		// (This path is unusual — the existing withholding path would also
 		// fail — but we refuse with a structured ERR rather than a bare 500.)
-		return fmt.Sprintf("access to object %s denied by read policy", firstNonEmpty(wants)), true
+		oid := firstNonEmpty(wants)
+		return fmt.Sprintf("access to object %s denied by read policy", oid), oid, true
 	}
 	for _, oid := range wants {
 		if types[oid] != "blob" {
@@ -362,24 +383,24 @@ func onDemandBlobDenyReason(ctx context.Context, mirror *gitx.Mirror, wants []st
 		if rerr != nil {
 			reason := fmt.Sprintf("access to object %s denied by read policy", oid)
 			log.Printf("gitproto: upload-pack enforce: on-demand resolve error for blob %s in repo %q: %v (denying fail-closed)", oid, repo, rerr)
-			return reason, true
+			return reason, oid, true
 		}
 		if len(paths) == 0 {
 			// Fail-closed: an unresolvable blob (no tree references it) cannot
 			// be proven to be non-denied. Deny with a uniform reason.
 			log.Printf("gitproto: upload-pack enforce: on-demand blob %s in repo %q resolves to no path (denying fail-closed)", oid, repo)
-			return fmt.Sprintf("access to object %s denied by read policy", oid), true
+			return fmt.Sprintf("access to object %s denied by read policy", oid), oid, true
 		}
 		for _, p := range paths {
 			if readDenyMatcher.Match(p) {
 				log.Printf("gitproto: upload-pack enforce: on-demand blob %s in repo %q denied by path %q (paths=%v)", oid, repo, p, paths)
-				return fmt.Sprintf("access to object %s denied by read policy", oid), true
+				return fmt.Sprintf("access to object %s denied by read policy", oid), oid, true
 			}
 		}
 		// Allowed blob want: fall through to the existing withholding path,
 		// which serves it.
 	}
-	return "", false
+	return "", "", false
 }
 
 // firstNonEmpty returns the first non-empty string in s, or "" if all are
