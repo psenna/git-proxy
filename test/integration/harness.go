@@ -206,7 +206,7 @@ func StartWithAuth(t *testing.T, repo, agentToken string, vaultCreds map[string]
 // Params). An empty/nil rule set yields passthrough (use Start instead).
 func StartWithPolicy(t *testing.T, repo string, pol config.PolicyConfig) *Harness {
 	t.Helper()
-	return startWithPolicy(t, repo, pol, "")
+	return startWithPolicy(t, repo, pol, "", false, nil)
 }
 
 // StartWithPolicyAndAudit is StartWithPolicy plus an append-only JSONL audit
@@ -216,13 +216,27 @@ func StartWithPolicy(t *testing.T, repo string, pol config.PolicyConfig) *Harnes
 // Use to assert audit events for push allow/deny and read-protected fetch.
 func StartWithPolicyAndAudit(t *testing.T, repo string, pol config.PolicyConfig, auditFile string) *Harness {
 	t.Helper()
-	return startWithPolicy(t, repo, pol, auditFile)
+	return startWithPolicy(t, repo, pol, auditFile, false, nil)
 }
 
-// startWithPolicy is the shared builder for StartWithPolicy and
-// StartWithPolicyAndAudit. auditFile is empty → no audit; non-empty → a file
-// sink is opened (fail-closed at test startup on open error) and wired in.
-func startWithPolicy(t *testing.T, repo string, pol config.PolicyConfig, auditFile string) *Harness {
+// StartWithPolicyAuditAlerts is StartWithPolicyAndAudit plus dry-run mode and
+// an alert sink wired into the proxy's frontend. dryRun=true enables dry-run
+// (the proxy forwards a clean engine push-deny instead of blocking it). The
+// alertSink (typically a webhook built from an httptest.Server URL) receives
+// an Alert on every deny (enforced or dry-run). A nil alertSink means alerts
+// are off (the proxy never fires an Alert). Use for the dry-run + alerts
+// integration suite (Task 13).
+func StartWithPolicyAuditAlerts(t *testing.T, repo string, pol config.PolicyConfig, auditFile string, dryRun bool, alertSink port.AlertSink) *Harness {
+	t.Helper()
+	return startWithPolicy(t, repo, pol, auditFile, dryRun, alertSink)
+}
+
+// startWithPolicy is the shared builder for StartWithPolicy,
+// StartWithPolicyAndAudit, and StartWithPolicyAuditAlerts. auditFile is empty
+// → no audit; non-empty → a file sink is opened (fail-closed at test startup on
+// open error) and wired in. dryRun enables dry-run mode on the proxy. alertSink
+// (nil → off) is wired into the proxy so denies fire an Alert.
+func startWithPolicy(t *testing.T, repo string, pol config.PolicyConfig, auditFile string, dryRun bool, alertSink port.AlertSink) *Harness {
 	t.Helper()
 
 	h := Start(t, repo)
@@ -276,6 +290,16 @@ func startWithPolicy(t *testing.T, repo string, pol config.PolicyConfig, auditFi
 		auditSink = s
 		frontend.SetAuditSink(auditSink, "http")
 		h.AuditFile = auditFile
+	}
+	// Dry-run + alerts (Task 13): wired into the proxy's frontend alongside
+	// audit. dryRun enables forward-on-clean-engine-deny (policy denies only,
+	// NOT inspection errors). alertSink (nil → off) fires an Alert on every
+	// deny. Best-effort: an alert delivery error never blocks the op.
+	if dryRun {
+		frontend.SetDryRun(true)
+	}
+	if alertSink != nil {
+		frontend.SetAlertSink(alertSink)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
