@@ -15,6 +15,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -29,6 +30,7 @@ type Config struct {
 	Policy   PolicyConfig      `yaml:"policy"`
 	SSH      SSHConfig         `yaml:"ssh"`
 	Audit    AuditConfig       `yaml:"audit"`
+	Alerts   AlertConfig       `yaml:"alerts"`
 }
 
 // AuditConfig configures the optional append-only JSONL audit log. When File
@@ -39,6 +41,21 @@ type Config struct {
 type AuditConfig struct {
 	// File is the filesystem path to the JSONL audit log. Empty → disabled.
 	File string `yaml:"file"`
+}
+
+// AlertConfig configures the optional violation-alert sink. When Webhook is
+// empty/absent alerts are disabled (the pre-alert behavior — no sink wired, the
+// proxy never fires an Alert). When set, main.go builds a webhook alert sink
+// (HTTP POST) at startup, wraps it in a MultiAlertSink with a log sink, and
+// wires it into both frontends; the sink is closed on shutdown. A malformed
+// webhook URL fails fast at startup (a config error), NOT at alert time — an
+// unreachable webhook at runtime is best-effort (logged, never blocks the op).
+// The webhook POST body leaves the proxy, so the Alert payload is treated as a
+// leak surface (no blob content, raw secrets, upstream URLs/creds — see
+// port.Alert no-leak contract).
+type AlertConfig struct {
+	// Webhook is the HTTP(S) URL to POST violation Alerts to. Empty → disabled.
+	Webhook string `yaml:"webhook"`
 }
 
 // UpstreamConfig describes the upstream git server the proxy forwards to.
@@ -115,6 +132,33 @@ func (c *Config) validate() error {
 	// (ephemeral fallback for dev/test, warned at startup).
 	if c.SSH.Listen != "" && len(c.SSH.AuthorizedKeys) == 0 {
 		return fmt.Errorf("config: ssh.authorized_keys is required when ssh.listen is set (an enabled SSH frontend with no authorized keys denies everyone)")
+	}
+	// Alerts: an empty webhook means alerts are disabled (allowed — no
+	// fail-fast). A non-empty but malformed webhook URL is a config error:
+	// fail fast at startup (NOT at alert time) so a typo is caught immediately
+	// rather than silently dropping every alert. An unreachable webhook at
+	// runtime is best-effort (the sink returns a delivery error the proxy logs;
+	// the op proceeds), which is distinct from a malformed URL.
+	if c.Alerts.Webhook != "" {
+		if err := validateWebhookURL(c.Alerts.Webhook); err != nil {
+			return fmt.Errorf("config: alerts.webhook: %w", err)
+		}
+	}
+	return nil
+}
+
+// validateWebhookURL parses u and requires a scheme and host so a malformed
+// webhook URL (e.g. "://not-a-url" or "not a url") fails at startup, not at
+// alert time. Reused by the webhook sink's own construction (internal/alert/
+// webhook) for the same fail-fast guarantee — the config layer fails before
+// the sink is even built.
+func validateWebhookURL(u string) error {
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("missing scheme or host")
 	}
 	return nil
 }

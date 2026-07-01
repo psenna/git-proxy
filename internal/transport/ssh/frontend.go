@@ -127,6 +127,20 @@ func (f *Frontend) SetAuditSink(s port.AuditSink, transport string) {
 	f.proxy.SetTransport(transport)
 }
 
+// SetDryRun enables/disables dry-run mode on the frontend's proxy. When on, the
+// proxy forwards a clean engine push-deny (instead of writing the deny
+// response) and records the TRUE verdict with DryRun=true. Call before Serve.
+// Mirrors httpfront.Frontend. See gitproto.Proxy.SetDryRun for the full
+// semantics (policy denies only, NOT inspection errors; read-protection out of
+// v1 scope).
+func (f *Frontend) SetDryRun(on bool) { f.proxy.SetDryRun(on) }
+
+// SetAlertSink wires an optional alert sink into the frontend's proxy. A nil
+// sink means alerts off (the proxy never fires an Alert). Call before Serve.
+// Best-effort: an Alert error is logged by the proxy and does NOT change the
+// verdict or block the op. Mirrors httpfront.Frontend.
+func (f *Frontend) SetAlertSink(s port.AlertSink) { f.proxy.SetAlertSink(s) }
+
 // Serve serves the frontend until ctx is canceled, then closes the listener.
 // It implements port.Transport.
 func (f *Frontend) Serve(ctx context.Context) error {

@@ -18,6 +18,9 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/psenna/git-proxy/internal/alert"
+	logalert "github.com/psenna/git-proxy/internal/alert/log"
+	"github.com/psenna/git-proxy/internal/alert/webhook"
 	"github.com/psenna/git-proxy/internal/audit/file"
 	"github.com/psenna/git-proxy/internal/auth/keyauth"
 	"github.com/psenna/git-proxy/internal/auth/token"
@@ -96,6 +99,42 @@ func run(configPath string) error {
 		log.Printf("git-proxy: audit enabled (file=%s)", cfg.Audit.File)
 	} else {
 		log.Printf("git-proxy: audit off (no audit.file) — audit disabled")
+	}
+
+	// Alert sink: a webhook that POSTs violation Alerts as JSON, plus a log
+	// (stderr) sink, fanned out via a MultiAlertSink so operators see
+	// violations both in real time (webhook) and in the proxy log. Empty
+	// alerts.webhook → disabled (nil sink, the proxy never fires an Alert —
+	// existing behavior). When set, fail fast at startup ONLY if the webhook
+	// URL is malformed (a config error; config.validate already rejects this,
+	// so webhook.New should not error here — but guard regardless). An
+	// unreachable webhook at runtime is best-effort (the sink returns a
+	// delivery error the proxy logs; the op proceeds regardless). The sink is
+	// closed on shutdown (frees idle HTTP connections).
+	var alertSink port.AlertSink
+	var webhookSink *webhook.Sink
+	if cfg.Alerts.Webhook != "" {
+		ws, err := webhook.New(cfg.Alerts.Webhook)
+		if err != nil {
+			return fmt.Errorf("alerts: webhook: %w", err)
+		}
+		webhookSink = ws
+		alertSink = alert.Multi(ws, logalert.NewSink(nil))
+		httpFrontend.SetAlertSink(alertSink)
+		log.Printf("git-proxy: alerts enabled (webhook=%s)", cfg.Alerts.Webhook)
+	} else {
+		log.Printf("git-proxy: alerts off (no alerts.webhook) — alert disabled")
+	}
+
+	// Dry-run mode: when policy.dry_run is on, the proxy FORWARDS a clean
+	// engine push-deny (instead of writing the deny response) and records the
+	// TRUE verdict (deny) with DryRun=true. The engine stays pure — it returns
+	// the true verdict; dry-run is a proxy-level concern. Default false
+	// (enforce-on-deny — today's behavior). Wired into BOTH frontends so policy
+	// applies identically across HTTP and SSH.
+	if cfg.Policy.DryRun {
+		httpFrontend.SetDryRun(true)
+		log.Printf("git-proxy: dry-run enabled (policy denies are forwarded, not enforced; mode=%s)", cfg.Policy.Mode)
 	}
 
 	// Enforcement state, built once and wired into BOTH the HTTP and SSH
@@ -188,6 +227,15 @@ func run(configPath string) error {
 		if auditSink != nil {
 			sshFE.SetAuditSink(auditSink, "ssh")
 		}
+		// Dry-run + alerts apply identically over SSH (same engine, same proxy
+		// semantics). Each frontend owns its own *gitproto.Proxy, so the sinks /
+		// dry-run flag are wired into the SSH frontend's proxy separately.
+		if cfg.Policy.DryRun {
+			sshFE.SetDryRun(true)
+		}
+		if alertSink != nil {
+			sshFE.SetAlertSink(alertSink)
+		}
 		transports = append(transports, sshFE)
 		log.Printf("git-proxy: SSH frontend enabled: listen=%s", cfg.SSH.Listen)
 	}
@@ -197,10 +245,16 @@ func run(configPath string) error {
 
 	err = serveTransports(ctx, stop, transports)
 	// Graceful shutdown: close the audit sink (flush-safe; the file is
-	// append-only so close never loses already-written lines). Best-effort.
+	// append-only so close never loses already-written lines) and the webhook
+	// alert sink (frees idle HTTP connections). Both best-effort.
 	if auditSink != nil {
 		if cerr := auditSink.Close(); cerr != nil {
 			log.Printf("git-proxy: close audit sink: %v", cerr)
+		}
+	}
+	if webhookSink != nil {
+		if cerr := webhookSink.Close(); cerr != nil {
+			log.Printf("git-proxy: close alert webhook sink: %v", cerr)
 		}
 	}
 	return err

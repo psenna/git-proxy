@@ -33,6 +33,21 @@ type PolicyConfig struct {
 	// (the proxy forwards to the upstream, which speaks whatever the client
 	// negotiated). The same gitignore-style matcher as the push path_acl rule.
 	Read ReadConfig `yaml:"read"`
+	// DryRun enables dry-run mode: the proxy FORWARDS a clean engine push-deny
+	// (instead of writing the deny response) and records the TRUE verdict
+	// (deny) with DryRun=true, so teams observe violations before turning on
+	// enforcement. Default false (enforce-on-deny — today's behavior). Dry-run
+	// softens POLICY denies only, NOT inspection failures (mirror/ancestry/
+	// ingest/parse errors still fail-closed). Read-protection dry-run is OUT of
+	// v1 scope (read protection withholds regardless of dry-run). The engine
+	// stays pure — it returns the true verdict; dry-run is a proxy-level
+	// concern wired via SetDryRun in main.go (NOT in the engine).
+	//
+	// Recommended pairing: mode: collect_all + dry_run: true is the
+	// observe-everything configuration (collect_all reports every violation
+	// rather than short-circuiting on the first, so a dry-run log shows the
+	// full set of violations a push triggers — useful for staged rollout).
+	DryRun bool `yaml:"dry_run"`
 }
 
 // ReadConfig configures proxy-level read protection on fetch/clone. When Deny
