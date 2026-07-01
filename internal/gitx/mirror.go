@@ -238,6 +238,16 @@ func parseObjectPaths(out []byte) []ObjectPath {
 	return objs
 }
 
+// ReadEnforceThin is the thin flag the read-enforce path MUST pass to
+// PackObjects/PackObjectsStream. A thin pack re-includes withheld blobs as
+// delta bases (`git pack-objects --thin` without a receiver have-set walks the
+// listed objects' references and INCLUDES the referenced-but-unlisted blobs),
+// which would break the read-protection guarantee. This exported constant
+// hardens against a future maintainer accidentally re-enabling thin on the
+// read-enforce path: the call site reads `gitx.ReadEnforceThin` instead of a
+// bare `false`, making the constraint self-documenting at the point of use.
+const ReadEnforceThin = false
+
 // PackObjects builds a packfile containing exactly the given object ids (no
 // reachability walk) via `git pack-objects --stdout [--thin]` reading the OID
 // list from stdin. With thin=true it produces a thin pack (deltas may reference
@@ -248,6 +258,11 @@ func parseObjectPaths(out []byte) []ObjectPath {
 // This is the read-protection packfile-assembly primitive: the caller feeds the
 // ALLOWED OID list (denied blobs omitted), so the resulting packfile genuinely
 // excludes the withheld objects even when trees reference them.
+//
+// thin MUST stay false on the read-enforce path: a thin pack re-includes
+// withheld blobs as delta bases, breaking read protection (see
+// ReadEnforceThin). The thin=true path is exercised by tests for pack-validity
+// only; do NOT route the enforce path through it.
 //
 // NOTE: PackObjects materializes the ENTIRE packfile in memory and is retained
 // for tests / small-pack callers. The read-enforce SERVING path uses
@@ -299,7 +314,7 @@ func (m *Mirror) PackObjects(ctx context.Context, oids []string, thin bool) ([]b
 // finish and release the mutex.
 //
 // thin MUST stay false on the read-enforce path: a thin pack re-includes
-// withheld blobs as delta bases, breaking read protection (see readEnforceThin).
+// withheld blobs as delta bases, breaking read protection (see ReadEnforceThin).
 func (m *Mirror) PackObjectsStream(ctx context.Context, oids []string, thin bool) (io.Reader, func() error, error) {
 	if len(oids) == 0 {
 		return bytes.NewReader(nil), func() error { return nil }, nil

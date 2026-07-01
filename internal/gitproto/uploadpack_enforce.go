@@ -122,7 +122,7 @@ func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRe
 	// only needs the objects it actually received. Documented v1 deviation from
 	// the "pass --thin when the client requested it" guidance. The
 	// readEnforceThin constant hardens against accidental re-enablement.
-	packReader, packWait, err := mirror.PackObjectsStream(ctx, allowed, false)
+	packReader, packWait, err := mirror.PackObjectsStream(ctx, allowed, gitx.ReadEnforceThin)
 	if err != nil {
 		return fmt.Errorf("gitproto: upload-pack enforce: pack-objects: %w", err)
 	}
