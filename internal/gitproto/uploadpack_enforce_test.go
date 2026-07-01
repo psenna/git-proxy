@@ -1,0 +1,412 @@
+package gitproto_test
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp/sideband"
+	"github.com/psenna/git-proxy/internal/gitproto"
+	"github.com/psenna/git-proxy/internal/gitproto/pktline"
+	"github.com/psenna/git-proxy/internal/gitx"
+	"github.com/psenna/git-proxy/internal/pathmatch"
+)
+
+// readRepoForProtection builds a source repo with a normal file (README.md), a
+// nested normal file (docs/guide.md), and a secret file (secrets/secret.txt) so
+// the read-protection tests can assert the secret blob is withheld while the
+// normal files clone fine. Returns the source dir and the tip SHA.
+func readRepoForProtection(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	mustGit(t, "", "init", "-q", "-b", "main", dir)
+	mustGit(t, dir, "config", "user.email", "test@example.com")
+	mustGit(t, dir, "config", "user.name", "Test")
+	writeFile(t, dir, "README.md", "# public readme\n")
+	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o755); err != nil {
+		t.Fatalf("mkdir docs: %v", err)
+	}
+	writeFile(t, dir, "docs/guide.md", "guide content\n")
+	if err := os.MkdirAll(filepath.Join(dir, "secrets"), 0o755); err != nil {
+		t.Fatalf("mkdir secrets: %v", err)
+	}
+	writeFile(t, dir, "secrets/secret.txt", "TOP-SECRET-VALUE-DO-NOT-LEAK\n")
+	mustGit(t, dir, "add", "README.md", "docs/guide.md", "secrets/secret.txt")
+	mustGit(t, dir, "commit", "-q", "-m", "add public and secret files")
+	return dir, revParseHead(t, dir)
+}
+
+// readProtectionMirror builds a mirror over a bare upstream seeded from
+// sourceDir's main branch, refreshed, and returns it.
+func readProtectionMirror(t *testing.T, sourceDir string) *gitx.Mirror {
+	t.Helper()
+	ctx := context.Background()
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "repo.git")
+	mustGit(t, "", "init", "--bare", "-q", "-b", "main", bare)
+	mustGit(t, sourceDir, "push", "-q", "file://"+bare, "main")
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "repo.git", t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("gitx.Open: %v", err)
+	}
+	if err := m.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	return m
+}
+
+// uploadPackRequest builds a v0 upload-pack request wanting tip, advertising
+// side-band-64k, thin-pack, ofs-delta, no-progress (what a real git clone
+// client sends). When sideband=false, side-band-64k is omitted to exercise the
+// raw packfile path.
+func uploadPackRequest(t *testing.T, tip string, sideband bool) *gitproto.UploadPackRequest {
+	t.Helper()
+	var buf bytes.Buffer
+	e := pktline.NewEncoder(&buf)
+	caps := "ofs-delta thin-pack"
+	if sideband {
+		caps += " side-band-64k"
+	}
+	caps += " no-progress"
+	if err := e.EncodeString("want " + tip + " " + caps + "\n"); err != nil {
+		t.Fatalf("encode want: %v", err)
+	}
+	if err := e.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if err := e.EncodeString("done\n"); err != nil {
+		t.Fatalf("encode done: %v", err)
+	}
+	if err := e.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	req, err := gitproto.ParseUploadPackRequest(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return req
+}
+
+// demuxSidebandPack expects resp to begin with a NAK pkt-line followed by a
+// side-band-64k muxed packfile and a terminating flush; it returns the demuxed
+// packfile bytes (channel 1).
+func demuxSidebandPack(t *testing.T, resp []byte) []byte {
+	t.Helper()
+	r := bytes.NewReader(resp)
+	s := pktline.NewScanner(r)
+	if !s.Scan() {
+		t.Fatalf("no NAK pkt-line; scan err=%v", s.Err())
+	}
+	if s.Marker() != pktline.Data || string(s.Bytes()) != "NAK\n" {
+		t.Fatalf("first pkt-line = marker=%v bytes=%q, want NAK\\n", s.Marker(), s.Bytes())
+	}
+	d := sideband.NewDemuxer(sideband.Sideband64k, r)
+	pack, err := io.ReadAll(d)
+	if err != nil {
+		t.Fatalf("demux packfile: %v", err)
+	}
+	return pack
+}
+
+// rawPackAfterNAK expects resp to begin with a NAK pkt-line followed by a raw
+// packfile (no sideband); returns the raw packfile bytes.
+func rawPackAfterNAK(t *testing.T, resp []byte) []byte {
+	t.Helper()
+	r := bytes.NewReader(resp)
+	s := pktline.NewScanner(r)
+	if !s.Scan() || s.Marker() != pktline.Data || string(s.Bytes()) != "NAK\n" {
+		t.Fatalf("expected NAK pkt-line first, got marker=%v bytes=%q err=%v", s.Marker(), s.Bytes(), s.Err())
+	}
+	// Remaining bytes are the raw packfile.
+	pack, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read raw pack: %v", err)
+	}
+	return pack
+}
+
+// assertPackHasBlobOIDs indexes pack (inside mirrorDir) and asserts the listed
+// OIDs are PRESENT and the listed OIDs are ABSENT.
+func assertPackHasBlobOIDs(t *testing.T, mirrorDir string, pack []byte, wantPresent, wantAbsent []string) {
+	t.Helper()
+	got := indexPackGitProto(t, mirrorDir, pack)
+	for _, oid := range wantPresent {
+		if !got[oid] {
+			t.Errorf("pack missing expected blob %s; got %v", oid, sortedKeysGitProto(got))
+		}
+	}
+	for _, oid := range wantAbsent {
+		if got[oid] {
+			t.Errorf("pack MUST NOT contain withheld blob %s; got %v", oid, sortedKeysGitProto(got))
+		}
+	}
+}
+
+// TestServeUploadPackEnforced_DenyWithholdsSecretBlob is the core read-protection
+// guarantee: with a deny matcher on "secrets/**", the served packfile MUST omit
+// the secrets/secret.txt blob while keeping the README.md and docs/guide.md
+// blobs and all commits/trees. The response is a v0 upload-pack stream (NAK +
+// side-band-64k muxed packfile + flush) a real git client can consume.
+func TestServeUploadPackEnforced_DenyWithholdsSecretBlob(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, tip := readRepoForProtection(t)
+	m := readProtectionMirror(t, source)
+
+	// Resolve the blob OIDs so the test can assert presence/absence concretely.
+	objs, err := m.WantedObjects(ctx, []string{tip}, nil)
+	if err != nil {
+		t.Fatalf("WantedObjects: %v", err)
+	}
+	var secretOID, readmeOID, guideOID string
+	for _, op := range objs {
+		switch op.Path {
+		case "secrets/secret.txt":
+			secretOID = op.OID
+		case "README.md":
+			readmeOID = op.OID
+		case "docs/guide.md":
+			guideOID = op.OID
+		}
+	}
+	if secretOID == "" || readmeOID == "" || guideOID == "" {
+		t.Fatalf("missing blob OIDs (secret=%q readme=%q guide=%q) in %+v", secretOID, readmeOID, guideOID, objs)
+	}
+
+	matcher := pathmatch.New([]string{"secrets/**"})
+	req := uploadPackRequest(t, tip, true)
+
+	var out bytes.Buffer
+	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced: %v", err)
+	}
+
+	// Response must start with NAK pkt-line and end with a sideband flush-pkt.
+	if !bytes.HasPrefix(out.Bytes(), []byte("0008NAK\n")) {
+		t.Fatalf("response missing NAK pkt-line prefix; got %x", out.Bytes()[:min(16, out.Len())])
+	}
+	if !bytes.HasSuffix(out.Bytes(), []byte("0000")) {
+		t.Fatalf("sideband response not terminated by flush-pkt 0000; got %x", out.Bytes()[max(0, out.Len()-8):])
+	}
+
+	pack := demuxSidebandPack(t, out.Bytes())
+	if !bytes.HasPrefix(pack, []byte("PACK")) {
+		t.Fatalf("demuxed packfile missing PACK magic; got %x", pack[:min(8, len(pack))])
+	}
+	assertPackHasBlobOIDs(t, m.Dir(), pack,
+		[]string{readmeOID, guideOID}, // public blobs present
+		[]string{secretOID})           // secret blob withheld
+}
+
+// TestServeUploadPackEnforced_AllowWhenNoDeny verifies that with no deny
+// patterns (empty matcher) the full packfile is served — read protection OFF
+// at the path level means nothing is withheld.
+func TestServeUploadPackEnforced_AllowWhenNoDeny(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, tip := readRepoForProtection(t)
+	m := readProtectionMirror(t, source)
+
+	objs, err := m.WantedObjects(ctx, []string{tip}, nil)
+	if err != nil {
+		t.Fatalf("WantedObjects: %v", err)
+	}
+	var secretOID, readmeOID string
+	for _, op := range objs {
+		switch op.Path {
+		case "secrets/secret.txt":
+			secretOID = op.OID
+		case "README.md":
+			readmeOID = op.OID
+		}
+	}
+
+	matcher := pathmatch.New(nil) // no deny patterns → match nothing
+	req := uploadPackRequest(t, tip, true)
+
+	var out bytes.Buffer
+	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced: %v", err)
+	}
+	pack := demuxSidebandPack(t, out.Bytes())
+	assertPackHasBlobOIDs(t, m.Dir(), pack,
+		[]string{secretOID, readmeOID}, // everything present
+		nil)
+}
+
+// TestServeUploadPackEnforced_NonSidebandRawPack verifies the raw (non-sideband)
+// response shape: NAK pkt-line followed directly by the raw packfile. A client
+// that did not negotiate side-band-64k gets the packfile unmuxed.
+func TestServeUploadPackEnforced_NonSidebandRawPack(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, tip := readRepoForProtection(t)
+	m := readProtectionMirror(t, source)
+
+	matcher := pathmatch.New([]string{"secrets/**"})
+	req := uploadPackRequest(t, tip, false) // no side-band-64k
+
+	var out bytes.Buffer
+	if err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced: %v", err)
+	}
+	pack := rawPackAfterNAK(t, out.Bytes())
+	if !bytes.HasPrefix(pack, []byte("PACK")) {
+		t.Fatalf("raw packfile missing PACK magic; got %x", pack[:min(8, len(pack))])
+	}
+
+	objs, err := m.WantedObjects(ctx, []string{tip}, nil)
+	if err != nil {
+		t.Fatalf("WantedObjects: %v", err)
+	}
+	var secretOID, readmeOID string
+	for _, op := range objs {
+		switch op.Path {
+		case "secrets/secret.txt":
+			secretOID = op.OID
+		case "README.md":
+			readmeOID = op.OID
+		}
+	}
+	assertPackHasBlobOIDs(t, m.Dir(), pack,
+		[]string{readmeOID},
+		[]string{secretOID})
+}
+
+// TestServeUploadPackEnforced_FailClosedOnBogusWant verifies fail-closed: when
+// the wanted object is not in the mirror, rev-list errors and the enforce path
+// returns an error (caller MUST deny, no passthrough fallback).
+func TestServeUploadPackEnforced_FailClosedOnBogusWant(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, _ := readRepoForProtection(t)
+	m := readProtectionMirror(t, source)
+
+	matcher := pathmatch.New([]string{"secrets/**"})
+	req := uploadPackRequest(t, strings.Repeat("1", 40), true) // bogus want
+
+	var out bytes.Buffer
+	err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git")
+	if err == nil {
+		t.Fatalf("expected fail-closed error for bogus want, got nil; response %x", out.Bytes())
+	}
+	// No packfile bytes must have been written (no unprotected leak).
+	if out.Len() != 0 {
+		t.Errorf("fail-closed path wrote %d bytes; want 0 (no partial response)", out.Len())
+	}
+}
+
+// TestServeUploadPackEnforced_FailClosedOnContextCancel verifies a canceled
+// context surfaces an error (no unprotected packfile served).
+func TestServeUploadPackEnforced_FailClosedOnContextCancel(t *testing.T) {
+	gitBinary(t)
+
+	source, tip := readRepoForProtection(t)
+	m := readProtectionMirror(t, source)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled before the call
+
+	matcher := pathmatch.New([]string{"secrets/**"})
+	req := uploadPackRequest(t, tip, true)
+
+	var out bytes.Buffer
+	err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git")
+	if err == nil {
+		t.Fatalf("expected error on canceled context, got nil")
+	}
+	if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context canceled") {
+		// Some git invocations may wrap the cancellation; just assert it failed.
+		t.Logf("fail-closed error (acceptable): %v", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("canceled path wrote %d bytes; want 0", out.Len())
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// writeFile writes content to dir/name (helper local to this file since the
+// gitx_test writeFile lives in another package).
+func writeFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+// indexPackGitProto mirrors gitx_test.indexPack: writes pack to a temp .pack
+// file, runs `git -C mirrorDir index-pack` then `verify-pack -v`, and returns
+// the set of OIDs the pack carries.
+func indexPackGitProto(t *testing.T, mirrorDir string, pack []byte) map[string]bool {
+	t.Helper()
+	dir := t.TempDir()
+	packPath := filepath.Join(dir, "test.pack")
+	if err := os.WriteFile(packPath, pack, 0o600); err != nil {
+		t.Fatalf("write test pack: %v", err)
+	}
+	cmd := exec.Command("git", "-C", mirrorDir, "index-pack", packPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("index-pack: %v\n%s", err, out)
+	}
+	idx := strings.TrimSuffix(packPath, ".pack") + ".idx"
+	out, err := exec.Command("git", "-C", mirrorDir, "verify-pack", "-v", idx).CombinedOutput()
+	if err != nil {
+		t.Fatalf("verify-pack: %v\n%s", err, out)
+	}
+	set := map[string]bool{}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 1 && len(f[0]) == 40 && isHex40GitProto(f[0]) {
+			set[f[0]] = true
+		}
+	}
+	return set
+}
+
+func isHex40GitProto(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func sortedKeysGitProto(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
