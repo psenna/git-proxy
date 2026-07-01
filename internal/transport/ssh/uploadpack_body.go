@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/psenna/git-proxy/internal/gitproto"
 	"github.com/psenna/git-proxy/internal/gitproto/pktline"
 )
 
@@ -34,11 +35,25 @@ import (
 // shot framing and is out of scope for v1-over-SSH (v0-only, single-round fetch
 // — consistent with the v0-only-over-SSH decision); documented as a deviation.
 // The request is small (refs + caps + haves), so buffering is fine.
+//
+// DoS hardening: the buffer is capped at gitproto.MaxUploadPackRequestBytes
+// (1 MiB). A real upload-pack request is tiny (wants/haves/caps — the packfile
+// is in the *response*, never the request), so 1 MiB is a generous ceiling. A
+// rogue authorized agent that streams `want` lines without `done` would
+// otherwise accumulate into an unbounded bytes.Buffer (OOM); the cap fails
+// closed with an error, and runGitSession writes a structured ERR + exits 1
+// (the existing fail-closed path — no negotiation proceeds).
 func readUploadPackRequest(r io.Reader) ([]byte, error) {
 	s := pktline.NewScanner(r)
 	var buf bytes.Buffer
 	for s.Scan() {
 		buf.Write(s.Raw())
+		// Fail-closed size cap: an upload-pack request exceeding
+		// MaxUploadPackRequestBytes is a rogue/stream-truncated request (no
+		// `done` reached). Deny rather than accumulate unboundedly.
+		if buf.Len() > int(gitproto.MaxUploadPackRequestBytes) {
+			return nil, fmt.Errorf("sshfront: upload-pack request exceeds %d bytes (no done)", gitproto.MaxUploadPackRequestBytes)
+		}
 		switch s.Marker() {
 		case pktline.Data:
 			// `done` is the LAST pkt-line of a v0 upload-pack request — git
