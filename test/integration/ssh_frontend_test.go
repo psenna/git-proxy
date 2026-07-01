@@ -144,5 +144,89 @@ func mustRunGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
+// TestSSH_ReadProtection_CloneWithholdsSecretBlob is the SSH-transport
+// counterpart of TestReadProtection_CloneWithholdsSecretBlob. A real
+// `git clone --filter=blob:none ssh://agent@host:port/repo` through the
+// read-protected SSH frontend must receive a packfile that OMITS the denied
+// secret blob while delivering the non-denied blobs (README.md, docs/guide.md).
+//
+// This exercises the read-protected SSH path end to end: the frontend's
+// writeAdvertisement re-emits the upstream advertisement as v0 with the
+// `filter` + `allow-reachable-sha1-in-want` extra caps (because
+// proxy.ReadDenyOn()), and Proxy.UploadPack assembles the filtered packfile
+// via ServeUploadPackEnforced, withholding blobs whose path matches the deny
+// matcher. Read protection is wired over SSH through the shared *gitproto.Proxy
+// (the reviewer confirmed), so this is a coverage-add; it must pass on the
+// existing code.
+//
+// What is asserted (the packfile-withholding guarantee over SSH):
+//   - The denied secret blob OID is NOT in the clone's local object store right
+//     after clone (inspected via --batch-all-objects, which does not trigger
+//     the on-demand fetch path).
+//   - The non-denied blob OIDs (README.md, docs/guide.md) ARE present, proving
+//     the proxy delivered the rest of the repo over SSH.
+//   - The secret canary string never appears in the received packfile bytes.
+//
+// What is NOT asserted (out of v1 / single-round-over-SSH scope): an on-demand
+// fetch of the denied blob over SSH (`git cat-file -p <oid>`) is not exercised
+// here — the single-round v0-over-SSH path does not expose a clean on-demand
+// fetch round the way the HTTP path does, and the core read-protection
+// guarantee (the denied blob is withheld from the served packfile) is what this
+// test proves. The on-demand denial is covered for the HTTP transport in
+// TestServeUploadPackEnforced_OnDemandBlob_DenyByPath.
+func TestSSH_ReadProtection_CloneWithholdsSecretBlob(t *testing.T) {
+	if !gitAvailable(t) {
+		t.Skip("git not available")
+	}
+	sh := StartSSH(t, "ssh-readprot.git", "agent-1", policyReadDeny("secrets/**"))
+	seedProtectedFiles(t, sh.h)
+
+	work := t.TempDir()
+	dst := filepath.Join(work, "clone")
+	// Partial clone through the SSH proxy. Checkout aborts on the denied blob's
+	// missing-object pre-fetch, so a non-zero exit is expected and acceptable;
+	// the clone still creates the repo and indexes the served packfile.
+	cmd := sh.GitSSH(work, "clone", "--filter=blob:none", sh.h.UpstreamURL+"/ssh-readprot.git", dst)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Logf("clone exit (expected — denied blob withheld over SSH): %v\n%s", err, out)
+	}
+
+	// Resolve the blob OIDs directly from the upstream bare repo (bypassing the
+	// proxy) so the assertions compare against the real object ids.
+	secretOID := strings.TrimSpace(mustOutput(t, "git", "-C", sh.h.BarePath, "rev-parse", "HEAD:secrets/secret.txt"))
+	readmeOID := strings.TrimSpace(mustOutput(t, "git", "-C", sh.h.BarePath, "rev-parse", "HEAD:README.md"))
+	guideOID := strings.TrimSpace(mustOutput(t, "git", "-C", sh.h.BarePath, "rev-parse", "HEAD:docs/guide.md"))
+
+	// Inspect the clone's local object store WITHOUT triggering any on-demand
+	// fetch (--batch-all-objects lists only objects already present).
+	present := presentObjectOIDs(t, dst)
+
+	if present[secretOID] {
+		t.Errorf("DENY LEAK over SSH: denied secret blob %s is present in the clone's object store (packfile withholding failed)", secretOID)
+	}
+	if !present[readmeOID] {
+		t.Errorf("non-denied blob %s (README.md) missing from SSH clone — other files must clone fine", readmeOID)
+	}
+	if !present[guideOID] {
+		t.Errorf("non-denied blob %s (docs/guide.md) missing from SSH clone — other files must clone fine", guideOID)
+	}
+
+	// Belt-and-suspenders: the secret canary must not appear anywhere in the
+	// received packfile bytes.
+	const canary = "TOP-SECRET-VALUE-DO-NOT-LEAK"
+	if packs, _ := filepath.Glob(filepath.Join(dst, ".git", "objects", "pack", "*.pack")); len(packs) > 0 {
+		for _, p := range packs {
+			b, err := os.ReadFile(p)
+			if err != nil {
+				t.Logf("read pack %s: %v", p, err)
+				continue
+			}
+			if strings.Contains(string(b), canary) {
+				t.Errorf("DENY LEAK over SSH: secret canary found in served packfile %s", p)
+			}
+		}
+	}
+}
+
 // Ensure policy import is used (rule registry init side effect).
 var _ = policy.FirstDeny
