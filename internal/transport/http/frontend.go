@@ -4,6 +4,7 @@
 package httpfront
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"fmt"
@@ -203,9 +204,21 @@ func (f *Frontend) handleInfoRefsReadProtected(w http.ResponseWriter, r *http.Re
 		http.Error(w, "advertisement parse failed", http.StatusBadGateway)
 		return
 	}
-	w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
-	if err := gitproto.EmitRefAdvertisementV0(w, adv, []string{"filter"}); err != nil {
+	// Buffer the re-emitted advertisement and only commit headers (status +
+	// Content-Type) + body on a successful emit. Writing Content-Type before
+	// EmitRefAdvertisementV0 and only logging an emit error would send a 200
+	// with a truncated/partial v0 advertisement; buffer + 502-on-error so the
+	// client sees a real failure instead of a malformed advertisement.
+	var buf bytes.Buffer
+	if err := gitproto.EmitRefAdvertisementV0(&buf, adv, []string{"filter"}); err != nil {
 		log.Printf("httpfront: read-protected info/refs emit for repo %q: %v", repo, err)
+		http.Error(w, "advertisement emit failed", http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		log.Printf("httpfront: read-protected info/refs write for repo %q: %v", repo, err)
 	}
 }
 
