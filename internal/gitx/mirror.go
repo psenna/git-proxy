@@ -283,6 +283,41 @@ func fullArgs(dir string, args ...string) []string {
 	return full
 }
 
+// ObjectTypes returns the git object type ("commit", "tree", "blob", "tag") for
+// each oid via `git cat-file --batch-check --stdin`. A missing object reports
+// "missing". Used by the read-protection path to identify blobs (so only blobs
+// are withheld; subtrees with a non-empty path are kept, preserving the tree
+// structure the agent navigates). The per-mirror mutex is held for
+// serialization. A nil/empty oid list yields nil with no error.
+func (m *Mirror) ObjectTypes(ctx context.Context, oids []string) (map[string]string, error) {
+	if len(oids) == 0 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cmd := exec.CommandContext(ctx, "git", fullArgs(m.dir, "cat-file", "--batch-check")...)
+	var stdin strings.Builder
+	for _, oid := range oids {
+		stdin.WriteString(oid)
+		stdin.WriteByte('\n')
+	}
+	cmd.Stdin = strings.NewReader(stdin.String())
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("gitx: object types: %w: %s", err, redactCreds(strings.TrimSpace(stderr.String())))
+	}
+	types := make(map[string]string, len(oids))
+	for _, line := range splitCleanLines(stdout.Bytes()) {
+		f := strings.Fields(line)
+		if len(f) >= 2 {
+			types[f[0]] = f[1]
+		}
+	}
+	return types, nil
+}
+
 // Dir returns the mirror's bare repo path (for tests/inspection only).
 func (m *Mirror) Dir() string { return m.dir }
 

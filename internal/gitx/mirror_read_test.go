@@ -296,3 +296,74 @@ func sortedKeys(m map[string]bool) []string {
 	sort.Strings(keys)
 	return keys
 }
+
+// TestMirror_ObjectTypes verifies the batched cat-file --batch-check wrapper:
+// commits report "commit", blobs "blob", trees "tree", and an unknown OID
+// reports "missing". The read-protection path uses this to identify blobs so
+// only blobs are withheld (subtrees with a non-empty path are kept).
+func TestMirror_ObjectTypes(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	mustGit(t, "", "init", "-q", "-b", "main", source)
+	mustGit(t, source, "config", "user.email", "test@example.com")
+	mustGit(t, source, "config", "user.name", "Test")
+	writeFile(t, source, "a.txt", "alpha\n")
+	if err := os.MkdirAll(filepath.Join(source, "sub"), 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	writeFile(t, source, "sub/b.txt", "beta\n")
+	mustGit(t, source, "add", "a.txt", "sub/b.txt")
+	mustGit(t, source, "commit", "-q", "-m", "add a and sub/b")
+	tip := revParseHead(t, source)
+
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+
+	root := t.TempDir()
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", root, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := m.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	objs, err := m.WantedObjects(ctx, []string{tip}, nil)
+	if err != nil {
+		t.Fatalf("WantedObjects: %v", err)
+	}
+	oids := make([]string, 0, len(objs))
+	for _, op := range objs {
+		oids = append(oids, op.OID)
+	}
+	oids = append(oids, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	types, err := m.ObjectTypes(ctx, oids)
+	if err != nil {
+		t.Fatalf("ObjectTypes: %v", err)
+	}
+	if types[tip] != "commit" {
+		t.Errorf("type[tip] = %q, want commit", types[tip])
+	}
+	if types["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"] != "missing" {
+		t.Errorf("type[unknown] = %q, want missing", types["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"])
+	}
+	// At least one blob and one tree must be present.
+	gotBlob, gotTree := false, false
+	for _, op := range objs {
+		switch types[op.OID] {
+		case "blob":
+			gotBlob = true
+		case "tree":
+			gotTree = true
+		}
+	}
+	if !gotBlob {
+		t.Errorf("no blob type found; types=%v", types)
+	}
+	if !gotTree {
+		t.Errorf("no tree type found; types=%v", types)
+	}
+}
