@@ -170,6 +170,12 @@ func (f *Frontend) handleConn(ctx context.Context, conn net.Conn) {
 	}
 	defer func() { _ = sconn.Close() }()
 
+	// Drain global (out-of-channel) requests concurrently with the channel
+	// loop — the standard x/crypto/ssh server pattern. Discarding them in a
+	// goroutine started here (rather than after the channel loop) keeps global
+	// requests from piling up while a long-lived git session holds the channel.
+	go ssh.DiscardRequests(reqs)
+
 	for newChannel := range chans {
 		if newChannel.ChannelType() != "session" {
 			_ = newChannel.Reject(ssh.UnknownChannelType, "only session channels are supported")
@@ -182,8 +188,6 @@ func (f *Frontend) handleConn(ctx context.Context, conn net.Conn) {
 		}
 		f.handleSession(ctx, sconn, channel, reqs)
 	}
-	// Drain global requests.
-	go ssh.DiscardRequests(reqs)
 }
 
 // handleSession handles one session channel. It waits for the exec request

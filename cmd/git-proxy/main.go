@@ -85,12 +85,11 @@ func run(configPath string) error {
 	// (passthrough) and the SSH frontend (if enabled) shares the same
 	// passthrough behavior.
 	var (
-		eng        *policy.Engine
-		opener     gitproto.MirrorOpener
-		readDeny   = cfg.Policy.ReadDenyMatcher()
-		maxBytes   = cfg.Policy.MaxPackfileBytesOrDefault()
+		eng      *policy.Engine
+		opener   gitproto.MirrorOpener
+		readDeny = cfg.Policy.ReadDenyMatcher()
+		maxBytes = cfg.Policy.MaxPackfileBytesOrDefault()
 	)
-	_ = readDeny // used below for both frontends
 
 	// Push enforcement: build the policy engine from config when any rule is
 	// enabled. With no enabled rules the proxy stays passthrough (no mirror,
