@@ -96,6 +96,16 @@ func (f *Frontend) SetReadDeny(matcher *pathmatch.Matcher) {
 	f.proxy.SetReadDeny(matcher)
 }
 
+// SetAuditSink wires an optional audit sink + transport tag into the frontend's
+// proxy. A nil sink means audit off (the proxy skips recording — existing
+// behavior). transport ("http"/"ssh") is stamped into each audit event. Call
+// before Serve. Best-effort: a Record error is logged by the proxy and does
+// NOT change the verdict or block the op.
+func (f *Frontend) SetAuditSink(s port.AuditSink, transport string) {
+	f.proxy.SetAuditSink(s)
+	f.proxy.SetTransport(transport)
+}
+
 // handle routes a single smart-HTTP request to one of the three endpoints.
 func (f *Frontend) handle(w http.ResponseWriter, r *http.Request) {
 	if f.auth != nil {

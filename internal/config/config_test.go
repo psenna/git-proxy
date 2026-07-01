@@ -93,3 +93,32 @@ auth:
 		t.Errorf("token agent-token-2 = %q, want agent-2", got)
 	}
 }
+
+func TestParseAuditConfig(t *testing.T) {
+	// Set: audit enabled with a file path.
+	c, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+audit:
+  file: "/var/log/git-proxy/audit.jsonl"
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Audit.File != "/var/log/git-proxy/audit.jsonl" {
+		t.Errorf("Audit.File = %q, want /var/log/git-proxy/audit.jsonl", c.Audit.File)
+	}
+	// Empty/absent: audit disabled (valid — no validation error).
+	c2, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+`))
+	if err != nil {
+		t.Fatalf("Parse (no audit): %v", err)
+	}
+	if c2.Audit.File != "" {
+		t.Errorf("Audit.File = %q, want empty (disabled)", c2.Audit.File)
+	}
+}

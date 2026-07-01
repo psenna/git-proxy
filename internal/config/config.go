@@ -28,6 +28,17 @@ type Config struct {
 	Auth     AuthConfig        `yaml:"auth"`
 	Policy   PolicyConfig      `yaml:"policy"`
 	SSH      SSHConfig         `yaml:"ssh"`
+	Audit    AuditConfig       `yaml:"audit"`
+}
+
+// AuditConfig configures the optional append-only JSONL audit log. When File
+// is empty/absent audit is disabled (the pre-audit behavior — no sink wired,
+// the proxy skips recording). When set, main.go opens the file at startup
+// (fail-fast if it cannot be opened) and wires the sink into both frontends;
+// the sink is closed on shutdown. The file is append-only and 0o600.
+type AuditConfig struct {
+	// File is the filesystem path to the JSONL audit log. Empty → disabled.
+	File string `yaml:"file"`
 }
 
 // UpstreamConfig describes the upstream git server the proxy forwards to.

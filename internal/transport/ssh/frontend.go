@@ -119,6 +119,14 @@ func (f *Frontend) SetReadDeny(matcher *pathmatch.Matcher) {
 	f.proxy.SetReadDeny(matcher)
 }
 
+// SetAuditSink wires an optional audit sink + transport tag into the frontend's
+// proxy. A nil sink means audit off. transport ("http"/"ssh") is stamped into
+// each audit event. Call before Serve. Mirrors httpfront.Frontend.
+func (f *Frontend) SetAuditSink(s port.AuditSink, transport string) {
+	f.proxy.SetAuditSink(s)
+	f.proxy.SetTransport(transport)
+}
+
 // Serve serves the frontend until ctx is canceled, then closes the listener.
 // It implements port.Transport.
 func (f *Frontend) Serve(ctx context.Context) error {
