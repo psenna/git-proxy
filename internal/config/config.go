@@ -60,6 +60,13 @@ type AlertConfig struct {
 
 // UpstreamConfig describes the upstream git server the proxy forwards to.
 type UpstreamConfig struct {
+	// Kind selects the upstream/SCM adapter by registry name (v1.md M10). Empty
+	// means "plain" (the default, backward compatible — plain smart-HTTP git).
+	// "github" selects the GitHub adapter skeleton (internal/upstream/github).
+	// An unknown Kind fails at startup via upstream.Build (fail-closed — no
+	// silent fallback). config is a pure YAML leaf: it does NOT import the
+	// upstream registry (no cycle); main.go maps this into upstream.UpstreamConfig.
+	Kind            string `yaml:"kind"`
 	URL             string `yaml:"url"`
 	CredentialsFile string `yaml:"credentials_file"`
 }
