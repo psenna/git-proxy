@@ -35,6 +35,7 @@ import (
 	sshfront "github.com/psenna/git-proxy/internal/transport/ssh"
 	"github.com/psenna/git-proxy/internal/upstream"
 	_ "github.com/psenna/git-proxy/internal/upstream/github" // register the github adapter via init()
+	_ "github.com/psenna/git-proxy/internal/upstream/plain"  // register the default plain adapter via init() (independent of github — the empty-kind default relies on this)
 	"github.com/psenna/git-proxy/internal/version"
 )
 
@@ -92,7 +93,7 @@ func run(configPath string) error {
 		CredentialsStore: creds,
 	})
 	if err != nil {
-		return fmt.Errorf("upstream: build kind %q: %w", cfg.Upstream.Kind, err)
+		return fmt.Errorf("build upstream kind %q: %w", cfg.Upstream.Kind, err)
 	}
 	httpFrontend := httpfront.New(ln, up, cfg.Upstream.URL, cfg.Repos, auth, creds)
 

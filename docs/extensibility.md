@@ -152,10 +152,13 @@ sub-interface (branch protection, pull requests); the core never depends on
 fail-closes on an unknown kind (no silent fallback). Duplicate registration panics
 (matching the rule registry).
 
-**The core never depends on `PRSupport`** — enforced by a compile-check test
-(`internal/port/upstream_prsupport_seam_test.go`) that fails if any file in
-`internal/gitproto`, `internal/transport`, `internal/policy`, or `cmd` references
-`port.PRSupport`.
+**The core never depends on `PRSupport`** — enforced by a `go/parser` AST-scan
+test (`internal/port/prsupport_core_isolation_test.go`) that fails if any
+production file in `internal/gitproto`, `internal/transport`, `internal/policy`,
+or `cmd` references `port.PRSupport`. (The scan walks `gitproto`, `transport`, and
+`cmd` recursively so the frontend subpackages `transport/http` and `transport/ssh`
+are covered; `policy` is scanned top-level only so `policy/rules` — which may
+legitimately type-assert `PRSupport` in a future rule — is excluded.)
 
 ---
 
