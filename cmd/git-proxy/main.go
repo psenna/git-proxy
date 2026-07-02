@@ -33,7 +33,9 @@ import (
 	"github.com/psenna/git-proxy/internal/port"
 	httpfront "github.com/psenna/git-proxy/internal/transport/http"
 	sshfront "github.com/psenna/git-proxy/internal/transport/ssh"
-	"github.com/psenna/git-proxy/internal/upstream/plain"
+	"github.com/psenna/git-proxy/internal/upstream"
+	_ "github.com/psenna/git-proxy/internal/upstream/github" // register the github adapter via init()
+	_ "github.com/psenna/git-proxy/internal/upstream/plain"  // register the default plain adapter via init() (independent of github — the empty-kind default relies on this)
 	"github.com/psenna/git-proxy/internal/version"
 )
 
@@ -79,7 +81,20 @@ func run(configPath string) error {
 		auth = token.New(cfg.Auth.Tokens)
 	}
 
-	up := plain.New(cfg.Upstream.URL, creds)
+	// Upstream/SCM adapter: built via the upstream registry (v1.md M10), selected
+	// by upstream.kind (default "plain" — backward compatible). Fail-closed on
+	// an unknown kind: upstream.Build returns an error rather than silently
+	// falling back. config is a YAML leaf; it does NOT import the registry, so
+	// main.go maps the YAML shape into upstream.UpstreamConfig here (carrying
+	// the already-loaded creds so every adapter shares one store).
+	up, err := upstream.Build(upstream.UpstreamConfig{
+		Kind:            cfg.Upstream.Kind,
+		URL:             cfg.Upstream.URL,
+		CredentialsStore: creds,
+	})
+	if err != nil {
+		return fmt.Errorf("build upstream kind %q: %w", cfg.Upstream.Kind, err)
+	}
 	httpFrontend := httpfront.New(ln, up, cfg.Upstream.URL, cfg.Repos, auth, creds)
 
 	// Audit sink: append-only JSONL file. Built once and wired into BOTH

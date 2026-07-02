@@ -13,7 +13,17 @@ import (
 	"strings"
 
 	"github.com/psenna/git-proxy/internal/port"
+	"github.com/psenna/git-proxy/internal/upstream"
 )
+
+// init self-registers the plain adapter on the upstream registry so config can
+// select it by Kind "plain" (the default). This mirrors the rule packages'
+// self-registration via policy.RegisterRule.
+func init() {
+	upstream.Register("plain", func(cfg upstream.UpstreamConfig) (port.Upstream, error) {
+		return New(cfg.URL, cfg.CredentialsStore), nil
+	})
+}
 
 // Upstream talks to a single plain git HTTP server at BaseURL.
 type Upstream struct {

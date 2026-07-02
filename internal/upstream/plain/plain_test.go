@@ -9,7 +9,49 @@ import (
 	"testing"
 
 	"github.com/psenna/git-proxy/internal/port"
+	"github.com/psenna/git-proxy/internal/upstream"
 )
+
+// TestSelfRegister asserts the plain adapter self-registers as "plain" on the
+// upstream default registry via init(). The default (empty Kind) resolves to
+// "plain", so Build with an empty Kind must succeed and return a non-nil
+// Upstream — proving backward compatibility (the default path is unchanged).
+func TestSelfRegister_PlainOnDefaultRegistry(t *testing.T) {
+	f, ok := upstream.Lookup("plain")
+	if !ok {
+		t.Fatal(`upstream.Lookup("plain"): want found (self-registered via init)`)
+	}
+	up, err := f(upstream.UpstreamConfig{URL: "http://example.git"})
+	if err != nil {
+		t.Fatalf("factory: %v", err)
+	}
+	if up == nil {
+		t.Fatal("factory returned nil Upstream")
+	}
+}
+
+func TestBuild_EmptyKindBuildsPlain(t *testing.T) {
+	// The empty Kind defaults to "plain" (backward compatible). Build on the
+	// default registry must succeed and return a working Upstream.
+	up, err := upstream.Build(upstream.UpstreamConfig{URL: "http://example.git"})
+	if err != nil {
+		t.Fatalf("Build empty kind: %v", err)
+	}
+	if up == nil {
+		t.Fatal("Build empty kind: returned nil Upstream")
+	}
+}
+
+func TestBuild_PlainKindBuildsPlain(t *testing.T) {
+	// Explicit "plain" Kind builds a plain upstream via the default registry.
+	up, err := upstream.Build(upstream.UpstreamConfig{Kind: "plain", URL: "http://example.git"})
+	if err != nil {
+		t.Fatalf("Build plain: %v", err)
+	}
+	if up == nil {
+		t.Fatal("Build plain: returned nil Upstream")
+	}
+}
 
 // TestUpstream_AttachesVaultCreds asserts the proxy attaches upstream Basic
 // auth credentials from the vault to its outgoing request, proving the
