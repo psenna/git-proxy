@@ -1,0 +1,25 @@
+# GitHub Pages (Jekyll) config for git-proxy docs.
+# Served from the /docs folder once Pages is enabled:
+#   Settings -> Pages -> Source: Deploy from a branch -> main -> /docs
+# `minima` is the GitHub-Pages-allowlisted default theme; `header_pages`
+# populates the top nav.
+
+title: git-proxy
+description: >-
+  A policy-enforcing gateway between AI coding agents and upstream Git
+  repositories. It terminates agent git traffic, authenticates the agent, and
+  inspects and gates every clone, fetch, and push before it reaches the real
+  repository.
+theme: minima
+# pretty: each page -> /<name>/index.html so /<name>/ resolves (matches the
+# links in index.md). Without this, pages are /<name>.html and /<name>/ 404s.
+permalink: pretty
+minima:
+  skin: classic
+header_pages:
+  - architecture.md
+  - extensibility.md
+  - deploy-docker.md
+show_excerpts: false
+github:
+  repository_url: https://github.com/psenna/git-proxy

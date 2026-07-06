@@ -1,3 +1,8 @@
+---
+layout: default
+title: Architecture
+---
+
 # Architecture (v1, as shipped)
 
 This document describes git-proxy **as built** in the v1 release. Every claim is
