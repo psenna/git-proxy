@@ -1,0 +1,54 @@
+# git-proxy configuration for the local Gitea compose stack.
+# Every field below is real and grounded in internal/config (see
+# ../../docs/architecture.md for the decision flows). Edit the upstream URL or
+# policy to taste; the only value you MUST fill in is the Gitea access token in
+# credentials.yaml (after the one-time Gitea setup in ./README.md).
+
+listen: "0.0.0.0:8080"
+
+upstream:
+  # plain = standard smart-HTTP git (Gitea speaks this at /<owner>/<repo>.git).
+  kind: plain
+  # Resolved on the compose bridge network — the proxy container reaches Gitea
+  # by service name. The agent on the host never uses this URL; it talks to the
+  # proxy at http://127.0.0.1:8080.
+  url: "http://gitea:3000"
+  # Per-repo Basic-auth creds the proxy attaches on the proxy->Gitea leg. The
+  # agent never sees these. See credentials.yaml.
+  credentials_file: /credentials.yaml
+
+auth:
+  tokens:
+    # Bearer token -> agent id (auditable identity recorded in every audit
+    # event). Point the agent's git at this with:
+    #   http.extraheader="Authorization: Bearer agent-token-1"
+    "agent-token-1": "agent-1"
+
+policy:
+  mode: first_deny            # stop at the first violation; use collect_all to report all
+  mirror:
+    dir: /tmp/git-proxy-mirror # bare inspection-mirror cache root (bind-mounted)
+  rules:
+    history_protect:
+      enabled: true
+      params:
+        refs: ["refs/heads/main"]   # block force-push / rewrite of main
+    branch_pattern:
+      enabled: true
+      params:
+        allow: ["refs/heads/main", "refs/heads/feat/*"]  # only these refs may be pushed
+    secret_scan:
+      enabled: true                 # redacted reasons; matched secret never reaches agent/audit/alert
+  read:
+    deny: ["secrets/**"]            # withhold secrets/ blobs from fetch (use --filter=blob:none to clone)
+  # dry_run: true                    # forward a clean policy-deny instead of blocking; audit records deny + dry_run
+
+audit:
+  file: /tmp/git-proxy/audit.jsonl   # append-only JSONL; omit to disable
+# alerts:
+#   webhook: "http://host.docker.internal:9999/hook"  # omit to disable; malformed URL fails fast at startup
+# ssh:
+#   listen: "0.0.0.0:2222"
+#   host_key: "/path/to/ssh_host_ed25519_key"          # omit -> ephemeral key (dev/test only)
+#   authorized_keys:
+#     agent-1: "ssh-ed25519 AAAA...comment"

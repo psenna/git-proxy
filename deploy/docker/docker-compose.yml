@@ -1,0 +1,73 @@
+# docker compose stack: git-proxy in front of a local Gitea git server.
+#
+# Topology:
+#   agent (host) --8080--> git-proxy --3000--> gitea   [gitnet bridge]
+#
+# The agent never sees Gitea credentials: the proxy holds them in
+# credentials.yaml and attaches Basic auth on the proxy->gitea leg. The agent
+# authenticates to the proxy with a Bearer token (auth.tokens in config.yaml).
+#
+# See ../../docs/deploy-docker.md for the full narrative walkthrough.
+# Quickstart commands are in ./README.md.
+
+services:
+  gitea:
+    image: gitea/gitea:1
+    container_name: git-proxy-gitea
+    environment:
+      # Run Gitea as the container's rootless user uid/gid 1000 (matches the
+      # git-proxy runtime user and the bind-mounted data dir ownership on a
+      # typical single-user Linux host).
+      USER_UID: "1000"
+      USER_GID: "1000"
+      # Disable the first-run installer screen — we provision the admin user,
+      # repo, and token via the Gitea CLI/API (see ./README.md). Setting
+      # INSTALL_LOCK also hardens Gitea so it cannot be re-installed by a
+      # visitor hitting the web UI.
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__server__ROOT_URL: "http://localhost:3000/"
+    volumes:
+      - gitea-data:/data
+    ports:
+      - "3000:3000"   # Gitea web UI + smart-HTTP git (host -> gitea for setup)
+      - "222:22"      # Gitea SSH (optional; not used by this example)
+    networks:
+      - gitnet
+    healthcheck:
+      # /api/v1/version returns 200 (no auth) once Gitea is up; /healthz is not
+      # present in this Gitea build (404).
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/v1/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  git-proxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: git-proxy:dev
+    container_name: git-proxy
+    depends_on:
+      gitea:
+        condition: service_healthy
+    # Run as the image's non-root gitproxy user (uid 1000). The bind-mounted
+    # data/ dirs must be writable by uid 1000 — see ./README.md if your host uid
+    # differs.
+    user: "1000:1000"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/config.yaml:ro
+      - ./credentials.yaml:/credentials.yaml:ro
+      - ./data/mirror:/tmp/git-proxy-mirror
+      - ./data/audit:/tmp/git-proxy
+    networks:
+      - gitnet
+
+networks:
+  gitnet:
+    driver: bridge
+
+volumes:
+  gitea-data:
