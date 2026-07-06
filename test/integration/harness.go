@@ -206,7 +206,7 @@ func StartWithAuth(t *testing.T, repo, agentToken string, vaultCreds map[string]
 // Params). An empty/nil rule set yields passthrough (use Start instead).
 func StartWithPolicy(t *testing.T, repo string, pol config.PolicyConfig) *Harness {
 	t.Helper()
-	return startWithPolicy(t, repo, pol, "", false, nil)
+	return startWithPolicy(t, repo, "", pol, "", false, nil)
 }
 
 // StartWithPolicyAndAudit is StartWithPolicy plus an append-only JSONL audit
@@ -216,7 +216,7 @@ func StartWithPolicy(t *testing.T, repo string, pol config.PolicyConfig) *Harnes
 // Use to assert audit events for push allow/deny and read-protected fetch.
 func StartWithPolicyAndAudit(t *testing.T, repo string, pol config.PolicyConfig, auditFile string) *Harness {
 	t.Helper()
-	return startWithPolicy(t, repo, pol, auditFile, false, nil)
+	return startWithPolicy(t, repo, "", pol, auditFile, false, nil)
 }
 
 // StartWithPolicyAuditAlerts is StartWithPolicyAndAudit plus dry-run mode and
@@ -228,15 +228,31 @@ func StartWithPolicyAndAudit(t *testing.T, repo string, pol config.PolicyConfig,
 // integration suite (Task 13).
 func StartWithPolicyAuditAlerts(t *testing.T, repo string, pol config.PolicyConfig, auditFile string, dryRun bool, alertSink port.AlertSink) *Harness {
 	t.Helper()
-	return startWithPolicy(t, repo, pol, auditFile, dryRun, alertSink)
+	return startWithPolicy(t, repo, "", pol, auditFile, dryRun, alertSink)
+}
+
+// StartWithAuthPolicyAndAudit is StartWithPolicyAndAudit plus Bearer token
+// authentication: agentToken is the single valid agent token (mapped to agent
+// id "agent-1"), so audit events carry a non-empty Agent field. h.Token is set
+// so harness.Git sends the bearer header. Use for the v1 capstone E2E test,
+// which exercises auth + push rules + read protection + audit in one flow.
+// Unlike StartWithAuth, this builder wires NO credential vault (the upstream is
+// unauthenticated), matching the enforcement harnesses.
+func StartWithAuthPolicyAndAudit(t *testing.T, repo, agentToken string, pol config.PolicyConfig, auditFile string) *Harness {
+	t.Helper()
+	return startWithPolicy(t, repo, agentToken, pol, auditFile, false, nil)
 }
 
 // startWithPolicy is the shared builder for StartWithPolicy,
-// StartWithPolicyAndAudit, and StartWithPolicyAuditAlerts. auditFile is empty
-// → no audit; non-empty → a file sink is opened (fail-closed at test startup on
-// open error) and wired in. dryRun enables dry-run mode on the proxy. alertSink
-// (nil → off) is wired into the proxy so denies fire an Alert.
-func startWithPolicy(t *testing.T, repo string, pol config.PolicyConfig, auditFile string, dryRun bool, alertSink port.AlertSink) *Harness {
+// StartWithPolicyAndAudit, StartWithPolicyAuditAlerts, and
+// StartWithAuthPolicyAndAudit. agentToken is empty → no auth (passthrough
+// enforcement harnesses); non-empty → Bearer token auth is wired (mapped to
+// agent id "agent-1") and h.Token is set so harness.Git sends the header.
+// auditFile is empty → no audit; non-empty → a file sink is opened (fail-closed
+// at test startup on open error) and wired in. dryRun enables dry-run mode on
+// the proxy. alertSink (nil → off) is wired into the proxy so denies fire an
+// Alert.
+func startWithPolicy(t *testing.T, repo, agentToken string, pol config.PolicyConfig, auditFile string, dryRun bool, alertSink port.AlertSink) *Harness {
 	t.Helper()
 
 	h := Start(t, repo)
@@ -267,7 +283,18 @@ func startWithPolicy(t *testing.T, repo string, pol config.PolicyConfig, auditFi
 		t.Fatalf("listen: %v", err)
 	}
 	up := plain.New(h.UpstreamURL, nil)
-	frontend := httpfront.New(ln, up, h.UpstreamURL, map[string]string{h.Repo: h.Repo}, nil, nil)
+	// Wire Bearer token auth when an agent token is supplied (the capstone E2E
+	// harness). An empty agentToken means unauthenticated enforcement (the
+	// per-feature suites), matching the prior behavior. authn is declared as the
+	// port.Authenticator INTERFACE (not *token.Authenticator) so an unset value is
+	// a literal nil interface — passing a nil *token.Authenticator would hit the
+	// typed-nil gotcha (a non-nil interface wrapping a nil pointer) and make
+	// httpfront enforce auth on the no-token path.
+	var authn port.Authenticator
+	if agentToken != "" {
+		authn = token.New(map[string]string{agentToken: "agent-1"})
+	}
+	frontend := httpfront.New(ln, up, h.UpstreamURL, map[string]string{h.Repo: h.Repo}, authn, nil)
 	frontend.SetEnforcement(eng, opener, pol.MaxPackfileBytesOrDefault())
 	// Read protection: wire the proxy-level fetch path matcher when configured.
 	// Fail-closed on malformed patterns (mirrors main.go startup validation).
@@ -307,6 +334,7 @@ func startWithPolicy(t *testing.T, repo string, pol config.PolicyConfig, auditFi
 	go func() { errCh <- frontend.Serve(ctx) }()
 
 	h.ProxyURL = "http://" + ln.Addr().String()
+	h.Token = agentToken // empty → no bearer header (unauthenticated enforcement).
 	h.ln = ln
 	h.cancel = cancel
 	h.errCh = errCh
