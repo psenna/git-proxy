@@ -154,11 +154,14 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// validateWebhookURL parses u and requires a scheme and host so a malformed
-// webhook URL (e.g. "://not-a-url" or "not a url") fails at startup, not at
-// alert time. Reused by the webhook sink's own construction (internal/alert/
-// webhook) for the same fail-fast guarantee — the config layer fails before
-// the sink is even built.
+// validateWebhookURL parses u and requires an http(s) scheme and a host so a
+// malformed webhook URL (e.g. "://not-a-url", "not a url", or a "file://..."
+// typo) fails at startup, not at alert time. The scheme allowlist is the single
+// source of truth: the config layer fails before the sink is even built, with a
+// config-namespaced error. The webhook sink (internal/alert/webhook) applies
+// the same allowlist independently as defense-in-depth (a sink constructed
+// directly, e.g. in a test, is still rejected), but config is what operators
+// see first.
 func validateWebhookURL(u string) error {
 	parsed, err := url.Parse(u)
 	if err != nil {
@@ -166,6 +169,9 @@ func validateWebhookURL(u string) error {
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
 		return fmt.Errorf("missing scheme or host")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("unsupported scheme %q (http/https only)", parsed.Scheme)
 	}
 	return nil
 }

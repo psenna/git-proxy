@@ -79,6 +79,26 @@ alerts:
 	}
 }
 
+// TestAlertConfig_NonHTTPSchemeRejected verifies a webhook URL with a non-http(s)
+// scheme (e.g. "file://...") is rejected at config load, BEFORE the sink is
+// built. This is the single source of truth for the scheme allowlist: config
+// fails first with a config-namespaced error so a typo doesn't surface later as
+// a sink-construction error. http and https are accepted (see
+// TestAlertConfig_ValidWebhookAccepted for https; http is accepted by the same
+// path).
+func TestAlertConfig_NonHTTPSchemeRejected(t *testing.T) {
+	_, err := config.Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+alerts:
+  webhook: "file:///etc/shadow"
+`))
+	if err == nil {
+		t.Fatalf("non-http(s) webhook URL must fail at config load (scheme allowlist)")
+	}
+}
+
 // TestAlertConfig_ValidWebhookAccepted verifies a well-formed webhook URL is
 // accepted at config load.
 func TestAlertConfig_ValidWebhookAccepted(t *testing.T) {

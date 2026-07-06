@@ -97,6 +97,13 @@ func (s *Scanner) Scan(path string, content []byte) []port.SecretFinding {
 			if loc == nil {
 				continue
 			}
+			// Skip zero-length matches (a regex that can match the empty string,
+			// e.g. "a*"): an empty match is not a secret, and redact with an empty
+			// secret would emit the raw line unredacted (a leak surface if the line
+			// also carries a different pattern's secret).
+			if loc[0] == loc[1] {
+				continue
+			}
 			findings = append(findings, port.SecretFinding{
 				Path:    path,
 				Line:    ln,
@@ -107,6 +114,9 @@ func (s *Scanner) Scan(path string, content []byte) []port.SecretFinding {
 		for j, re := range s.extra {
 			loc := re.FindStringIndex(line)
 			if loc == nil {
+				continue
+			}
+			if loc[0] == loc[1] {
 				continue
 			}
 			findings = append(findings, port.SecretFinding{
@@ -134,10 +144,15 @@ func (s *Scanner) Scan(path string, content []byte) []port.SecretFinding {
 }
 
 // redact returns a bounded snippet of line with every occurrence of secret
-// replaced by "***REDACTED***". The snippet never contains the raw secret.
+// replaced by "***REDACTED***". The snippet never contains the raw secret. If
+// secret is empty (a degenerate match the caller should have skipped), the
+// whole line is masked: Selectively redacting an empty match is impossible, and
+// returning the raw line could leak a different pattern's secret on the same
+// line. Defense-in-depth — Scan skips zero-length matches, so this branch should
+// be unreachable in practice.
 func redact(line, secret string) string {
 	if secret == "" {
-		return trimSnippet(line)
+		return "***REDACTED***"
 	}
 	masked := strings.ReplaceAll(line, secret, "***REDACTED***")
 	return trimSnippet(masked)

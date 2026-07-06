@@ -170,6 +170,12 @@ func (p *Proxy) UploadPack(ctx context.Context, repo string, body io.Reader, w i
 			return fmt.Errorf("gitproto: upload-pack: %w", err)
 		}
 		defer func() { _ = rc.Close() }()
+		// Audit the fetch passthrough for parity with push passthrough (which
+		// records a bare "allow") — a full traffic audit covers both legs.
+		// Best-effort: recordAudit logs+swallows any sink error (a sink failure
+		// never changes the verdict or blocks the op).
+		p.recordAudit(ctx, "git-upload-pack", agentName(ctx), repo, "allow",
+			nil, nil, nil, nil, false)
 		return forwardStream(rc, w)
 	}
 

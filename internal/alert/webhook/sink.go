@@ -50,8 +50,13 @@ func New(url string) (*Sink, error) {
 	}, nil
 }
 
-// validateURL parses u and requires a scheme and host so a malformed config
-// (e.g. "://not-a-url" or "not a url") fails at startup, not at alert time.
+// validateURL parses u and requires an http(s) scheme + host so a malformed
+// config (e.g. "://not-a-url" or "not a url") fails at startup, not at alert
+// time. The scheme is allowlisted to http/https only: the webhook POST leaves
+// the proxy, and a non-http(s) scheme (file://, gopher://, ftp://) is never a
+// legitimate alert destination — rejecting it at startup is fail-fast
+// defense-in-depth (an http.Client would error at send time anyway, but a
+// typo'd scheme should be caught before any alert is dropped).
 func validateURL(u string) error {
 	parsed, err := neturl.Parse(u)
 	if err != nil {
@@ -59,6 +64,9 @@ func validateURL(u string) error {
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
 		return fmt.Errorf("missing scheme or host")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("unsupported scheme %q (http/https only)", parsed.Scheme)
 	}
 	return nil
 }
@@ -69,12 +77,20 @@ func validateURL(u string) error {
 // best-effort (log and proceed — the verdict stands regardless). Fire-and-forget:
 // v1 does not retry. The body is the JSON Alert (no secret/cred content per the
 // port.Alert no-leak contract; the proxy enforces this at Alert construction).
-func (s *Sink) Alert(ctx context.Context, a port.Alert) error {
+//
+// The POST is detached from the caller's ctx: it uses context.Background() (the
+// client's defaultTimeout bounds the round-trip). The inbound request ctx is
+// propagated by the proxy and would be cancelled if the agent — including the
+// agent being denied — disconnects; tying alert delivery to that lifetime would
+// let a denied client silence notification of its own denial by closing the
+// connection. The durable audit record (a file write, ctx-unaware) survives
+// regardless; detaching the webhook keeps the real-time alert equally resilient.
+func (s *Sink) Alert(_ context.Context, a port.Alert) error {
 	body, err := json.Marshal(a)
 	if err != nil {
 		return fmt.Errorf("alert/webhook: marshal: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, s.url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("alert/webhook: build request: %w", err)
 	}

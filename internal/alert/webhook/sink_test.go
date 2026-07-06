@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/psenna/git-proxy/internal/alert/webhook"
 	"github.com/psenna/git-proxy/internal/port"
@@ -151,15 +150,20 @@ func TestWebhook_MalformedURLFailsFast(t *testing.T) {
 	}
 }
 
-// TestWebhook_TimeoutDoesNotBlock verifies a slow server does not block the
-// caller beyond a bounded window. The sink honors the caller's context
-// (NewRequestWithContext) and applies a short HTTP client timeout (5s default);
-// whichever fires first bounds the wait. Here a 200ms context deadline beats
-// the 2s-sleeping server, so the call returns an error within ~1s (best-effort:
-// the caller proceeds regardless).
-func TestWebhook_TimeoutDoesNotBlock(t *testing.T) {
+// TestWebhook_DetachedFromCallerCtx verifies the webhook POST is DETACHED from
+// the caller's context: an already-cancelled caller ctx does NOT cancel the
+// POST. The proxy propagates the inbound request ctx to recordAlert; if the
+// agent being denied disconnects, that ctx is cancelled. Tying alert delivery
+// to the caller's lifetime would let a denied client silence notification of
+// its own denial by closing the connection. The POST uses context.Background()
+// bounded by the client's defaultTimeout (5s), so a stuck server blocks the
+// caller at most ~5s — independent of the caller's lifetime. (The 5s bound
+// itself is set by construction via http.Client.Timeout; not re-asserted here
+// to avoid a 5s test.)
+func TestWebhook_DetachedFromCallerCtx(t *testing.T) {
+	var got int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(2 * time.Second)
+		atomic.AddInt32(&got, 1)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -170,15 +174,14 @@ func TestWebhook_TimeoutDoesNotBlock(t *testing.T) {
 	}
 	defer func() { _ = sink.Close() }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	err = sink.Alert(ctx, port.Alert{Verdict: "deny"})
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatalf("slow server / short ctx must yield a delivery error")
+	// An already-cancelled caller ctx MUST NOT prevent delivery (the security
+	// property: a disconnected denied client cannot silence its own alert).
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := sink.Alert(ctx, port.Alert{Verdict: "deny"}); err != nil {
+		t.Fatalf("cancelled caller ctx must NOT cancel the POST (detached delivery): %v", err)
 	}
-	if elapsed > 1500*time.Millisecond {
-		t.Fatalf("Alert blocked too long (%v) — context deadline not honored", elapsed)
+	if atomic.LoadInt32(&got) != 1 {
+		t.Fatalf("POST did not reach the server (got=%d) — caller ctx leaked into delivery", got)
 	}
 }
