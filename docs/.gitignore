@@ -1,0 +1,4 @@
+# Local Jekyll build output — never commit.
+_site/
+.jekyll-cache/
+.jekyll-metadata

@@ -93,6 +93,33 @@ clone of a repo with `secrets/**` read-denied withholds the secret blobs. Every
 decision is recorded in the audit file; every deny fires an alert. The agent
 never sees the upstream credentials.
 
+## Deployment
+
+A multi-stage `Dockerfile` builds a minimal runtime image (Alpine + `git` +
+`ca-certificates`, non-root) — the inspection mirror needs the `git` binary on
+`PATH`, so a distroless image won't work:
+
+```sh
+docker build -t git-proxy .
+docker run --rm -p 8080:8080 -v "$PWD/config.yaml:/config.yaml:ro" git-proxy
+```
+
+The fastest way to see enforcement against a real upstream is the
+**Docker Compose + Gitea** example — `docker compose up` runs git-proxy in
+front of a local self-hosted git server, no external account required:
+
+```sh
+cd deploy/docker
+mkdir -p data/mirror data/audit
+docker compose up -d --build
+```
+
+See [`docs/deploy-docker.md`](./docs/deploy-docker.md) for the full walkthrough
+(topology, one-time Gitea setup, the enforcement flow, audit inspection, and
+production hardening). A documentation site (this README + the `docs/` pages)
+is published to GitHub Pages from the `/docs` folder — see the deploy guide's
+"Publishing this docs site" section.
+
 ## Documentation
 
 - [`requirements.md`](./requirements.md) — goals, features, and v1 scope.
@@ -100,6 +127,8 @@ never sees the upstream credentials.
   (layer diagram, decision flows, seams, scope, milestone table).
 - [`docs/extensibility.md`](./docs/extensibility.md) — how to add rules, SCM
   adapters, frontends, auth, secret scanners, credential stores, and sinks.
+- [`docs/deploy-docker.md`](./docs/deploy-docker.md) — run git-proxy in front of
+  a local Gitea git server with Docker Compose (fastest way to try it).
 - [`PRINCIPLES.md`](./PRINCIPLES.md) — engineering principles every change must
   follow.
 - [`CONTRIBUTING.md`](./CONTRIBUTING.md) — issue and PR workflow for the agents

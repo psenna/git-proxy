@@ -1,0 +1,32 @@
+# Build artifacts and coverage
+*.out
+*.test
+*.exe
+*.exe~
+coverage.*
+*.coverprofile
+profile.cov
+
+# Version control + SDD bookkeeping
+.git
+.gitignore
+.superpowers/
+
+# Local runtime state from the compose example (never bake into the image)
+deploy/docker/data/
+
+# Docs are not needed at image build time
+docs/
+*.md
+
+# Editor/IDE
+.idea/
+.vscode/
+
+# Go workspace files
+go.work
+go.work.sum
+
+# CI / plans
+.github/
+.claude/

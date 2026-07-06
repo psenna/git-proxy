@@ -1,3 +1,8 @@
+---
+layout: default
+title: Extensibility
+---
+
 # Extending git-proxy
 
 git-proxy is extensible by interface: every pluggable seam lives in `internal/port`
