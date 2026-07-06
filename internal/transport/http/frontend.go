@@ -311,11 +311,15 @@ func (f *Frontend) applyUpstreamCreds(req *http.Request, repo string) {
 }
 
 // parsePath splits a smart-HTTP path into the repo and the endpoint suffix.
-// The repo may contain slashes (e.g. "org/team/repo.git").
+// The repo may contain slashes (e.g. "org/team/repo.git"). The endpoint is always
+// a SUFFIX of the path (smart-HTTP URLs are <base>/<repo>/<endpoint>); matching
+// on a substring would mis-route a repo whose path contains an endpoint token
+// (e.g. "/git-upload-pack.git/git-upload-pack" → empty repo), so HasSuffix is
+// used, not strings.Index.
 func parsePath(path string) (repo, endpoint string, ok bool) {
 	for _, ep := range []string{"/info/refs", "/git-upload-pack", "/git-receive-pack"} {
-		if i := strings.Index(path, ep); i >= 0 {
-			return strings.TrimPrefix(path[:i], "/"), ep, true
+		if strings.HasSuffix(path, ep) {
+			return strings.TrimPrefix(path[:len(path)-len(ep)], "/"), ep, true
 		}
 	}
 	return "", "", false
