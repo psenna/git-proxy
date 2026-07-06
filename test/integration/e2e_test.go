@@ -143,14 +143,16 @@ func TestE2E_V1Capstone(t *testing.T) {
 	seedProtectedFiles(t, h) // adds docs/guide.md + secrets/secret.txt upstream.
 	clone2 := t.TempDir()
 	dst2 := filepath.Join(clone2, "repo")
-	// Partial clone with --no-checkout: the proxy withholds the denied blob from
-	// the served packfile while delivering the non-denied blobs. A non-zero exit
-	// is acceptable (the denied blob's checkout pre-fetch would abort); the repo
-	// is created and the served packfile is indexed regardless.
+	// Partial clone with --no-checkout: the proxy withholds the denied blob
+	// from the served packfile while delivering the non-denied blobs. With
+	// --no-checkout there is no working-tree pre-fetch, so the clone is
+	// expected to succeed; the t.Logf is belt-and-suspenders against an
+	// unexpected non-zero exit. The repo is created and the served packfile
+	// is indexed regardless.
 	cloneCmd := h.Git(clone2, "clone", "-q", "--filter=blob:none", "--no-checkout",
 		h.UpstreamURL+"/test.git", dst2)
 	if out, err := cloneCmd.CombinedOutput(); err != nil {
-		t.Logf("M7: clone exit (expected — denied blob withheld): %v\n%s", err, out)
+		t.Logf("M7: clone exit (unexpected under --no-checkout — inspect): %v\n%s", err, out)
 	}
 	secretOID := strings.TrimSpace(mustOutput(t, "git", "-C", h.BarePath, "rev-parse", "HEAD:secrets/secret.txt"))
 	readmeOID := strings.TrimSpace(mustOutput(t, "git", "-C", h.BarePath, "rev-parse", "HEAD:README.md"))
@@ -190,6 +192,18 @@ func TestE2E_V1Capstone(t *testing.T) {
 		return e.Agent == "agent-1" && e.Service == "git-receive-pack"
 	}) {
 		t.Fatalf("M9a: no push audit event attributed to agent-1; events=%+v", events)
+	}
+	// The secret-bearing push (feat/secret) MUST have been audited as a deny.
+	// This anchors the no-leak canary below: it proves the secret actually
+	// reached the audit-recording path (the redaction point), so the canary is
+	// non-vacuous — without this, a regression that skipped audit recording on
+	// a secret-scan deny would make the canary pass for the wrong reason (no
+	// event means nothing to leak).
+	if !hasAuditEvent(events, func(e port.AuditEvent) bool {
+		return e.Service == "git-receive-pack" && e.Verdict == "deny" &&
+			len(e.Refs) > 0 && e.Refs[0].Ref == "refs/heads/feat/secret"
+	}) {
+		t.Fatalf("M9a: no secret-scan deny audit event for feat/secret — canary would be vacuous; events=%+v", events)
 	}
 	// No-leak canary: the secret string from the secret-bearing push MUST NOT
 	// appear in the audit file (the rules redact secrets; the audit records only
