@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -52,7 +53,7 @@ func run(configPath string) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("git-proxy %s starting: listen=%s upstream=%s", version.Version, cfg.Listen, cfg.Upstream.URL)
+	log.Printf("git-proxy %s starting: listen=%s upstream=%s", version.Version, cfg.Listen, redactURL(cfg.Upstream.URL))
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -79,6 +80,16 @@ func run(configPath string) error {
 	var auth port.Authenticator
 	if len(cfg.Auth.Tokens) > 0 {
 		auth = token.New(cfg.Auth.Tokens)
+	} else {
+		// No Bearer tokens configured → the HTTP frontend is unauthenticated
+		// (an open relay): any client can reach the upstream through the proxy
+		// with the proxy's upstream credentials attached. Fail-open at the config
+		// level is the existing default (preserved for backward compatibility /
+		// local tests), but for a security-control gateway that holds upstream
+		// creds this is a risky posture — warn loudly so a production deploy
+		// doesn't silently run open. Configure auth.tokens (or use the SSH
+		// frontend with ssh.authorized_keys) to close it.
+		log.Printf("git-proxy: WARNING: no auth.tokens configured — the HTTP frontend is an OPEN relay (any client can reach the upstream with the proxy's upstream credentials). Configure auth.tokens in production.")
 	}
 
 	// Upstream/SCM adapter: built via the upstream registry (v1.md M10), selected
@@ -136,7 +147,7 @@ func run(configPath string) error {
 		webhookSink = ws
 		alertSink = alert.Multi(ws, logalert.NewSink(nil))
 		httpFrontend.SetAlertSink(alertSink)
-		log.Printf("git-proxy: alerts enabled (webhook=%s)", cfg.Alerts.Webhook)
+		log.Printf("git-proxy: alerts enabled (webhook=%s)", redactWebhookURL(cfg.Alerts.Webhook))
 	} else {
 		log.Printf("git-proxy: alerts off (no alerts.webhook) — alert disabled")
 	}
@@ -324,4 +335,32 @@ func newMirrorOpener(upstreamURL, root string, creds port.CredentialStore) gitpr
 		mu.Unlock()
 		return m, nil
 	}
+}
+
+// redactURL returns u with any embedded userinfo (user:pass@) stripped, so a
+// misconfigured upstream.url carrying credentials is not written verbatim to
+// the startup log (which may be captured by a log aggregator). The scheme + host
+// + path are preserved (the repo path is useful operational context and carries
+// no secret). An unparseable URL is returned unchanged rather than blanked —
+// the config layer already validated a scheme/host, so this is defense-in-depth.
+func redactURL(u string) string {
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return u
+	}
+	parsed.User = nil
+	return parsed.String()
+}
+
+// redactWebhookURL returns just scheme://host for a webhook URL, dropping the
+// path, query, and fragment. Incoming-webhook URLs (Slack, Mattermost, generic)
+// commonly embed a secret token in the path or query, so the full URL must not
+// be logged. The host is enough operational context to identify the destination.
+// An unparseable URL is returned unchanged (defense-in-depth; config validated it).
+func redactWebhookURL(u string) string {
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return u
+	}
+	return parsed.Scheme + "://" + parsed.Host
 }
