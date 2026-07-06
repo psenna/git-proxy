@@ -3,6 +3,12 @@
 This guide is for the agents and humans implementing git-proxy. Read
 [`PRINCIPLES.md`](./PRINCIPLES.md) first — it is binding.
 
+> **Status:** v1 shipped. The v1 milestone (issues #1–#15) is complete — push
+> rules, read protection, audit, dry-run, alerts, and HTTP+SSH transports are
+> all live. The workflow below stays binding for v2 and beyond. See
+> [`docs/architecture.md`](./docs/architecture.md) for what shipped and
+> [`docs/extensibility.md`](./docs/extensibility.md) for how to extend it.
+
 ## Issue and PR workflow
 
 - **One issue per PR.** Each issue in the tracker maps to one PR that closes it.
