@@ -15,6 +15,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 
@@ -31,6 +32,36 @@ type Config struct {
 	SSH      SSHConfig         `yaml:"ssh"`
 	Audit    AuditConfig       `yaml:"audit"`
 	Alerts   AlertConfig       `yaml:"alerts"`
+	Broker   BrokerConfig      `yaml:"broker"`
+}
+
+// BrokerConfig configures the optional agent-facing PR/CI broker HTTP server.
+// When Listen is empty/absent the broker is disabled (git-protocol-only
+// operation — today's behavior). When enabled, the broker exposes a small REST
+// surface to already-authenticated agents and forwards each op to the upstream
+// SCM REST API using the proxy's held GitHub token (the agent never receives the
+// token). It runs as a separate mux on a separate port from the git-protocol
+// frontend; it is NOT a sub-path of the git frontend. config is a pure YAML
+// leaf: the broker package defines its own config type and main.go maps this
+// into it (mirroring UpstreamConfig), so this struct carries only YAML-facing
+// fields and no behavior.
+type BrokerConfig struct {
+	// Listen is the broker HTTP listen address (e.g. "127.0.0.1:8090").
+	// Empty/absent → broker disabled. MUST parse as host:port and MUST differ
+	// from the git-protocol Listen address (a separate mux on a separate port).
+	Listen string `yaml:"listen"`
+	// AllowedAgents is the allowlist of agent names permitted to use broker
+	// ops. Empty/absent means "all authenticated agents" (auth still gates;
+	// production should set this explicitly).
+	AllowedAgents []string `yaml:"allowed_agents"`
+	// AllowedOps optionally restricts which op kinds are permitted.
+	// Empty/absent means all ops are allowed. Values: "pr.create", "pr.get",
+	// "pr.list", "pr.merge", "pr.comment", "pr.review", "ci.status".
+	AllowedOps []string `yaml:"allowed_ops"`
+	// MergeMethod is the default GitHub merge method when a merge request does
+	// not specify one. One of "merge", "squash", "rebase". Empty defaults to
+	// "merge".
+	MergeMethod string `yaml:"merge_method"`
 }
 
 // AuditConfig configures the optional append-only JSONL audit log. When File
@@ -151,6 +182,37 @@ func (c *Config) validate() error {
 			return fmt.Errorf("config: alerts.webhook: %w", err)
 		}
 	}
+	// Broker: disabled when Listen is empty (git-protocol-only operation). When
+	// enabled, Listen MUST parse as host:port and MUST differ from the git
+	// frontend Listen address — the broker is a separate mux on a separate port,
+	// never a sub-path of the git frontend. A collision would silently shadow one
+	// server with the other, so fail closed at startup.
+	if c.Broker.Listen != "" {
+		if err := validateHostPort(c.Broker.Listen); err != nil {
+			return fmt.Errorf("config: broker.listen: %w", err)
+		}
+		if c.Broker.Listen == c.Listen {
+			return fmt.Errorf("config: broker.listen must differ from listen (broker runs on a separate port)")
+		}
+	}
+	return nil
+}
+
+// validateHostPort parses a as host:port (net.SplitHostPort) and requires a
+// non-empty host and port, so a malformed listen address (e.g. "not-a-url",
+// "8090", or ":8090" with no host) fails at startup rather than binding
+// unexpectedly. A bare ":8090" (all-interfaces, no host) is accepted for dev
+// convenience — it is a valid host:port with an empty host — but a value with no
+// port separator is rejected.
+func validateHostPort(a string) error {
+	host, port, err := net.SplitHostPort(a)
+	if err != nil {
+		return fmt.Errorf("invalid host:port %q: %w", a, err)
+	}
+	if port == "" {
+		return fmt.Errorf("invalid host:port %q: missing port", a)
+	}
+	_ = host // host may be empty ("":8090 binds all interfaces); port is required
 	return nil
 }
 

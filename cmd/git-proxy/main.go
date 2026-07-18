@@ -23,6 +23,7 @@ import (
 	logalert "github.com/psenna/git-proxy/internal/alert/log"
 	"github.com/psenna/git-proxy/internal/alert/webhook"
 	"github.com/psenna/git-proxy/internal/audit/file"
+	"github.com/psenna/git-proxy/internal/broker"
 	"github.com/psenna/git-proxy/internal/auth/keyauth"
 	"github.com/psenna/git-proxy/internal/auth/token"
 	"github.com/psenna/git-proxy/internal/config"
@@ -264,6 +265,47 @@ func run(configPath string) error {
 		}
 		transports = append(transports, sshFE)
 		log.Printf("git-proxy: SSH frontend enabled: listen=%s", cfg.SSH.Listen)
+	}
+
+	// Broker: the optional agent-facing GitHub PR/CI broker HTTP server. Enabled
+	// only when broker.listen is set; it runs on a separate mux and a separate
+	// port from the git-protocol frontend. It type-asserts port.PRSupport off the
+	// already-built upstream (main.go never references PRSupport — the broker
+	// does the type-assert internally) and fails closed at startup if the
+	// upstream is not an SCM adapter (e.g. upstream.kind: plain). The agent's
+	// Bearer auth reuses the shared port.Authenticator built above; the proxy's
+	// GitHub token is resolved per-repo by the adapter on the proxy→GitHub REST
+	// leg, never handed to the agent.
+	if cfg.Broker.Listen != "" {
+		brokerLn, err := net.Listen("tcp", cfg.Broker.Listen)
+		if err != nil {
+			return fmt.Errorf("broker listen: %w", err)
+		}
+		// Pass a true-nil AuditSink (not a nil *file.Sink wrapped in a non-nil
+		// interface) when audit is off, so the broker's nil check works.
+		var brokerAudit port.AuditSink
+		if auditSink != nil {
+			brokerAudit = auditSink
+		}
+		br, err := broker.New(brokerLn, up, cfg.Repos, auth, brokerAudit, broker.Config{
+			Listen:        cfg.Broker.Listen,
+			AllowedAgents: cfg.Broker.AllowedAgents,
+			AllowedOps:    cfg.Broker.AllowedOps,
+			MergeMethod:   cfg.Broker.MergeMethod,
+		})
+		if err != nil {
+			// Fail closed: the broker requires an SCM adapter. Return rather
+			// than silently running a broker that 501s every op.
+			return fmt.Errorf("broker: %w", err)
+		}
+		if auth == nil {
+			// The broker fails closed on every request when no authenticator is
+			// configured (it never runs unauthenticated), so this is safe but
+			// useless — warn so an operator notices the missing auth.tokens.
+			log.Printf("git-proxy: WARNING: broker enabled with no auth.tokens configured — every broker request will be rejected (fail closed). Configure auth.tokens to make the broker usable.")
+		}
+		transports = append(transports, br)
+		log.Printf("git-proxy: broker enabled: listen=%s", cfg.Broker.Listen)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

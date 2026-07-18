@@ -78,6 +78,48 @@ func TestStore_MissingFileFails(t *testing.T) {
 	}
 }
 
+const vaultWithTokenYAML = `credentials:
+  "gh/owner/repo.git":
+    username: ci-bot
+    password: upstream-secret
+    token: ghp_broker_token
+  "team/repo.git":
+    username: team-bot
+    password: team-secret
+`
+
+func TestStore_LoadsTokenField(t *testing.T) {
+	s, err := New(writeVault(t, vaultWithTokenYAML))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c, ok := s.CredentialsFor("gh/owner/repo.git")
+	if !ok {
+		t.Fatal("expected creds for gh/owner/repo.git")
+	}
+	if c.Token != "ghp_broker_token" {
+		t.Errorf("Token = %q, want ghp_broker_token", c.Token)
+	}
+	// The Basic-auth fields are unchanged alongside the new token field.
+	if c.Username != "ci-bot" || c.Password != "upstream-secret" {
+		t.Errorf("basic creds = {%s, %s}, want {ci-bot, upstream-secret}", c.Username, c.Password)
+	}
+}
+
+func TestStore_RepoWithoutTokenHasEmptyToken(t *testing.T) {
+	s, err := New(writeVault(t, vaultWithTokenYAML))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c, ok := s.CredentialsFor("team/repo.git")
+	if !ok {
+		t.Fatal("expected creds for team/repo.git")
+	}
+	if c.Token != "" {
+		t.Errorf("Token = %q, want empty (no token configured for this repo)", c.Token)
+	}
+}
+
 func TestStore_ImplementsCredentialStore(t *testing.T) {
 	var _ port.CredentialStore = (*Store)(nil)
 }
