@@ -137,6 +137,15 @@ cd demo
 git -c "$GIT_PROXY_HEADER" remote set-url origin $PROXY/demo/demo.git
 ```
 
+> **Read-protected repos:** once any file under `secrets/**` exists in the
+> repo (see the read-protection walkthrough below), a **plain** clone like the
+> one above is rejected by the proxy with an actionable error pointing you at
+> `--filter=blob:none` — the proxy withholds the denied blobs and a plain clone
+> cannot tolerate the resulting missing objects. Use
+> `git -c "$GIT_PROXY_HEADER" clone --filter=blob:none $PROXY/demo/demo.git`
+> for read-protected repos. The plain clone works until a `secrets/**` file is
+> pushed.
+
 ### A clean push to `feat/*` is forwarded
 
 `branch_pattern` allows `refs/heads/main` and `refs/heads/feat/*`, so a new
@@ -202,8 +211,30 @@ git cat-file -p HEAD:secrets/api.key
 ```
 
 The `secrets/api.key` blob is withheld from the clone (the proxy assembles the
-packfile and omits denied-path blobs). A plain (non-`--filter`) clone of a
-read-protected repo is not supported in v1 — use `--filter=blob:none`.
+packfile and omits denied-path blobs).
+
+> **If checkout fails:** a `--filter=blob:none` clone of a repo that already
+> contains a `secrets/**` file may report `Clone succeeded, but checkout failed`
+> and `access to object <oid> denied by read policy`. That is the protection
+> working, not a bug: at checkout time git prefetches every blob in `HEAD`
+> before writing any file, and the proxy denies the on-demand fetch of the
+> `secrets/**` blob — which aborts checkout *before any file is written*, so
+> even non-secret files (`README.md`, `docs/…`) are left out of the working
+> tree. Their blobs are present in your local object store; the tree simply was
+> not populated. Recover the non-secret files without ever fetching the secret:
+>
+> ```sh
+> git restore --staged :/                    # unstage the deletions (fetches nothing)
+> git checkout HEAD -- . ':!secrets'         # materialize everything except secrets/
+> ```
+>
+> Or clone with `--no-checkout` up front
+> (`git -c "$GIT_PROXY_HEADER" clone --no-checkout --filter=blob:none …`) and
+> check out only the paths you need. The denied `secrets/**` blob is never
+> delivered on either path. A plain (non-`--filter`) clone of a
+read-protected repo is rejected in v1 with an actionable error pointing at
+`--filter=blob:none` (the proxy withholds the denied blobs and a plain clone
+cannot tolerate the missing objects); use `--filter=blob:none`.
 
 ## 4. Inspect the audit log
 
