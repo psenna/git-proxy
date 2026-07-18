@@ -97,7 +97,7 @@ func TestCreatePR_HappyPath(t *testing.T) {
 	up := &capturingPRSupport{}
 	_, srv := newTestBroker(t, up, Config{MergeMethod: "squash"})
 	resp := do(t, srv, http.MethodPost, "/owner%2Frepo.git/prs", "agent-token-1", []byte(`{"head":"feat","base":"main","title":"t"}`))
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", resp.StatusCode)
 	}
@@ -114,7 +114,7 @@ func TestGetPR_HappyPath(t *testing.T) {
 	up := &capturingPRSupport{}
 	_, srv := newTestBroker(t, up, Config{})
 	resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/prs/7", "agent-token-1", nil)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
@@ -128,7 +128,7 @@ func TestListPRs_HappyPath(t *testing.T) {
 	up := &capturingPRSupport{}
 	_, srv := newTestBroker(t, up, Config{})
 	resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/prs?state=open", "agent-token-1", nil)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
@@ -142,7 +142,7 @@ func TestMergePR_204AndDefaultMethod(t *testing.T) {
 	up := &capturingPRSupport{}
 	_, srv := newTestBroker(t, up, Config{MergeMethod: "squash"})
 	resp := do(t, srv, http.MethodPost, "/owner%2Frepo.git/prs/7/merge", "agent-token-1", nil)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", resp.StatusCode)
 	}
@@ -155,7 +155,7 @@ func TestMergePR_MethodOverride(t *testing.T) {
 	up := &capturingPRSupport{}
 	_, srv := newTestBroker(t, up, Config{MergeMethod: "merge"})
 	resp := do(t, srv, http.MethodPost, "/owner%2Frepo.git/prs/7/merge", "agent-token-1", []byte(`{"method":"rebase"}`))
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", resp.StatusCode)
 	}
@@ -172,7 +172,7 @@ func TestMergePR_MalformedBodyIs400(t *testing.T) {
 	up := &capturingPRSupport{}
 	_, srv := newTestBroker(t, up, Config{MergeMethod: "squash"})
 	resp := do(t, srv, http.MethodPost, "/owner%2Frepo.git/prs/7/merge", "agent-token-1", []byte(`{"method":"rebase"`)) // truncated JSON
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (malformed body must not fall back to default method)", resp.StatusCode)
 	}
@@ -189,7 +189,7 @@ func TestCommentPR_HappyPath(t *testing.T) {
 	up := &capturingPRSupport{}
 	_, srv := newTestBroker(t, up, Config{})
 	resp := do(t, srv, http.MethodPost, "/owner%2Frepo.git/prs/5/comments", "agent-token-1", []byte(`{"body":"lgtm"}`))
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", resp.StatusCode)
 	}
@@ -202,7 +202,7 @@ func TestReviewPR_HappyPath(t *testing.T) {
 	up := &capturingPRSupport{}
 	_, srv := newTestBroker(t, up, Config{})
 	resp := do(t, srv, http.MethodPost, "/owner%2Frepo.git/prs/5/reviews", "agent-token-1", []byte(`{"event":"APPROVE","body":"ship"}`))
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", resp.StatusCode)
 	}
@@ -215,7 +215,7 @@ func TestChecks_HappyPath(t *testing.T) {
 	up := &capturingPRSupport{summary: port.CheckSummary{Overall: "success", Checks: []port.CheckRun{{Name: "ci", Status: "completed", Conclusion: "success"}}}}
 	_, srv := newTestBroker(t, up, Config{})
 	resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/checks/abc/def", "agent-token-1", nil)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
@@ -240,7 +240,7 @@ func TestAuth_401NoAndBadBearer(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/prs/7", tc.token, nil)
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode != http.StatusUnauthorized {
 				t.Fatalf("status = %d, want 401", resp.StatusCode)
 			}
@@ -255,7 +255,7 @@ func TestAuthz_403NotAllowlisted(t *testing.T) {
 	up := &capturingPRSupport{}
 	_, srv := newTestBroker(t, up, Config{AllowedAgents: []string{"bob"}})
 	resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/prs/7", "agent-token-1", nil)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403 (alice not in allowlist [bob])", resp.StatusCode)
 	}
@@ -265,7 +265,7 @@ func TestOpAllowlist_403(t *testing.T) {
 	up := &capturingPRSupport{}
 	_, srv := newTestBroker(t, up, Config{AllowedOps: []string{"pr.get"}})
 	resp := do(t, srv, http.MethodPost, "/owner%2Frepo.git/prs/7/merge", "agent-token-1", nil)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403 (pr.merge not in allowed_ops)", resp.StatusCode)
 	}
@@ -300,7 +300,7 @@ func TestSentinelToStatus(t *testing.T) {
 			}
 			_, srv := newTestBroker(t, up, Config{})
 			resp := do(t, srv, tc.method, tc.path, "agent-token-1", tc.body)
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode != tc.want {
 				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.want)
 			}
@@ -321,7 +321,7 @@ func TestRateLimited_ForwardsRetryAfter(t *testing.T) {
 	up := &capturingPRSupport{prErr: &port.RateLimitedError{RetryAfter: "120"}}
 	_, srv := newTestBroker(t, up, Config{})
 	resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/prs/7", "agent-token-1", nil)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", resp.StatusCode)
 	}
@@ -335,7 +335,7 @@ func TestRateLimited_NoRetryAfterWhenAbsent(t *testing.T) {
 	up := &capturingPRSupport{prErr: port.ErrRateLimited}
 	_, srv := newTestBroker(t, up, Config{})
 	resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/prs/7", "agent-token-1", nil)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", resp.StatusCode)
 	}
@@ -359,7 +359,7 @@ func TestAgentBearerNotForwardedToPRSupport(t *testing.T) {
 	srv := httptest.NewServer(b.routes())
 	defer srv.Close()
 	resp := do(t, srv, http.MethodPost, "/owner%2Frepo.git/prs", "agent-token-1", []byte(`{"head":"feat","base":"main","title":"t"}`))
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", resp.StatusCode)
 	}
@@ -390,7 +390,7 @@ func TestRepoAliasResolved(t *testing.T) {
 	// "alias" has no slash, so it needs no encoding; the broker resolves it to
 	// owner/repo.git before calling PRSupport.
 	resp := do(t, srv, http.MethodGet, "/alias/prs/7", "t", nil)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}

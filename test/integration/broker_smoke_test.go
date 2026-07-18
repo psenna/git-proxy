@@ -20,8 +20,12 @@ func freePort(t *testing.T) int {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
+	defer func() { _ = ln.Close() }()
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listen addr %T is not *net.TCPAddr", ln.Addr())
+	}
+	return addr.Port
 }
 
 // buildBinary builds the git-proxy binary into a temp dir and returns its path.
@@ -103,7 +107,7 @@ func TestBrokerSmoke_Healthz(t *testing.T) {
 	})
 
 	resp := waitForHealthy(t, brokerAddr, 5*time.Second)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("/healthz status = %d, want 200", resp.StatusCode)
 	}

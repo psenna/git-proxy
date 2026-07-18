@@ -144,7 +144,7 @@ func TestIntegration_BrokerEndToEnd(t *testing.T) {
 	// 1. Create PR → 201.
 	resp := req(t, http.MethodPost, brokerURL+"/owner%2Frepo.git/prs", "agent-token-1", []byte(`{"head":"feat","base":"main","title":"t"}`))
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create status = %d, want 201: %s", resp.StatusCode, body)
 	}
@@ -154,14 +154,14 @@ func TestIntegration_BrokerEndToEnd(t *testing.T) {
 
 	// 2. Get PR → 200.
 	resp = req(t, http.MethodGet, brokerURL+"/owner%2Frepo.git/prs/7", "agent-token-1", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("get status = %d, want 200", resp.StatusCode)
 	}
 
 	// 3. Merge PR → 204 (broker returns No Content on a successful merge).
 	resp = req(t, http.MethodPost, brokerURL+"/owner%2Frepo.git/prs/7/merge", "agent-token-1", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("merge status = %d, want 204", resp.StatusCode)
 	}
@@ -205,14 +205,14 @@ func TestIntegration_Negatives(t *testing.T) {
 
 	// No Bearer → 401.
 	resp := req(t, http.MethodGet, brokerURL+"/owner%2Frepo.git/prs/7", "", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("no-bearer status = %d, want 401", resp.StatusCode)
 	}
 
 	// Bad Bearer → 401.
 	resp = req(t, http.MethodGet, brokerURL+"/owner%2Frepo.git/prs/7", "wrong", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("bad-bearer status = %d, want 401", resp.StatusCode)
 	}
@@ -221,7 +221,7 @@ func TestIntegration_Negatives(t *testing.T) {
 	// is permitted).
 	brokerURL2, _, _, _ := bootIntegration(t, Config{AllowedAgents: []string{"alice"}})
 	resp = req(t, http.MethodGet, brokerURL2+"/owner%2Frepo.git/prs/7", "bob-token-2", nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("unallowlisted status = %d, want 403", resp.StatusCode)
 	}
@@ -233,7 +233,7 @@ func TestIntegration_GitHubConflictMapsToBroker409(t *testing.T) {
 
 	resp := req(t, http.MethodPost, brokerURL+"/owner%2Frepo.git/prs/7/merge", "agent-token-1", nil)
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (GitHub 409 → broker 409): %s", resp.StatusCode, body)
 	}

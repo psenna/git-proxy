@@ -150,7 +150,9 @@ func TestPRSupport_RealCallsAttachTokenAndFailClosed(t *testing.T) {
 	defer srv.Close()
 
 	adapter := New(upstream.UpstreamConfig{Kind: "github", URL: srv.URL, CredentialsStore: fakeVault{token: proxyToken}})
-	prs := interface{}(adapter).(port.PRSupport)
+	// Compile-time check that *Adapter satisfies port.PRSupport (panics at build
+	// time if it ever stops conforming); avoids an unchecked type assertion.
+	var prs port.PRSupport = adapter
 	ctx := context.Background()
 
 	pr, err := prs.EnsurePR(ctx, "owner/repo.git", "feat", "main", "t")
@@ -208,7 +210,7 @@ func TestPRSupport_RealCallsAttachTokenAndFailClosed(t *testing.T) {
 	// Fail-closed: a repo with no token configured must NOT call GitHub
 	// anonymously; it returns ErrUnauthorized before any request leaves.
 	noTokenAdapter := New(upstream.UpstreamConfig{Kind: "github", URL: srv.URL, CredentialsStore: emptyVault{}})
-	unknownPRs := interface{}(noTokenAdapter).(port.PRSupport)
+	var unknownPRs port.PRSupport = noTokenAdapter
 	if _, err := unknownPRs.EnsurePR(ctx, "owner/repo.git", "feat", "main", "t"); !errors.Is(err, port.ErrUnauthorized) {
 		t.Errorf("EnsurePR with no token err = %v, want ErrUnauthorized", err)
 	}
