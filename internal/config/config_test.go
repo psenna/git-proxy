@@ -94,6 +94,70 @@ auth:
 	}
 }
 
+func TestParseBrokerConfigDisabledByDefault(t *testing.T) {
+	c, err := Parse([]byte(validYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Broker.Listen != "" {
+		t.Errorf("Broker.Listen = %q, want empty (broker disabled by default)", c.Broker.Listen)
+	}
+}
+
+func TestParseBrokerConfigEnabled(t *testing.T) {
+	c, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+broker:
+  listen: "127.0.0.1:8090"
+  allowed_agents: ["agent-1", "agent-2"]
+  allowed_ops: ["pr.create", "ci.status"]
+  merge_method: "squash"
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Broker.Listen != "127.0.0.1:8090" {
+		t.Errorf("Broker.Listen = %q", c.Broker.Listen)
+	}
+	if len(c.Broker.AllowedAgents) != 2 || c.Broker.AllowedAgents[0] != "agent-1" {
+		t.Errorf("Broker.AllowedAgents = %v", c.Broker.AllowedAgents)
+	}
+	if len(c.Broker.AllowedOps) != 2 {
+		t.Errorf("Broker.AllowedOps = %v", c.Broker.AllowedOps)
+	}
+	if c.Broker.MergeMethod != "squash" {
+		t.Errorf("Broker.MergeMethod = %q", c.Broker.MergeMethod)
+	}
+}
+
+func TestParseBrokerListenCollisionRejected(t *testing.T) {
+	_, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+broker:
+  listen: "127.0.0.1:8080"
+`))
+	if err == nil || !strings.Contains(err.Error(), "broker.listen") {
+		t.Fatalf("expected broker.listen collision error, got %v", err)
+	}
+}
+
+func TestParseBrokerListenMalformedRejected(t *testing.T) {
+	_, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+broker:
+  listen: "not-a-host-port"
+`))
+	if err == nil || !strings.Contains(err.Error(), "broker.listen") {
+		t.Fatalf("expected broker.listen malformed error, got %v", err)
+	}
+}
+
 func TestParseAuditConfig(t *testing.T) {
 	// Set: audit enabled with a file path.
 	c, err := Parse([]byte(`
