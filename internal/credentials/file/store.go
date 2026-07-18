@@ -23,9 +23,10 @@ type Store struct {
 // vaultFile is the YAML schema of the credentials file:
 //
 //	credentials:
-//	  "test.git":
+//	  "owner/repo.git":
 //	    username: ci-bot
 //	    password: hunter2
+//	    token: ghp_broker_token   # optional Bearer token for the SCM REST API
 type vaultFile struct {
 	Credentials map[string]port.Credentials `yaml:"credentials"`
 }
