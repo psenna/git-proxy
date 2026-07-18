@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/psenna/git-proxy/internal/config"
+	"github.com/psenna/git-proxy/internal/port"
 )
 
 // policyReadDeny returns a PolicyConfig that enables proxy-level read
@@ -177,5 +178,64 @@ func TestReadProtection_OffClonesFully(t *testing.T) {
 	// The public files clone fully too.
 	if g, err := os.ReadFile(filepath.Join(dst, "docs", "guide.md")); err != nil || string(g) != "public guide\n" {
 		t.Errorf("docs/guide.md = %q err=%v, want %q", string(g), err, "public guide\n")
+	}
+}
+
+// TestReadProtection_PlainCloneRejectedWithActionableError is the end-to-end
+// acceptance test for the plain-clone rejection fix. A plain (non --filter)
+// clone of a read-protected repo (policy.read.deny: secrets/**) whose
+// reachable set contains a denied blob is REFUSED by the proxy with an
+// actionable error pointing the agent at --filter=blob:none — NOT the cryptic
+// client-side "missing blob object" the old broken-packfile behavior caused.
+// The audit log records a deny with the actionable reason and no secret
+// content.
+func TestReadProtection_PlainCloneRejectedWithActionableError(t *testing.T) {
+	auditPath := auditFile(t)
+	h := StartWithPolicyAndAudit(t, "test.git", policyReadDeny("secrets/**"), auditPath)
+	seedProtectedFiles(t, h)
+
+	// Plain clone through the proxy: must fail with the actionable error.
+	clone := t.TempDir()
+	dst := filepath.Join(clone, "repo")
+	cmd := h.Git(clone, "clone", h.UpstreamURL+"/test.git", dst)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		// A plain clone that produced a working tree would mean the denied blob
+		// leaked — fail loudly.
+		if b, rerr := os.ReadFile(filepath.Join(dst, "secrets", "secret.txt")); rerr == nil {
+			t.Fatalf("DENY LEAK: plain clone succeeded and secret file present: %q", b)
+		}
+		t.Fatalf("plain clone of read-protected repo unexpectedly succeeded")
+	}
+	outStr := string(out)
+	if !strings.Contains(outStr, "requires a partial clone") || !strings.Contains(outStr, "--filter=blob:none") {
+		t.Fatalf("plain clone output missing actionable reason; got:\n%s", outStr)
+	}
+	if strings.Contains(outStr, "missing blob object") {
+		t.Errorf("plain clone surfaced the old cryptic 'missing blob object' error; got:\n%s", outStr)
+	}
+	const canary = "TOP-SECRET-VALUE-DO-NOT-LEAK"
+	if strings.Contains(outStr, canary) {
+		t.Errorf("DENY LEAK: secret canary in clone output: %q", outStr)
+	}
+
+	// Audit: a git-upload-pack deny event with the actionable reason and no
+	// secret content.
+	events := readAuditEvents(t, auditPath)
+	if !hasAuditEvent(events, func(e port.AuditEvent) bool {
+		return e.Service == "git-upload-pack" &&
+			e.Verdict == "deny" &&
+			len(e.Reasons) > 0 &&
+			strings.Contains(e.Reasons[0], "requires a partial clone") &&
+			strings.Contains(e.Reasons[0], "--filter=blob:none")
+	}) {
+		t.Errorf("no audit git-upload-pack deny event with the actionable reason; events=%+v", events)
+	}
+	for _, e := range events {
+		for _, r := range e.Reasons {
+			if strings.Contains(r, canary) {
+				t.Errorf("DENY LEAK: secret canary in audit reason %q", r)
+			}
+		}
 	}
 }

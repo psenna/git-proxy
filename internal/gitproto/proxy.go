@@ -223,10 +223,14 @@ func (p *Proxy) UploadPack(ctx context.Context, repo string, body io.Reader, w i
 	// and the alert carries DryRun=false. Documented limitation.
 	verdict := "allow"
 	var reasons []string
-	if len(result.DeniedOIDs) > 0 {
+	switch {
+	case result.DeniedReason != "":
+		verdict = "deny"
+		reasons = []string{result.DeniedReason}
+	case len(result.DeniedOIDs) > 0:
 		verdict = "deny"
 		reasons = []string{"on-demand blob denied by read policy"}
-	} else if len(result.DeniedPaths) > 0 {
+	case len(result.DeniedPaths) > 0:
 		verdict = "deny"
 		reasons = []string{"blob withheld by read policy"}
 	}
