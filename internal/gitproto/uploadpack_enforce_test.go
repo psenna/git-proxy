@@ -95,6 +95,21 @@ func uploadPackRequest(t *testing.T, tip string, sideband bool) *gitproto.Upload
 	return req
 }
 
+// uploadPackRequestFilter is uploadPackRequest for a partial-clone fetch: the
+// request advertises the `filter` capability, exactly as a real
+// `git clone --filter=blob:none` does. Used by the deny-matcher packfile tests,
+// which must exercise the partial-clone (withhold) path rather than the
+// plain-clone ERR path that a non-filter request now triggers.
+func uploadPackRequestFilter(t *testing.T, tip string, sideband bool) *gitproto.UploadPackRequest {
+	t.Helper()
+	req := uploadPackRequest(t, tip, sideband)
+	// splitCaps (which parsed req.Caps) splits on whitespace, so a real
+	// "filter blob:none" cap appears as two entries. Appending them here
+	// reproduces that tokenization; clientRequestedFilter matches on "filter".
+	req.Caps = append(req.Caps, "filter", "blob:none")
+	return req
+}
+
 // uploadPackRequestWants builds a v0 upload-pack request wanting the given OIDs
 // (one want line each; caps attach to the first). Used by the on-demand tests to
 // send a BLOB oid as a want (what the agent's git sends after a
@@ -250,7 +265,7 @@ func TestServeUploadPackEnforced_DenyWithholdsSecretBlob(t *testing.T) {
 	}
 
 	matcher := pathmatch.New([]string{"secrets/**"})
-	req := uploadPackRequest(t, tip, true)
+	req := uploadPackRequestFilter(t, tip, true) // partial-clone request → withhold path
 
 	var out bytes.Buffer
 	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
@@ -322,7 +337,7 @@ func TestServeUploadPackEnforced_NonSidebandRawPack(t *testing.T) {
 	m := readProtectionMirror(t, source)
 
 	matcher := pathmatch.New([]string{"secrets/**"})
-	req := uploadPackRequest(t, tip, false) // no side-band-64k
+	req := uploadPackRequestFilter(t, tip, false) // partial-clone request, no side-band-64k → raw withhold path
 
 	var out bytes.Buffer
 	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
@@ -728,6 +743,53 @@ func TestServeUploadPackEnforced_OnDemandBlob_MixedWantWithDeniedBlob(t *testing
 	}
 	assertUploadPackErr(t, out.Bytes())
 	// No packfile: the ERR is the only pkt-line (assertUploadPackErr checks).
+}
+
+// TestServeUploadPackEnforced_PlainCloneDeniedWithError verifies the fix: a
+// read-protected fetch whose reachable set contains a denied-path blob, made
+// WITHOUT the `filter` capability (a plain clone), is REFUSED with an
+// actionable `ERR <reason>\n` pkt-line — not a structurally-incomplete packfile
+// the client would reject with a cryptic "missing blob object". The reason
+// points the agent at --filter=blob:none and leaks no paths/OIDs/secrets.
+// The matching fetch WITH `filter` still serves the withheld packfile
+// (partial-clone path), asserted as a regression guard.
+func TestServeUploadPackEnforced_PlainCloneDeniedWithError(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, tip := readRepoForProtection(t)
+	m := readProtectionMirror(t, source)
+	matcher := pathmatch.New([]string{"secrets/**"})
+
+	// --- Plain clone: no `filter` capability → refused with ERR. ---
+	plainReq := uploadPackRequest(t, tip, true) // no filter
+	var out bytes.Buffer
+	res, err := gitproto.ServeUploadPackEnforced(ctx, &out, plainReq, m, matcher, "repo.git")
+	if err != nil {
+		t.Fatalf("ServeUploadPackEnforced plain clone: %v (ERR write should succeed; expected nil error)", err)
+	}
+	reason := assertUploadPackErr(t, out.Bytes())
+	const wantReason = "read-protected repository requires a partial clone; retry with --filter=blob:none"
+	if reason != wantReason {
+		t.Fatalf("ERR reason = %q, want %q", reason, wantReason)
+	}
+	if res.DeniedReason != wantReason {
+		t.Errorf("result.DeniedReason = %q, want %q", res.DeniedReason, wantReason)
+	}
+	// No secret canary in the response (no-leak).
+	if strings.Contains(out.String(), "TOP-SECRET-VALUE-DO-NOT-LEAK") {
+		t.Errorf("DENY LEAK: secret canary present in plain-clone ERR response")
+	}
+
+	// --- Regression: the same fetch WITH `filter` serves the withheld packfile. ---
+	var outFilt bytes.Buffer
+	filtReq := uploadPackRequestFilter(t, tip, true)
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &outFilt, filtReq, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced filter clone: %v", err)
+	}
+	if !bytes.HasPrefix(outFilt.Bytes(), []byte("0008NAK\n")) {
+		t.Fatalf("filter-clone response should start with a NAK pkt-line + packfile (not ERR); got %x", outFilt.Bytes()[:min(16, outFilt.Len())])
+	}
 }
 
 // mustOutput runs a command and returns trimmed stdout, failing the test on a

@@ -22,8 +22,37 @@ import (
 // any non-empty DeniedPaths/DeniedOIDs → verdict deny; both empty → allow.
 // Paths and OIDs are not blob content — safe to log (no-leak contract).
 type UploadPackEnforceResult struct {
-	DeniedPaths []string // blob paths withheld from the packfile (Task 9)
-	DeniedOIDs  []string // on-demand blob OIDs refused with ERR (Task 10)
+	DeniedPaths  []string // blob paths withheld from the packfile (Task 9)
+	DeniedOIDs   []string // on-demand blob OIDs refused with ERR (Task 10)
+	DeniedReason string   // actionable plain-clone rejection reason (empty otherwise)
+}
+
+// errPlainCloneNeedsFilter is the actionable, fail-closed reason emitted when a
+// read-protected fetch would withhold a denied-path blob but the client did not
+// request a filtered (partial) fetch. A plain clone cannot tolerate the
+// withheld blobs (a tree referencing a missing blob), so the proxy refuses
+// rather than serving a structurally-incomplete packfile the client would reject
+// with a cryptic "missing blob object". Generic: no credentials, no secret
+// content, no paths/OIDs.
+const errPlainCloneNeedsFilter = "read-protected repository requires a partial clone; retry with --filter=blob:none"
+
+// clientRequestedFilter reports whether the agent's upload-pack request asked
+// for a filtered (partial) fetch — i.e. it advertised the `filter` capability.
+// A plain clone/fetch does not, and cannot tolerate the blobs read protection
+// withholds, so the caller refuses it with an actionable ERR rather than
+// serving a structurally-incomplete packfile.
+//
+// req.Caps entries are "name" or "name=value"; splitCaps splits on whitespace,
+// so a real `filter blob:none` cap appears as two entries ("filter" and
+// "blob:none"). Matching the "filter" name in either the bare or name=value
+// form covers both tokenizations.
+func clientRequestedFilter(caps []string) bool {
+	for _, c := range caps {
+		if c == "filter" || strings.HasPrefix(c, "filter=") {
+			return true
+		}
+	}
+	return false
 }
 
 // ServeUploadPackEnforced assembles a filtered packfile for a read-protected
@@ -156,6 +185,23 @@ func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRe
 	}
 	if withheld > 0 {
 		log.Printf("gitproto: upload-pack enforce: withheld %d blob(s) for repo %q", withheld, repo)
+	}
+
+	// Plain-clone rejection: if any blob was withheld and the client did not
+	// request a filtered (partial) fetch, the served packfile would be
+	// structurally incomplete (a tree referencing a missing blob) and the
+	// client would fail with a cryptic "missing blob object". Refuse the fetch
+	// with an actionable ERR pointing at --filter=blob:none instead. Fail-closed:
+	// the denied blob is never served. This mirrors the on-demand deny pattern
+	// (write ERR to w, return a populated result + nil error so the caller's
+	// audit mapping records the deny).
+	if withheld > 0 && !clientRequestedFilter(req.Caps) {
+		log.Printf("gitproto: upload-pack enforce: refusing plain clone of read-protected repo %q (%d denied blob(s)); client must use --filter=blob:none", repo, withheld)
+		reason := errPlainCloneNeedsFilter
+		if err := writeUploadPackErr(w, reason); err != nil {
+			return UploadPackEnforceResult{DeniedPaths: deniedPaths, DeniedReason: reason}, err
+		}
+		return UploadPackEnforceResult{DeniedPaths: deniedPaths, DeniedReason: reason}, nil
 	}
 
 	// Assemble the filtered packfile from the explicit allowed OID list. The
