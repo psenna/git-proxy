@@ -26,6 +26,16 @@ import (
 type Config struct {
 	Listen   string            `yaml:"listen"`
 	Upstream UpstreamConfig    `yaml:"upstream"`
+	// IssueUpstream is an OPTIONAL, separately-configured upstream that sources
+	// the issue tracker (the broker's issue routes), distinct from Upstream
+	// (the SCM that backs git protocol + PRSupport). Empty Kind (absent) means
+	// issues are disabled — issue routes return 501 per-op; the broker's
+	// PRSupport startup fail-closed is unchanged. Decoupling the issue provider
+	// from the SCM lets a deployment run, e.g., GitHub as the SCM and Jira as
+	// the issue source with no core change. v1 sets both to kind: github
+	// (reusing the github adapter, which implements IssueSupport). See
+	// internal/port/issues.go.
+	IssueUpstream UpstreamConfig `yaml:"issue_upstream"`
 	Repos    map[string]string `yaml:"repos"`
 	Auth     AuthConfig        `yaml:"auth"`
 	Policy   PolicyConfig      `yaml:"policy"`
@@ -162,6 +172,13 @@ func (c *Config) validate() error {
 	}
 	if c.Upstream.URL == "" {
 		return fmt.Errorf("config: upstream.url is required")
+	}
+	// Issue upstream: optional. When Kind is set (issues opted-in), the URL is
+	// required — a missing URL on an enabled issue upstream is a config error
+	// (fail closed at startup, NOT a silent fallback to the SCM upstream). An
+	// absent IssueUpstream (empty Kind) means issues disabled, which is allowed.
+	if c.IssueUpstream.Kind != "" && c.IssueUpstream.URL == "" {
+		return fmt.Errorf("config: issue_upstream.url is required when issue_upstream.kind is set")
 	}
 	// SSH frontend: disabled when Listen is empty (HTTP-only operation). When
 	// enabled, AuthorizedKeys MUST be non-empty (fail closed: an enabled SSH
