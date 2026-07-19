@@ -111,10 +111,9 @@ func mirrorExists(ctx context.Context, dir string) bool {
 	if _, err := exec.LookPath("git"); err != nil {
 		return false
 	}
-	// Confirm it is a git dir (git rev-parse succeeds).
-	out, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--git-dir").CombinedOutput()
-	if err != nil {
-		_ = out
+	// Confirm it is a git dir (git rev-parse succeeds). The command's output
+	// is not needed — only its success/failure distinguishes a git dir.
+	if _, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--git-dir").CombinedOutput(); err != nil {
 		return false
 	}
 	return true
