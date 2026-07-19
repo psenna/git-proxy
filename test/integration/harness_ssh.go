@@ -6,11 +6,13 @@ import (
 	"crypto/rand"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/psenna/git-proxy/internal/auth/keyauth"
@@ -48,6 +50,11 @@ type SSHHarness struct {
 	// via the underlying Harness. SSH-only tests do not use ProxyURL.
 	h *Harness
 
+	// up wraps the real upstream with a hit counter so a test can assert the
+	// upstream was (not) contacted — e.g. the deny test asserts 0 hits after a
+	// rejected clone, proving the deny check fired before writeAdvertisement.
+	up *countingUpstream
+
 	// sshCancel stops the SSH frontend.
 	sshCancel context.CancelFunc
 	// sshErrCh receives the SSH frontend's Serve result.
@@ -64,7 +71,26 @@ type SSHHarness struct {
 // Pass pol as a config.PolicyConfig with the desired rules enabled; an empty
 // rule set + no read-deny yields passthrough. mirrorRoot is overridden to a
 // temp dir regardless.
+//
+// Under deny-by-default, the SSH test repo must be reachable for the existing
+// push tests (which push through the proxy): StartSSH delegates to
+// StartSSHWithAccess with fakeCredStore(repo) + nil publicRepos, mirroring the
+// HTTP harness choices (Task 3). Use StartSSHWithAccess directly to boot with
+// a different cred store / publicRepos allowlist (e.g. the deny test passes
+// nil creds to assert an unconfigured repo is rejected).
 func StartSSH(t *testing.T, repo, agentName string, pol config.PolicyConfig) *SSHHarness {
+	t.Helper()
+	return StartSSHWithAccess(t, repo, agentName, pol, fakeCredStore(repo), nil)
+}
+
+// StartSSHWithAccess is StartSSH with explicit creds + publicRepos wired into
+// the SSH frontend's deny-by-default access check. creds is the
+// port.CredentialStore the frontend's access.Decide consults (nil → no
+// credential profiles → reads denied unless publicRepos matches, writes always
+// denied). publicRepos is the anonymous-read allowlist (nil → no allowlist).
+// The proxy→upstream attach path is UNCHANGED (the upstream uses its own
+// plainUpstream nil creds); only the new access.Decide path uses these.
+func StartSSHWithAccess(t *testing.T, repo, agentName string, pol config.PolicyConfig, creds port.CredentialStore, publicRepos port.RepoMatcher) *SSHHarness {
 	t.Helper()
 
 	h := Start(t, repo)
@@ -122,7 +148,11 @@ func StartSSH(t *testing.T, repo, agentName string, pol config.PolicyConfig) *SS
 	if err != nil {
 		t.Fatalf("ssh listen: %v", err)
 	}
-	sshFE, err := sshfront.New(sshLn, plainUpstream(t, h), map[string]string{repo: repo}, sshAuthn, hostKeyPath)
+	// Wrap the upstream with a hit counter so the deny test can assert the
+	// upstream was not contacted (deny fires before writeAdvertisement, the
+	// first upstream contact). Transparent to the proxy: forwards every call.
+	up := &countingUpstream{inner: plainUpstream(t, h)}
+	sshFE, err := sshfront.New(sshLn, up, map[string]string{repo: repo}, sshAuthn, hostKeyPath, creds, publicRepos)
 	if err != nil {
 		t.Fatalf("ssh frontend: %v", err)
 	}
@@ -141,6 +171,7 @@ func StartSSH(t *testing.T, repo, agentName string, pol config.PolicyConfig) *SS
 		h:                 h,
 		sshCancel:         cancel,
 		sshErrCh:          sshErrCh,
+		up:                up,
 	}
 	t.Cleanup(sh.Close)
 	return sh
@@ -152,6 +183,60 @@ func StartSSH(t *testing.T, repo, agentName string, pol config.PolicyConfig) *SS
 func plainUpstream(t *testing.T, h *Harness) port.Upstream {
 	t.Helper()
 	return plain.New(h.UpstreamURL, nil)
+}
+
+// UpstreamHits returns the number of upstream method calls (ListRefs,
+// ListRefsService, UploadPack, ReceivePack) observed since the harness started.
+// A deny-by-default rejection fires before any upstream contact, so the deny
+// test asserts 0 hits after a rejected clone (proving the deny check ran before
+// writeAdvertisement, the first upstream contact).
+func (s *SSHHarness) UpstreamHits() int {
+	if s.up == nil {
+		return 0
+	}
+	return s.up.snapshot()
+}
+
+// countingUpstream wraps a port.Upstream and counts every method call. It is
+// transparent (forwards every call to inner) so the proxy behaves identically;
+// the counter only lets a test assert upstream contact. Used by the SSH harness
+// to assert the deny check fires before the first upstream contact.
+type countingUpstream struct {
+	inner port.Upstream
+	mu    sync.Mutex
+	hits  int
+}
+
+func (c *countingUpstream) snapshot() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.hits
+}
+
+func (c *countingUpstream) bump() {
+	c.mu.Lock()
+	c.hits++
+	c.mu.Unlock()
+}
+
+func (c *countingUpstream) ListRefs(ctx context.Context, repo string) (port.Refs, error) {
+	c.bump()
+	return c.inner.ListRefs(ctx, repo)
+}
+
+func (c *countingUpstream) ListRefsService(ctx context.Context, repo, service string) (port.Refs, error) {
+	c.bump()
+	return c.inner.ListRefsService(ctx, repo, service)
+}
+
+func (c *countingUpstream) UploadPack(ctx context.Context, repo string, body io.Reader) (io.ReadCloser, error) {
+	c.bump()
+	return c.inner.UploadPack(ctx, repo, body)
+}
+
+func (c *countingUpstream) ReceivePack(ctx context.Context, repo string, body io.Reader) (io.ReadCloser, error) {
+	c.bump()
+	return c.inner.ReceivePack(ctx, repo, body)
 }
 
 // Close stops the SSH frontend and the underlying upstream. Safe to call
