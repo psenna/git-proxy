@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -423,8 +424,17 @@ func writeVault(t *testing.T, creds map[string]port.Credentials) string {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString("credentials:\n")
-	i := 0
-	for repo, c := range creds {
+	// Sort the repo keys so PROFILE%d names are assigned deterministically.
+	// Go randomizes map iteration order; the names are unique and tests resolve
+	// by repo not name, but stable ordering keeps the emitted vault file (and
+	// any diff output) reproducible across runs.
+	repos := make([]string, 0, len(creds))
+	for r := range creds {
+		repos = append(repos, r)
+	}
+	sort.Strings(repos)
+	for i, repo := range repos {
+		c := creds[repo]
 		name := fmt.Sprintf("PROFILE%d", i)
 		b.WriteString("  - name: " + name + "\n")
 		b.WriteString("    username: " + c.Username + "\n")
@@ -434,7 +444,6 @@ func writeVault(t *testing.T, creds map[string]port.Credentials) string {
 		}
 		b.WriteString("    repos:\n")
 		b.WriteString("      - \"" + repo + "\"\n")
-		i++
 	}
 	p := filepath.Join(t.TempDir(), "vault.yaml")
 	if err := os.WriteFile(p, []byte(b.String()), 0o600); err != nil {

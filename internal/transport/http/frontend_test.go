@@ -229,6 +229,12 @@ func TestFrontend_DenyByDefault(t *testing.T) {
 		if !strings.Contains(rr.Body.String(), "repository not served by this proxy") {
 			t.Errorf("body = %q, want it to contain the generic deny reason", rr.Body.String())
 		}
+		// No-leak: the denied repo path must not be echoed back in the deny body
+		// (symmetric with the SSH deny test). Defense-in-depth against a future
+		// regression that interpolates the repo path into the deny response.
+		if strings.Contains(rr.Body.String(), "other/x.git") {
+			t.Errorf("deny body leaked repo path: %q", rr.Body.String())
+		}
 		if hits, _ := up.snapshot(); hits != 0 {
 			t.Errorf("upstream hit %d times; deny must not reach upstream", hits)
 		}
@@ -274,6 +280,11 @@ func TestFrontend_DenyByDefault(t *testing.T) {
 		f.handle(rr, req)
 		if rr.Code != http.StatusForbidden {
 			t.Fatalf("code = %d, want 403 for push to public_repos (read-only)", rr.Code)
+		}
+		// No-leak: the denied repo path must not be echoed back in the deny body
+		// (symmetric with the SSH deny test and the deny_unconfigured_read case).
+		if strings.Contains(rr.Body.String(), "other/x.git") {
+			t.Errorf("deny body leaked repo path: %q", rr.Body.String())
 		}
 		if hits, _ := up.snapshot(); hits != 0 {
 			t.Errorf("upstream hit %d times; denied push must not reach upstream", hits)
