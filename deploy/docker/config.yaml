@@ -24,6 +24,18 @@ auth:
     #   http.extraheader="Authorization: Bearer agent-token-1"
     "agent-token-1": "agent-1"
 
+# public_repos: an OPTIONAL allowlist of upstream repo patterns the proxy serves
+# to anonymous (uncredentialed) agents for read-only (clone/fetch) access.
+# Patterns match the UPSTREAM (mapped) repo path; wildcards like "public/*" are
+# allowed (bare "*" and "**" are not). Empty/absent → deny-by-default for any
+# repo with no credentialed profile. The demo repo "demo/demo.git" is profiled in
+# credentials.yaml, so it is served regardless — public_repos is for repos you
+# want to expose to anonymous readers with NO upstream creds attached. Uncomment
+# to use:
+#
+# public_repos:
+#   - "public/*"
+
 policy:
   mode: first_deny            # stop at the first violation; use collect_all to report all
   mirror:

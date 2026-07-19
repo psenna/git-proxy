@@ -11,6 +11,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http/cgi"
 	"net/http/httptest"
@@ -25,7 +26,7 @@ import (
 	fileaudit "github.com/psenna/git-proxy/internal/audit/file"
 	"github.com/psenna/git-proxy/internal/auth/token"
 	"github.com/psenna/git-proxy/internal/config"
-	"github.com/psenna/git-proxy/internal/credentials/file"
+	"github.com/psenna/git-proxy/internal/credentials/profile"
 	"github.com/psenna/git-proxy/internal/gitproto"
 	"github.com/psenna/git-proxy/internal/gitx"
 	"github.com/psenna/git-proxy/internal/policy"
@@ -173,7 +174,7 @@ func StartWithAuth(t *testing.T, repo, agentToken string, vaultCreds map[string]
 	var store port.CredentialStore
 	if vaultCreds != nil {
 		h.VaultPath = writeVault(t, vaultCreds)
-		s, err := file.New(h.VaultPath)
+		s, err := profile.New(h.VaultPath)
 		if err != nil {
 			t.Fatalf("load vault: %v", err)
 		}
@@ -413,16 +414,27 @@ func (s fakeStore) CredentialsFor(repo string) (port.Credentials, bool) {
 
 var _ port.CredentialStore = fakeStore{}
 
-// writeVault writes a credential vault YAML file and returns its path. The
-// vault maps repo paths to upstream credentials.
+// writeVault writes a credential vault YAML file in the profile-store list
+// layout and returns its path. Each map entry (keyed by upstream repo path)
+// becomes one named profile (PROFILE0, PROFILE1, ...) with repos: [<repo>].
+// token is emitted only when non-empty. The auth tests pass real passwords, so
+// every emitted profile is credentialed and CredentialsFor resolves them.
 func writeVault(t *testing.T, creds map[string]port.Credentials) string {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString("credentials:\n")
+	i := 0
 	for repo, c := range creds {
-		b.WriteString("  \"" + repo + "\":\n")
+		name := fmt.Sprintf("PROFILE%d", i)
+		b.WriteString("  - name: " + name + "\n")
 		b.WriteString("    username: " + c.Username + "\n")
 		b.WriteString("    password: " + c.Password + "\n")
+		if c.Token != "" {
+			b.WriteString("    token: " + c.Token + "\n")
+		}
+		b.WriteString("    repos:\n")
+		b.WriteString("      - \"" + repo + "\"\n")
+		i++
 	}
 	p := filepath.Join(t.TempDir(), "vault.yaml")
 	if err := os.WriteFile(p, []byte(b.String()), 0o600); err != nil {

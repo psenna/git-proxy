@@ -49,21 +49,26 @@ cp .env.example .env
 $EDITOR .env                # OLLAMA_API_KEY, GITHUB_REPO, (optionally OLLAMA_MODEL)
 ```
 
-Then edit `credentials.yaml` so the key matches your repo and holds your PAT in both
-the `password` (git protocol, Basic) and `token` (broker, Bearer) fields:
+Then edit `credentials.yaml` so the profile's `repos` matches your repo and holds
+your PAT in both the `password` (git protocol, Basic) and `token` (broker, Bearer)
+fields:
 
 ```sh
 $EDITOR credentials.yaml
 # e.g. for psenna/git-proxy.git:
 #   credentials:
-#     "psenna/git-proxy.git":
+#     - name: GITHUB
 #       username: x-access-token
 #       password: ghp_yourPAT
 #       token: ghp_yourPAT
+#       repos:
+#         - "psenna/git-proxy.git"
 ```
 
 `x-access-token` + PAT is the canonical GitHub git-HTTPS Basic form (the proxy's git
 leg reads only `username`/`password`; the broker reads `token`). One PAT fills both.
+You can also inject the PAT via the `GITHUB_PASSWORD` / `GITHUB_TOKEN` env vars
+(env > file > empty), e.g. in `docker-compose.yml`, instead of editing this file.
 
 ## 2. Bring the stack up
 

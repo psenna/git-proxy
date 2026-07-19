@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -27,7 +28,8 @@ import (
 	"github.com/psenna/git-proxy/internal/auth/token"
 	"github.com/psenna/git-proxy/internal/broker"
 	"github.com/psenna/git-proxy/internal/config"
-	credfile "github.com/psenna/git-proxy/internal/credentials/file"
+	credprofile "github.com/psenna/git-proxy/internal/credentials/profile"
+	repomatch "github.com/psenna/git-proxy/internal/credentials/repomatch"
 	"github.com/psenna/git-proxy/internal/gitproto"
 	"github.com/psenna/git-proxy/internal/gitx"
 	"github.com/psenna/git-proxy/internal/policy"
@@ -66,12 +68,30 @@ func run(configPath string) error {
 	// credentials_file is allowed (passthrough); a malformed one fails closed at
 	// startup.
 	var creds port.CredentialStore
+	var scmStore *credprofile.Store
 	if cfg.Upstream.CredentialsFile != "" {
-		store, err := credfile.New(cfg.Upstream.CredentialsFile)
+		store, err := credprofile.New(cfg.Upstream.CredentialsFile)
 		if err != nil {
 			return fmt.Errorf("load credentials: %w", err)
 		}
+		scmStore = store
 		creds = store
+	}
+
+	// public_repos allowlist: an optional set of upstream repo patterns the
+	// proxy serves to anonymous (uncredentialed) agents for read-only access.
+	// Patterns match the UPSTREAM (mapped) repo path. Empty/absent → no
+	// allowlist (deny-by-default for uncredentialed repos). A nil RepoMatcher
+	// matches nothing (the frontends treat nil as "no public allowlist"). Built
+	// once here and passed to BOTH frontends. Pattern validation happens here
+	// (fail fast at startup on a malformed pattern), NOT in config.Validate.
+	var publicRepos port.RepoMatcher
+	if len(cfg.PublicRepos) > 0 {
+		m, err := repomatch.NewBoolMatcher(cfg.PublicRepos)
+		if err != nil {
+			return fmt.Errorf("public_repos: %w", err)
+		}
+		publicRepos = m
 	}
 
 	// Agent authenticator: Bearer tokens. If no tokens are configured the proxy
@@ -107,7 +127,7 @@ func run(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("build upstream kind %q: %w", cfg.Upstream.Kind, err)
 	}
-	httpFrontend := httpfront.New(ln, up, cfg.Upstream.URL, cfg.Repos, auth, creds, nil)
+	httpFrontend := httpfront.New(ln, up, cfg.Upstream.URL, cfg.Repos, auth, creds, publicRepos)
 
 	// Audit sink: append-only JSONL file. Built once and wired into BOTH
 	// frontends' proxies (each owns its own *gitproto.Proxy). Empty
@@ -243,7 +263,7 @@ func run(configPath string) error {
 		if err != nil {
 			return fmt.Errorf("ssh listen: %w", err)
 		}
-		sshFE, err := sshfront.New(sshLn, up, cfg.Repos, sshAuthn, cfg.SSH.HostKey, creds, nil)
+		sshFE, err := sshfront.New(sshLn, up, cfg.Repos, sshAuthn, cfg.SSH.HostKey, creds, publicRepos)
 		if err != nil {
 			return fmt.Errorf("ssh frontend: %w", err)
 		}
@@ -276,6 +296,12 @@ func run(configPath string) error {
 	// Bearer auth reuses the shared port.Authenticator built above; the proxy's
 	// GitHub token is resolved per-repo by the adapter on the proxy→GitHub REST
 	// leg, never handed to the agent.
+	// issueStore holds the profile store built from issue_upstream's
+	// credentials_file (when the broker + an issue upstream are configured), so
+	// its wildcards can be aggregated into the startup wildcard warning below.
+	// It stays nil when the broker is disabled or no issue credentials file is
+	// configured (no issue-store wildcards to warn about).
+	var issueStore *credprofile.Store
 	if cfg.Broker.Listen != "" {
 		brokerLn, err := net.Listen("tcp", cfg.Broker.Listen)
 		if err != nil {
@@ -296,10 +322,11 @@ func run(configPath string) error {
 		if cfg.IssueUpstream.Kind != "" {
 			var issueCreds port.CredentialStore
 			if cfg.IssueUpstream.CredentialsFile != "" {
-				store, err := credfile.New(cfg.IssueUpstream.CredentialsFile)
+				store, err := credprofile.New(cfg.IssueUpstream.CredentialsFile)
 				if err != nil {
 					return fmt.Errorf("load issue_upstream credentials: %w", err)
 				}
+				issueStore = store
 				issueCreds = store
 			}
 			issueUp, err = upstream.Build(upstream.UpstreamConfig{
@@ -337,6 +364,36 @@ func run(configPath string) error {
 		}
 		transports = append(transports, br)
 		log.Printf("git-proxy: broker enabled: listen=%s", cfg.Broker.Listen)
+	}
+
+	// Aggregated wildcard warning: any wildcard repo matcher (a profile whose
+	// repos include a "*" pattern, or a public_repos entry containing "*")
+	// broadens which repos receive a profile's PAT (or anonymous read for
+	// public_repos). Collect them across the SCM store, the issue-upstream
+	// store (if built), and the public_repos allowlist, and warn once so an
+	// operator can verify least-privilege. The warning carries only the
+	// pattern, the profile name, and the description — NEVER a secret value
+	// (the profile store's WildcardPatterns guarantees this by construction).
+	var ww []string
+	if scmStore != nil {
+		for _, w := range scmStore.WildcardPatterns() {
+			ww = append(ww, fmt.Sprintf("%q (%s — %s)", w.Pattern, w.Name, w.Description))
+		}
+	}
+	if issueStore != nil {
+		for _, w := range issueStore.WildcardPatterns() {
+			ww = append(ww, fmt.Sprintf("%q (%s — %s)", w.Pattern, w.Name, w.Description))
+		}
+	}
+	if len(cfg.PublicRepos) > 0 {
+		for _, p := range cfg.PublicRepos {
+			if strings.Contains(p, "*") {
+				ww = append(ww, fmt.Sprintf("%q (public_repos)", p))
+			}
+		}
+	}
+	if len(ww) > 0 {
+		log.Printf("git-proxy: WARNING: wildcard repo matchers configured — %s — matching repos receive that profile's PAT (or anonymous read for public_repos); verify least-privilege", strings.Join(ww, ", "))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

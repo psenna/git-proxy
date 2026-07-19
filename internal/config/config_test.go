@@ -235,6 +235,33 @@ issue_upstream:
 	}
 }
 
+func TestParsePublicRepos(t *testing.T) {
+	c, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+public_repos: ["public/*", "org/r.git"]
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(c.PublicRepos) != 2 {
+		t.Fatalf("PublicRepos = %v (len %d), want 2 entries", c.PublicRepos, len(c.PublicRepos))
+	}
+	if c.PublicRepos[0] != "public/*" || c.PublicRepos[1] != "org/r.git" {
+		t.Errorf("PublicRepos = %v, want [public/* org/r.git]", c.PublicRepos)
+	}
+
+	// Absent public_repos → nil (no allowlist; deny-by-default).
+	c2, err := Parse([]byte(validYAML))
+	if err != nil {
+		t.Fatalf("Parse (no public_repos): %v", err)
+	}
+	if c2.PublicRepos != nil {
+		t.Errorf("PublicRepos = %v, want nil when absent", c2.PublicRepos)
+	}
+}
+
 func TestParseIssueUpstreamAbsentIsValid(t *testing.T) {
 	// No issue_upstream at all: issues disabled, valid (no validation error).
 	c, err := Parse([]byte(`

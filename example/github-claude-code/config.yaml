@@ -30,6 +30,19 @@ auth:
     # The Claude Code container sends this as its git extraHeader / broker Bearer.
     "agent-token-1": "claude-code-agent"
 
+# public_repos: an OPTIONAL allowlist of upstream repo patterns the proxy serves
+# to anonymous (uncredentialed) agents for read-only (clone/fetch) access. Patterns
+# match the UPSTREAM (mapped) repo path; wildcards like "public/*" are allowed
+# (bare "*" and "**" are not). Empty/absent → deny-by-default for any repo that
+# has no credentialed profile (the agent's repo below is profiled in
+# credentials.yaml, so it is served regardless). The agent's repo is NOT listed
+# here because it is already credentialed — public_repos is for repos you want to
+# expose to anonymous readers with NO upstream creds attached. Uncomment to use:
+#
+# public_repos:
+#   - "public/*"
+#   - "oss/mirror.git"
+
 # Issue upstream: an OPTIONAL, separately-configured upstream that sources the
 # broker's issue routes (create/get/list/comment/close/reopen/edit/labels),
 # DISTINCT from the SCM upstream above. v1 sets it to kind: github too — the

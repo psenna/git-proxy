@@ -116,13 +116,19 @@ curl -s -u demo:demopass -X POST http://localhost:3000/api/v1/users/demo/tokens 
 ```
 
 Put the `sha1` value into `credentials.yaml` and restart the proxy so it
-re-reads the credentials:
+re-reads the credentials. The file uses the profile layout (a list under
+`credentials:`); fill the `REPLACE_WITH_GITEA_ACCESS_TOKEN` placeholder, or inject
+the token via the `GITEA_PASSWORD` (or `GITEA_TOKEN`) env var in `docker-compose.yml`
+(env overrides the file value, so the proxy picks it up without editing the file):
 
 ```sh
 TOKEN="<paste the sha1 token here>"
 sed -i "s/REPLACE_WITH_GITEA_ACCESS_TOKEN/$TOKEN/" credentials.yaml
 docker compose restart git-proxy
 ```
+
+> Prefer the env path? Set `GITEA_PASSWORD` in `docker-compose.yml` (or `.env`)
+> and leave `credentials.yaml` untouched — env > file > empty.
 
 > Prefer the web UI? Open `http://localhost:3000`, log in as `demo`/`demopass`,
 > create the repo, then create a personal access token under Settings →

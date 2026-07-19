@@ -37,6 +37,15 @@ type Config struct {
 	// internal/port/issues.go.
 	IssueUpstream UpstreamConfig `yaml:"issue_upstream"`
 	Repos    map[string]string `yaml:"repos"`
+	// PublicRepos is the optional allowlist of upstream repository patterns
+	// the proxy serves to anonymous (uncredentialed) agents for read-only
+	// access. Patterns match the UPSTREAM (mapped) repo path. Wildcards like
+	// "public/*" are allowed; bare "*" and "**" are not. Empty/absent → no
+	// allowlist (deny-by-default for uncredentialed repos). Patterns are
+	// validated at startup by repomatch.NewBoolMatcher in main.go (NOT in
+	// Validate) so a malformed pattern fails fast at proxy start, not at
+	// config parse time.
+	PublicRepos []string `yaml:"public_repos"`
 	Auth     AuthConfig        `yaml:"auth"`
 	Policy   PolicyConfig      `yaml:"policy"`
 	SSH      SSHConfig         `yaml:"ssh"`
