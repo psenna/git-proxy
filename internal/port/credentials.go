@@ -33,3 +33,9 @@ type CredentialStore interface {
 	// credentials are configured for that repo.
 	CredentialsFor(repo string) (Credentials, bool)
 }
+
+// RepoMatcher tests whether a repository path matches an allowlist (e.g. the
+// public_repos config). A nil RepoMatcher matches nothing.
+type RepoMatcher interface {
+	Match(repo string) bool
+}
