@@ -336,3 +336,28 @@ task matches its `description`.
 - **Fail-closed.** Missing token → 401 (never anonymous); non-SCM upstream → the
   broker is disabled at startup; an unknown repo → fail-closed before any upstream
   call. If an op is unavailable, surface it — do not work around it.
+
+### Operator configuration notes (credentials & `public_repos`)
+
+These are for the **operator** who deploys git-proxy, not for you (the agent).
+You cannot change them; you can only surface a misconfiguration to the operator.
+
+- **Credentials are profiles.** The proxy's upstream credentials live in a YAML
+  **list** under `credentials:` — each profile has a `name`, optional
+  `description`, `username`, `password` (git-HTTP Basic), `token` (broker
+  Bearer), and `repos` (patterns matched against the upstream repo path, e.g.
+  `psenna/git-proxy.git` or `mycompany/*`). Per-org wildcards like `mycompany/*`
+  are allowed; bare `*` / `**` are not (the proxy refuses to start).
+- **Env overrides the file (env > file > empty).** The env-var name is the
+  profile name **UPPERCASED** — `name: company_abc` reads `COMPANY_ABC_USERNAME`,
+  `COMPANY_ABC_PASSWORD`, `COMPANY_ABC_TOKEN`. This lets docker-compose inject a
+  PAT without editing the credentials file.
+- **The proxy denies unconfigured repos (deny-by-default).** A repo with no
+  matching credential profile is rejected with 403 (HTTP) / structured ERR +
+  non-zero exit (SSH) **before** the proxy contacts the upstream. To expose a
+  repo to anonymous (uncredentialed) agents for **read-only** clone/fetch, the
+  operator adds it to the top-level `public_repos` allowlist in `config.yaml`.
+  Anonymous pushes to a `public_repos` repo are still denied — writes always
+  require a credential profile. If you hit a 403 on a repo you expected to be
+  reachable, ask the operator to add a credential profile (or a `public_repos`
+  entry for anonymous read); do not retry blindly.

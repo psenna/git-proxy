@@ -136,7 +136,7 @@ All extension points are interfaces in `internal/port`:
 | SCM capabilities (optional) | `PRSupport` | `internal/upstream/github` skeleton (`ErrNotImplemented`) |
 | Push rule | `Rule` | `internal/policy/rules`: history_protect, branch_pattern, commit_message, path_acl, secret_scan |
 | Agent auth | `Authenticator` | `internal/auth/token` (Bearer), `internal/auth/keyauth` (SSH key) |
-| Upstream credentials | `CredentialStore` | `internal/credentials/file` |
+| Upstream credentials | `CredentialStore` | `internal/credentials/profile` (+ `port.RepoMatcher` via `internal/credentials/repomatch` for `public_repos`) |
 | Secret scanner | `SecretScanner` | `internal/secret/regex` |
 | Audit sink | `AuditSink` | `internal/audit/file` (append-only JSONL) |
 | Alert sink | `AlertSink` | `internal/alert/webhook`, `internal/alert/log`, `MultiAlertSink` |

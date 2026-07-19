@@ -29,7 +29,7 @@ the worked example for each seam, grounded in the code as of v1 (M10).
 | Frontend | `port.Transport` | (constructed in `main.go`) | `listen` / `ssh.listen` | `internal/transport/http`, `internal/transport/ssh` |
 | Auth method | `port.Authenticator` | (constructed in `main.go`) | `auth.tokens` / `ssh.authorized_keys` | `internal/auth/token`, `internal/auth/keyauth` |
 | Secret scanner | `port.SecretScanner` | (constructed in the rule) | (inside `secret_scan` rule config) | `internal/secret/regex` |
-| Credential store | `port.CredentialStore` | (constructed in `main.go`) | `upstream.credentials_file` / `issue_upstream.credentials_file` | `internal/credentials/file` |
+| Credential store | `port.CredentialStore` (+ `port.RepoMatcher` for `public_repos`) | (constructed in `main.go`) | `upstream.credentials_file` / `issue_upstream.credentials_file` / `public_repos` | `internal/credentials/profile`, `internal/credentials/repomatch` |
 | Audit sink | `port.AuditSink` | (constructed in `main.go`) | `audit.file` | `internal/audit/file` |
 | Alert sink | `port.AlertSink` | (constructed in `main.go`) | `alerts.webhook` | `internal/alert/webhook`, `internal/alert/log`, `internal/alert` (Multi) |
 
@@ -302,14 +302,94 @@ skips binary blobs, redacts matched secrets in reasons).
 ## Credential store
 
 `port.CredentialStore` is the vault of per-repo upstream credentials the proxy
-attaches on the proxy→upstream leg. The agent never sees these.
+attaches on the proxy→upstream leg. The agent never sees these. The v1
+implementation is `internal/credentials/profile` — a YAML **list** of named
+profiles, not the older file-based JSON vault (the `internal/credentials/file`
+package is deleted). The surface is **frozen**: `port.Credentials` and
+`port.CredentialStore` are unchanged — there is no `Anonymous` field; the
+deny/anonymous decision is the frontend's via `internal/access` (below), not a
+store flag.
 
-**To add one:** implement `port.CredentialStore` (`CredentialsFor(repo) (Credential, bool)`),
-construct it in `main.go` from `upstream.credentials_file`, and pass it both to the
-upstream adapter (via `upstream.UpstreamConfig.CredentialsStore`) and to the
-frontends (for the info/refs reverse-proxy leg). Reference:
-`internal/credentials/file` (file-based JSON vault; a secret-manager backend lands
-later behind the same interface).
+**Schema** (`credentials.yaml`):
+
+```yaml
+credentials:
+  - name: company_abc            # required, matches ^[A-Za-z_][A-Za-z0-9_]*$
+    description: "Main org token" # optional, human-only (logged in warnings)
+    username: ci-bot
+    password: hunter2            # git-HTTP Basic
+    token: ghp_broker_token      # broker REST (Bearer); empty = git-only
+    repos: ["mycompany/*"]       # patterns matched against the upstream repo path
+```
+
+- **List layout** under `credentials:`; each profile has `name`, optional
+  `description`, `username`, `password`, `token`, and `repos` (a list of
+  patterns). The proxy reads the file once at startup (env is resolved at
+  startup, not per-request).
+- **Env override — env > file > empty.** The env-var name is the profile name
+  **UPPERCASED** (e.g. `name: company_abc` → `COMPANY_ABC_USERNAME`,
+  `COMPANY_ABC_PASSWORD`, `COMPANY_ABC_TOKEN`). A set-and-non-empty env var
+  overrides the file value; an empty env var is treated as unset so an operator
+  can blank a file secret by setting the env var to `""`.
+- **Per-org wildcards** like `mycompany/*` are allowed (matched via stdlib
+  `path.Match`, where `*` is one path segment). A bare `*` or any `**` is
+  rejected — the proxy refuses to start.
+- **Startup validation** is split:
+  - **Fatal** (returns an error, proxy refuses to start): the file cannot be
+    read/parsed; a profile name is empty or fails `^[A-Za-z_][A-Za-z0-9_]*$`; a
+    duplicate name (case-insensitive); a profile with no `repos`; a malformed
+    pattern (bare `*`, `**`, `path.Match` syntax error); or the same exact repo
+    or same wildcard pattern in two profiles.
+  - **Warning** (non-fatal, proxy starts): a secretless profile (password AND
+    token both empty after env resolution) or a one-legged profile (token set,
+    password empty, or vice versa). The warning names the **env-var NAMES** and
+    the **description** — never the resolved secret.
+- **Secretless profile → `(zero, false)`.** A profile whose resolved password
+  and token are both empty still matches its `repos`, but `CredentialsFor`
+  returns `(zero, false)`, so the deny decision falls through to `public_repos`
+  (deny-by-default). A profiled repo (with a usable secret) returns its creds
+  and the request is allowed.
+
+**`public_repos` + `port.RepoMatcher` (deny-by-default tri-state).** Separately
+from the credential vault, `config.yaml` may declare a top-level
+`public_repos:` list of upstream repo patterns the proxy serves to anonymous
+(uncredentialed) agents for **read-only** (clone/fetch) access. The list is
+validated at startup by `internal/credentials/repomatch.NewBoolMatcher`, which
+returns a `port.RepoMatcher` (`Match(repo string) bool`); a nil/absent
+`public_repos` means a matcher that matches nothing. `cmd/git-proxy/main.go`
+passes the matcher to both frontends. The frontends call
+`access.Decide(creds, public, repo, isWrite)` from `internal/access`, a
+fail-closed tri-state:
+
+- `creds.CredentialsFor(repo)` ok → **Allow** (the upstream leg attaches Basic
+  auth from the profile).
+- no creds, **read**, and `public.Match(repo)` → **Allow** (anonymous
+  read-only; the upstream leg attaches nothing).
+- no creds + **write**, or no creds + no public match → **Deny** (403 HTTP /
+  structured ERR + non-zero exit SSH; the upstream is never contacted).
+
+So a repo with no credential profile and no `public_repos` entry is denied
+before any upstream call — **deny-by-default**. A `public_repos` repo + push is
+denied (writes always require a credential, even for public repos). 401
+(missing/invalid agent Bearer) precedes 403 (HTTP).
+
+**`internal/credentials/repomatch`** is the shared repo-key matcher used by both
+the profile store (resolving a repo to its profile) and the `public_repos`
+allowlist (`NewBoolMatcher`). It is **deliberately separate** from
+`internal/pathmatch`: `pathmatch` is gitignore-style in-repo **file-path**
+matching (e.g. `secrets/**` withheld from a fetch); `repomatch` is
+**repo-key** matching via stdlib `path.Match` (e.g. `mycompany/*` selects a
+profile). Different domains, different semantics.
+
+**To add one:** implement `port.CredentialStore`
+(`CredentialsFor(repo) (Credentials, bool)`), construct it in `main.go` from
+`upstream.credentials_file`, and pass it both to the upstream adapter (via
+`upstream.UpstreamConfig.CredentialsStore`) and to the frontends (for the
+info/refs reverse-proxy leg). A secret-manager backend (Vault, AWS Secrets
+Manager, …) lands later behind the same interface. Reference:
+`internal/credentials/profile` (YAML profile vault, env-over-file),
+`internal/credentials/repomatch` (shared repo-key matcher),
+`internal/access/access.go` (`Decide` — the deny-by-default tri-state).
 
 ---
 
