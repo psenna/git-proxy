@@ -302,7 +302,8 @@ func (f *Frontend) handleExec(ctx context.Context, sconn *ssh.ServerConn, channe
 
 	if err := f.runGitSession(sessionCtx, channel, service, mapped); err != nil {
 		log.Printf("sshfront: %s session for repo %q agent %q: %v", service, mapped, agentName, err)
-		// runGitSession writes its own structured error and sends exit-status;
+		// runGitSession writes its own structured error and sends exit-status on
+		// every failure path (advertisement error, stream error) and on success;
 		// nothing more to do here.
 		return
 	}
@@ -311,13 +312,16 @@ func (f *Frontend) handleExec(ctx context.Context, sconn *ssh.ServerConn, channe
 // runGitSession writes the ref advertisement and hands the channel to the proxy.
 // It returns nil on a successful session (the proxy completes the negotiation +
 // packfile), and a non-nil error when the session must fail (advertisement
-// error). On advertisement error it writes an ERR pkt-line (upload-pack) or a
-// stderr message (receive-pack) and exits non-zero. On success it exits 0.
+// error or a stream error). On every failure path it writes a structured error
+// (ERR pkt-line for upload-pack, stderr for receive-pack) and sends a non-zero
+// exit-status; on success it sends exit-status 0.
 func (f *Frontend) runGitSession(ctx context.Context, channel ssh.Channel, service, repo string) error {
 	// Write the ref advertisement (raw v0, no preamble).
 	if err := f.writeAdvertisement(ctx, channel, service, repo); err != nil {
-		// Fail-closed: advertisement error → ERR pkt-line + no negotiation.
+		// Fail-closed: advertisement error → ERR pkt-line + no negotiation, and
+		// a non-zero exit-status so the git client surfaces a clean failure.
 		writeSessionError(channel, service, "proxy error")
+		_ = sendExitStatus(channel, 1)
 		return err
 	}
 	// Hand the channel's stdin/stdout to the proxy for negotiation + packfile.

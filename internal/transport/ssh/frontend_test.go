@@ -1,8 +1,14 @@
 package sshfront
 
 import (
+	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
+	"io"
 	"testing"
+
+	"github.com/psenna/git-proxy/internal/port"
 )
 
 func TestParseExecCommand_UploadPackQuoted(t *testing.T) {
@@ -135,4 +141,89 @@ func TestParseSSHString_Malformed(t *testing.T) {
 	if _, ok := parseSSHString(bad); ok {
 		t.Error("overlong length should be malformed")
 	}
+}
+
+// TestRunGitSession_AdvertisementErrorSendsExitStatus asserts that when the
+// upstream ref advertisement fails (fetch/parse/emit error), runGitSession
+// sends a non-zero SSH exit-status channel request before returning. The
+// other three paths in runGitSession (upload-pack read error, receive-pack
+// stream error, success) already call sendExitStatus; this guards the
+// advertisement-error branch, which writes a structured error but previously
+// returned without the exit-status request — so the git client did not get a
+// clean non-zero exit signal on that one path.
+func TestRunGitSession_AdvertisementErrorSendsExitStatus(t *testing.T) {
+	for _, service := range []string{"git-upload-pack", "git-receive-pack"} {
+		t.Run(service, func(t *testing.T) {
+			ch := &fakeChannel{}
+			// errUpstream.ListRefsService fails, so writeAdvertisement returns
+			// an error before any negotiation; f.proxy is never reached, so nil
+			// is safe.
+			f := &Frontend{up: errUpstream{}}
+			err := f.runGitSession(context.Background(), ch, service, "repo.git")
+			if err == nil {
+				t.Fatal("runGitSession: want error from failed advertisement, got nil")
+			}
+			var status uint32
+			var got bool
+			names := make([]string, 0, len(ch.requests))
+			for _, req := range ch.requests {
+				names = append(names, req.name)
+				if req.name == "exit-status" {
+					got = true
+					if len(req.payload) == 4 {
+						status = binary.BigEndian.Uint32(req.payload)
+					}
+				}
+			}
+			if !got {
+				t.Fatalf("exit-status not sent on advertisement error (service=%s); got requests %v", service, names)
+			}
+			if status != 1 {
+				t.Errorf("exit-status = %d, want 1 (non-zero failure)", status)
+			}
+		})
+	}
+}
+
+// fakeChannel is a minimal ssh.Channel recorder for unit-testing session paths
+// without a real SSH connection. It records SendRequest calls (notably
+// "exit-status") so a test can assert the exit-status channel request was sent.
+type fakeChannel struct {
+	requests []recordedRequest
+	stderr   bytes.Buffer
+	written  bytes.Buffer
+}
+
+type recordedRequest struct {
+	name      string
+	wantReply bool
+	payload   []byte
+}
+
+func (c *fakeChannel) Read([]byte) (int, error)    { return 0, io.EOF }
+func (c *fakeChannel) Write(p []byte) (int, error) { return c.written.Write(p) }
+func (c *fakeChannel) Close() error                { return nil }
+func (c *fakeChannel) CloseWrite() error           { return nil }
+func (c *fakeChannel) SendRequest(name string, wantReply bool, payload []byte) (bool, error) {
+	c.requests = append(c.requests, recordedRequest{name: name, wantReply: wantReply, payload: payload})
+	return false, nil
+}
+func (c *fakeChannel) Stderr() io.ReadWriter { return &c.stderr }
+
+// errUpstream is a port.Upstream whose ListRefsService always fails, used to
+// drive runGitSession's advertisement-error path. The other methods are never
+// reached on that path (writeAdvertisement returns before negotiation).
+type errUpstream struct{}
+
+func (errUpstream) ListRefs(context.Context, string) (port.Refs, error) {
+	return port.Refs{}, errors.New("upstream unavailable")
+}
+func (errUpstream) ListRefsService(context.Context, string, string) (port.Refs, error) {
+	return port.Refs{}, errors.New("upstream unavailable")
+}
+func (errUpstream) UploadPack(context.Context, string, io.Reader) (io.ReadCloser, error) {
+	return nil, errors.New("upstream unavailable")
+}
+func (errUpstream) ReceivePack(context.Context, string, io.Reader) (io.ReadCloser, error) {
+	return nil, errors.New("upstream unavailable")
 }
