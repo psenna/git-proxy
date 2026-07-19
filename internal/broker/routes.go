@@ -31,6 +31,19 @@ func (b *Broker) routes() *http.ServeMux {
 	mux.HandleFunc("POST /{repo}/prs/{number}/comments", b.handleComment)
 	mux.HandleFunc("POST /{repo}/prs/{number}/reviews", b.handleReview)
 	mux.HandleFunc("GET /{repo}/checks/{ref...}", b.handleChecks)
+	// Issue routes (opt-in via issue_upstream; 501 per-op when issues==nil).
+	// POST-only mutations, RPC-style for close/reopen/label-remove (matching
+	// the /merge style). /labels (add) and /labels/remove are distinct fixed
+	// segments — no ServeMux conflict (/labels is not a wildcard).
+	mux.HandleFunc("POST /{repo}/issues", b.handleCreateIssue)
+	mux.HandleFunc("GET /{repo}/issues", b.handleListIssues)
+	mux.HandleFunc("GET /{repo}/issues/{number}", b.handleGetIssue)
+	mux.HandleFunc("POST /{repo}/issues/{number}/comments", b.handleCommentIssue)
+	mux.HandleFunc("POST /{repo}/issues/{number}/close", b.handleCloseIssue)
+	mux.HandleFunc("POST /{repo}/issues/{number}/reopen", b.handleReopenIssue)
+	mux.HandleFunc("POST /{repo}/issues/{number}/edit", b.handleEditIssue)
+	mux.HandleFunc("POST /{repo}/issues/{number}/labels", b.handleAddLabels)
+	mux.HandleFunc("POST /{repo}/issues/{number}/labels/remove", b.handleRemoveLabel)
 	return mux
 }
 
@@ -212,6 +225,225 @@ func (b *Broker) handleChecks(w http.ResponseWriter, r *http.Request) {
 	}
 	b.audit(r.Context(), agent.Name, repo, op, "allow", nil)
 	respondJSON(w, http.StatusOK, summary)
+}
+
+// handleCreateIssue implements POST /{repo}/issues (op issue.create).
+func (b *Broker) handleCreateIssue(w http.ResponseWriter, r *http.Request) {
+	const op = "issue.create"
+	repo := b.resolveRepo(r.PathValue("repo"))
+	agent, is, ok := b.issuesOK(w, r, repo, op)
+	if !ok {
+		return
+	}
+	var req createIssueReq
+	if err := decodeJSON(r, &req); err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	issue, err := is.CreateIssue(r.Context(), repo, req.Title, req.Body)
+	if err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	b.audit(r.Context(), agent.Name, repo, op, "allow", nil)
+	respondJSON(w, http.StatusCreated, issue)
+}
+
+// handleListIssues implements GET /{repo}/issues (op issue.list). state is taken
+// from the ?state= query (empty defaults to "open" inside the adapter).
+func (b *Broker) handleListIssues(w http.ResponseWriter, r *http.Request) {
+	const op = "issue.list"
+	repo := b.resolveRepo(r.PathValue("repo"))
+	agent, is, ok := b.issuesOK(w, r, repo, op)
+	if !ok {
+		return
+	}
+	state := r.URL.Query().Get("state")
+	issues, err := is.ListIssues(r.Context(), repo, state)
+	if err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	b.audit(r.Context(), agent.Name, repo, op, "allow", nil)
+	respondJSON(w, http.StatusOK, issues)
+}
+
+// handleGetIssue implements GET /{repo}/issues/{number} (op issue.get).
+func (b *Broker) handleGetIssue(w http.ResponseWriter, r *http.Request) {
+	const op = "issue.get"
+	repo := b.resolveRepo(r.PathValue("repo"))
+	agent, is, ok := b.issuesOK(w, r, repo, op)
+	if !ok {
+		return
+	}
+	number, err := strconv.Atoi(r.PathValue("number"))
+	if err != nil {
+		b.opFail(w, r, agent.Name, repo, op, fmt.Errorf("invalid issue number"))
+		return
+	}
+	issue, err := is.GetIssue(r.Context(), repo, number)
+	if err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	b.audit(r.Context(), agent.Name, repo, op, "allow", nil)
+	respondJSON(w, http.StatusOK, issue)
+}
+
+// handleCommentIssue implements POST /{repo}/issues/{number}/comments
+// (op issue.comment).
+func (b *Broker) handleCommentIssue(w http.ResponseWriter, r *http.Request) {
+	const op = "issue.comment"
+	repo := b.resolveRepo(r.PathValue("repo"))
+	agent, is, ok := b.issuesOK(w, r, repo, op)
+	if !ok {
+		return
+	}
+	number, err := strconv.Atoi(r.PathValue("number"))
+	if err != nil {
+		b.opFail(w, r, agent.Name, repo, op, fmt.Errorf("invalid issue number"))
+		return
+	}
+	var req commentReq
+	if err := decodeJSON(r, &req); err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	if err := is.CommentIssue(r.Context(), repo, number, req.Body); err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	b.audit(r.Context(), agent.Name, repo, op, "allow", nil)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleCloseIssue implements POST /{repo}/issues/{number}/close (op issue.close).
+func (b *Broker) handleCloseIssue(w http.ResponseWriter, r *http.Request) {
+	const op = "issue.close"
+	repo := b.resolveRepo(r.PathValue("repo"))
+	agent, is, ok := b.issuesOK(w, r, repo, op)
+	if !ok {
+		return
+	}
+	number, err := strconv.Atoi(r.PathValue("number"))
+	if err != nil {
+		b.opFail(w, r, agent.Name, repo, op, fmt.Errorf("invalid issue number"))
+		return
+	}
+	if err := is.CloseIssue(r.Context(), repo, number); err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	b.audit(r.Context(), agent.Name, repo, op, "allow", nil)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleReopenIssue implements POST /{repo}/issues/{number}/reopen
+// (op issue.reopen).
+func (b *Broker) handleReopenIssue(w http.ResponseWriter, r *http.Request) {
+	const op = "issue.reopen"
+	repo := b.resolveRepo(r.PathValue("repo"))
+	agent, is, ok := b.issuesOK(w, r, repo, op)
+	if !ok {
+		return
+	}
+	number, err := strconv.Atoi(r.PathValue("number"))
+	if err != nil {
+		b.opFail(w, r, agent.Name, repo, op, fmt.Errorf("invalid issue number"))
+		return
+	}
+	if err := is.ReopenIssue(r.Context(), repo, number); err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	b.audit(r.Context(), agent.Name, repo, op, "allow", nil)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleEditIssue implements POST /{repo}/issues/{number}/edit (op issue.edit).
+// An empty title/body in the request means "leave unchanged" (the adapter omits
+// it from the PATCH), so an agent does not blank a field by accident.
+func (b *Broker) handleEditIssue(w http.ResponseWriter, r *http.Request) {
+	const op = "issue.edit"
+	repo := b.resolveRepo(r.PathValue("repo"))
+	agent, is, ok := b.issuesOK(w, r, repo, op)
+	if !ok {
+		return
+	}
+	number, err := strconv.Atoi(r.PathValue("number"))
+	if err != nil {
+		b.opFail(w, r, agent.Name, repo, op, fmt.Errorf("invalid issue number"))
+		return
+	}
+	var req editIssueReq
+	if err := decodeJSON(r, &req); err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	issue, err := is.EditIssue(r.Context(), repo, number, req.Title, req.Body)
+	if err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	b.audit(r.Context(), agent.Name, repo, op, "allow", nil)
+	respondJSON(w, http.StatusOK, issue)
+}
+
+// handleAddLabels implements POST /{repo}/issues/{number}/labels
+// (op issue.label.add). Returns the resulting label set.
+func (b *Broker) handleAddLabels(w http.ResponseWriter, r *http.Request) {
+	const op = "issue.label.add"
+	repo := b.resolveRepo(r.PathValue("repo"))
+	agent, is, ok := b.issuesOK(w, r, repo, op)
+	if !ok {
+		return
+	}
+	number, err := strconv.Atoi(r.PathValue("number"))
+	if err != nil {
+		b.opFail(w, r, agent.Name, repo, op, fmt.Errorf("invalid issue number"))
+		return
+	}
+	var req addLabelsReq
+	if err := decodeJSON(r, &req); err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	labels, err := is.AddLabels(r.Context(), repo, number, req.Labels)
+	if err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	b.audit(r.Context(), agent.Name, repo, op, "allow", nil)
+	respondJSON(w, http.StatusOK, labels)
+}
+
+// handleRemoveLabel implements POST /{repo}/issues/{number}/labels/remove
+// (op issue.label.remove). The label name travels in the JSON body (not the
+// path) so path-encoding concerns stay inside the rest client, not the broker
+// URL.
+func (b *Broker) handleRemoveLabel(w http.ResponseWriter, r *http.Request) {
+	const op = "issue.label.remove"
+	repo := b.resolveRepo(r.PathValue("repo"))
+	agent, is, ok := b.issuesOK(w, r, repo, op)
+	if !ok {
+		return
+	}
+	number, err := strconv.Atoi(r.PathValue("number"))
+	if err != nil {
+		b.opFail(w, r, agent.Name, repo, op, fmt.Errorf("invalid issue number"))
+		return
+	}
+	var req removeLabelReq
+	if err := decodeJSON(r, &req); err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	if err := is.RemoveLabel(r.Context(), repo, number, req.Label); err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	b.audit(r.Context(), agent.Name, repo, op, "allow", nil)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // authOK performs authentication + authorization for op. On either failure it

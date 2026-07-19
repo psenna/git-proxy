@@ -102,7 +102,7 @@ func bootIntegration(t *testing.T, cfg Config) (brokerURL string, gh *fakeGitHub
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	b, err := New(ln, adapter, map[string]string{"owner/repo.git": "owner/repo.git"}, authn, sink, cfg)
+	b, err := New(ln, adapter, nil, map[string]string{"owner/repo.git": "owner/repo.git"}, authn, sink, cfg)
 	if err != nil {
 		t.Fatalf("broker.New: %v", err)
 	}

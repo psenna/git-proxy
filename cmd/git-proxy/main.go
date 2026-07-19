@@ -281,13 +281,44 @@ func run(configPath string) error {
 		if err != nil {
 			return fmt.Errorf("broker listen: %w", err)
 		}
+		// Issue upstream: an OPTIONAL, separately-configured upstream that
+		// sources the issue tracker for the broker's issue routes, distinct
+		// from the SCM upstream (up) that backs PRSupport. Built via the same
+		// upstream.Build registry path; it MAY point at the same
+		// credentials_file as the SCM upstream (v1 GitHub case) or a different
+		// one (future Jira). main.go never references port.IssueSupport — it
+		// passes a port.Upstream (or nil) and the broker type-asserts
+		// internally. Absent (empty issue_upstream.kind) → nil → issue routes
+		// return 501 per-op (issues opt-in, no silent fallback to the SCM
+		// upstream). A non-empty kind resolves its own credential store and is
+		// built fail-closed (an unknown kind / malformed URL surfaces here).
+		var issueUp port.Upstream
+		if cfg.IssueUpstream.Kind != "" {
+			var issueCreds port.CredentialStore
+			if cfg.IssueUpstream.CredentialsFile != "" {
+				store, err := credfile.New(cfg.IssueUpstream.CredentialsFile)
+				if err != nil {
+					return fmt.Errorf("load issue_upstream credentials: %w", err)
+				}
+				issueCreds = store
+			}
+			issueUp, err = upstream.Build(upstream.UpstreamConfig{
+				Kind:            cfg.IssueUpstream.Kind,
+				URL:             cfg.IssueUpstream.URL,
+				CredentialsStore: issueCreds,
+			})
+			if err != nil {
+				return fmt.Errorf("build issue_upstream kind %q: %w", cfg.IssueUpstream.Kind, err)
+			}
+			log.Printf("git-proxy: broker issue upstream enabled: kind=%s url=%s", cfg.IssueUpstream.Kind, redactURL(cfg.IssueUpstream.URL))
+		}
 		// Pass a true-nil AuditSink (not a nil *file.Sink wrapped in a non-nil
 		// interface) when audit is off, so the broker's nil check works.
 		var brokerAudit port.AuditSink
 		if auditSink != nil {
 			brokerAudit = auditSink
 		}
-		br, err := broker.New(brokerLn, up, cfg.Repos, auth, brokerAudit, broker.Config{
+		br, err := broker.New(brokerLn, up, issueUp, cfg.Repos, auth, brokerAudit, broker.Config{
 			Listen:        cfg.Broker.Listen,
 			AllowedAgents: cfg.Broker.AllowedAgents,
 			AllowedOps:    cfg.Broker.AllowedOps,

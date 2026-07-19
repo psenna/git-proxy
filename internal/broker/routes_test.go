@@ -65,7 +65,7 @@ func (c *capturingPRSupport) Checks(_ context.Context, _ string, ref string) (po
 func newTestBroker(t *testing.T, up *capturingPRSupport, cfg Config) (*Broker, *httptest.Server) {
 	t.Helper()
 	authn := fakeAuthenticator{tokens: map[string]string{"agent-token-1": "alice"}}
-	b, err := New(nil, up, nil, authn, &recordingSink{}, cfg)
+	b, err := New(nil, up, nil, nil, authn, &recordingSink{}, cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -352,7 +352,7 @@ func TestAgentBearerNotForwardedToPRSupport(t *testing.T) {
 	// was not forwarded. Cross-check via audit: no event carries the token.
 	sink := &recordingSink{}
 	up := &capturingPRSupport{}
-	b, err := New(nil, up, nil, fakeAuthenticator{tokens: map[string]string{"agent-token-1": "alice"}}, sink, Config{})
+	b, err := New(nil, up, nil, nil, fakeAuthenticator{tokens: map[string]string{"agent-token-1": "alice"}}, sink, Config{})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestAgentBearerNotForwardedToPRSupport(t *testing.T) {
 func TestRepoAliasResolved(t *testing.T) {
 	up := &capturingPRSupport{}
 	authn := fakeAuthenticator{tokens: map[string]string{"t": "alice"}}
-	b, err := New(nil, up, map[string]string{"alias": "owner/repo.git"}, authn, &recordingSink{}, Config{})
+	b, err := New(nil, up, nil, map[string]string{"alias": "owner/repo.git"}, authn, &recordingSink{}, Config{})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

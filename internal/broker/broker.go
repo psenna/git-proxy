@@ -1,18 +1,25 @@
 // Package broker is the agent-facing GitHub broker: a separate HTTP server
 // (separate mux, separate listen port from the git-protocol frontend) through
-// which an already-authenticated AI agent asks the proxy to manipulate PRs and
-// query CI/pipeline state. The proxy attaches its OWN held GitHub token and
-// forwards to the upstream SCM REST API; the agent never receives the token
-// (same fail-closed, no-leak security model as the git-protocol path).
+// which an already-authenticated AI agent asks the proxy to manipulate PRs,
+// query CI/pipeline state, and work the issue tracker. The proxy attaches its
+// OWN held provider token and forwards to the upstream REST API; the agent
+// never receives the token (same fail-closed, no-leak security model as the
+// git-protocol path).
 //
-// The broker type-asserts port.PRSupport off the port.Upstream main.go built
-// via the upstream registry, and fails closed at startup if the upstream does
-// not implement it (the broker requires an SCM adapter — set upstream.kind:
-// github). It deliberately lives OUTSIDE the core isolation set
+// The broker type-asserts port.PRSupport off the SCM port.Upstream main.go
+// built via the upstream registry, and fails closed at startup if that upstream
+// does not implement it (the broker requires an SCM adapter — set
+// upstream.kind: github). It separately type-asserts port.IssueSupport off a
+// SEPARATELY-configured issue upstream (config.issue_upstream) — NON-fatal: if
+// the issue upstream is absent or lacks IssueSupport, the issue routes return
+// 501 per-op while PR/CI routes keep working (issues are opt-in and additive;
+// the PRSupport startup fail-closed is unchanged).
+//
+// The broker deliberately lives OUTSIDE the core isolation set
 // (internal/gitproto, internal/transport, internal/policy, cmd/git-proxy):
-// those packages must never reference PRSupport, and the broker is the one place
-// the type-assert happens. main.go passes the already-built port.Upstream and
-// never mentions PRSupport.
+// those packages must never reference PRSupport or IssueSupport, and the broker
+// is the one place the type-asserts happen. main.go passes the already-built
+// port.Upstreams and never mentions PRSupport or IssueSupport.
 package broker
 
 import (
@@ -40,7 +47,9 @@ type Config struct {
 	AllowedAgents []string
 	// AllowedOps optionally restricts which op kinds are permitted. Empty
 	// means all ops are allowed. Values: "pr.create", "pr.get", "pr.list",
-	// "pr.merge", "pr.comment", "pr.review", "ci.status".
+	// "pr.merge", "pr.comment", "pr.review", "ci.status", "issue.create",
+	// "issue.get", "issue.list", "issue.comment", "issue.close",
+	// "issue.reopen", "issue.edit", "issue.label.add", "issue.label.remove".
 	AllowedOps []string
 	// MergeMethod is the default GitHub merge method when a merge request does
 	// not specify one. Empty defaults to "merge".
@@ -51,7 +60,12 @@ type Config struct {
 // so main.go's serveTransports fan-out runs it alongside the git frontends.
 type Broker struct {
 	ln   net.Listener
-	prs  port.PRSupport // type-asserted from port.Upstream at New
+	prs  port.PRSupport // type-asserted from the SCM upstream at New (fail-closed)
+	// issues is the optional issue-tracker capability type-asserted from the
+	// SEPARATELY-configured issue upstream at New. nil when no issue upstream
+	// was passed or it does not implement IssueSupport — issue routes then
+	// return 501 per-op (issues are opt-in/additive; PRSupport is unaffected).
+	issues     port.IssueSupport
 	repos map[string]string // agent-facing repo path → upstream repo key
 	auth      port.Authenticator // agent Bearer authenticator; nil → fail closed
 	auditSink port.AuditSink     // best-effort; nil → no audit
@@ -63,16 +77,24 @@ type Broker struct {
 	server *http.Server
 }
 
-// New constructs a broker. It type-asserts port.PRSupport off up and fails
-// closed (returns an error) when up does not implement it — the broker is
+// New constructs a broker. It type-asserts port.PRSupport off scmUp and fails
+// closed (returns an error) when scmUp does not implement it — the broker is
 // meaningless without an SCM adapter, and main.go treats the error as a startup
-// failure rather than silently running a broker that 501s every op.
-func New(ln net.Listener, up port.Upstream, repos map[string]string, a port.Authenticator, audit port.AuditSink, cfg Config) (*Broker, error) {
-	prs, ok := up.(port.PRSupport)
+// failure rather than silently running a broker that 501s every PR/CI op.
+//
+// issueUp is the SEPARATELY-configured issue upstream (config.issue_upstream);
+// it may be nil. New type-asserts port.IssueSupport off it NON-fatally: when
+// issueUp is nil or does not implement IssueSupport, b.issues stays nil and the
+// issue routes return 501 per-op (issues are opt-in — the right default for a
+// security gateway; no silent fallback to the SCM upstream). main.go never
+// references port.IssueSupport — it passes a port.Upstream (or nil) and the
+// type-assert happens here, outside the core isolation set.
+func New(ln net.Listener, scmUp port.Upstream, issueUp port.Upstream, repos map[string]string, a port.Authenticator, audit port.AuditSink, cfg Config) (*Broker, error) {
+	prs, ok := scmUp.(port.PRSupport)
 	if !ok {
 		// Fail closed: name the type so an operator sees *why* (e.g. they set
 		// upstream.kind: plain, which has no SCM API). No secret content.
-		return nil, fmt.Errorf("broker: upstream %T does not implement port.PRSupport; the broker requires an SCM adapter (set upstream.kind: github)", up)
+		return nil, fmt.Errorf("broker: upstream %T does not implement port.PRSupport; the broker requires an SCM adapter (set upstream.kind: github)", scmUp)
 	}
 	mergeMethod := cfg.MergeMethod
 	if mergeMethod == "" {
@@ -88,9 +110,38 @@ func New(ln net.Listener, up port.Upstream, repos map[string]string, a port.Auth
 		allowedAgents: toSet(cfg.AllowedAgents),
 		allowedOps:    toSet(cfg.AllowedOps),
 	}
+	// IssueSupport is optional/additive: a nil issueUp or one that lacks the
+	// capability simply leaves b.issues nil (issue routes → 501). No error —
+	// issues being unavailable is not a startup failure (distinct from
+	// PRSupport, which the broker cannot function without).
+	if issueUp != nil {
+		if is, ok := issueUp.(port.IssueSupport); ok {
+			b.issues = is
+		}
+	}
 	mux := b.routes()
 	b.server = &http.Server{Handler: mux}
 	return b, nil
+}
+
+// issuesOK guards an issue handler. It reuses authOK for the auth/authz gate,
+// then — when issues are configured — returns the IssueSupport and ok=true. When
+// b.issues is nil (no issue upstream configured, or it lacks IssueSupport) it
+// writes a 501 "not implemented" via opFail, audits the deny, and returns
+// ok=false so the handler returns immediately. The 501 is per-op: PR/CI routes
+// are unaffected. The auth/authz gate still runs first, so an unauthenticated
+// or unauthorized request gets 401/403 (not a 501 that leaks "issues exist").
+func (b *Broker) issuesOK(w http.ResponseWriter, r *http.Request, repo, op string) (auth.AgentIdentity, port.IssueSupport, bool) {
+	agent, ok := b.authOK(w, r, repo, op)
+	if !ok {
+		return auth.AgentIdentity{}, nil, false
+	}
+	if b.issues == nil {
+		// Issues opt-in: absent → 501 per-op, generic reason, no-leak.
+		b.opFail(w, r, agent.Name, repo, op, port.ErrNotImplemented)
+		return agent, nil, false
+	}
+	return agent, b.issues, true
 }
 
 // Serve runs the broker until ctx is canceled, then gracefully shuts down. It
