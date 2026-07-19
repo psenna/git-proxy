@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	fileaudit "github.com/psenna/git-proxy/internal/audit/file"
 	"github.com/psenna/git-proxy/internal/auth/token"
 	"github.com/psenna/git-proxy/internal/config"
 	"github.com/psenna/git-proxy/internal/credentials/file"
@@ -32,7 +33,6 @@ import (
 	"github.com/psenna/git-proxy/internal/port"
 	httpfront "github.com/psenna/git-proxy/internal/transport/http"
 	"github.com/psenna/git-proxy/internal/upstream/plain"
-	fileaudit "github.com/psenna/git-proxy/internal/audit/file"
 )
 
 // Harness holds a running upstream git HTTP server and proxy pair.
@@ -120,7 +120,12 @@ func Start(t *testing.T, repo string) *Harness {
 		t.Fatalf("listen: %v", err)
 	}
 	up := plain.New(upstreamSrv.URL, nil)
-	frontend := httpfront.New(ln, up, upstreamSrv.URL, map[string]string{repo: repo}, nil, nil)
+	// creds: a fake cred store that reports a throwaway credential for exactly
+	// the test repo, so access.Decide allows read AND write (deny-by-default
+	// would 403 a no-cred repo). publicRepos=nil: read-only public allowlist
+	// would 403 TestPassthroughPush's push. The push service-leg uses up.creds
+	// (nil above), so pushes are still anonymous to the open upstream.
+	frontend := httpfront.New(ln, up, upstreamSrv.URL, map[string]string{repo: repo}, nil, fakeCredStore(repo), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -181,7 +186,7 @@ func StartWithAuth(t *testing.T, repo, agentToken string, vaultCreds map[string]
 	}
 	up := plain.New(h.UpstreamURL, store)
 	authn := token.New(map[string]string{agentToken: "agent-1"})
-	frontend := httpfront.New(ln, up, h.UpstreamURL, map[string]string{h.Repo: h.Repo}, authn, store)
+	frontend := httpfront.New(ln, up, h.UpstreamURL, map[string]string{h.Repo: h.Repo}, authn, store, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -294,7 +299,13 @@ func startWithPolicy(t *testing.T, repo, agentToken string, pol config.PolicyCon
 	if agentToken != "" {
 		authn = token.New(map[string]string{agentToken: "agent-1"})
 	}
-	frontend := httpfront.New(ln, up, h.UpstreamURL, map[string]string{h.Repo: h.Repo}, authn, nil)
+	// creds: a fake cred store that reports a throwaway credential for exactly
+	// the test repo so access.Decide allows read AND write. Push-policy tests
+	// push through the proxy with no agent creds; deny-by-default would 403 the
+	// push BEFORE it reaches the enforcement engine. The push service-leg uses
+	// up.creds (nil above), so pushes are still anonymous to the open upstream.
+	// publicRepos=nil: read-only public allowlist would 403 the push.
+	frontend := httpfront.New(ln, up, h.UpstreamURL, map[string]string{h.Repo: h.Repo}, authn, fakeCredStore(h.Repo), nil)
 	frontend.SetEnforcement(eng, opener, pol.MaxPackfileBytesOrDefault())
 	// Read protection: wire the proxy-level fetch path matcher when configured.
 	// Fail-closed on malformed patterns (mirrors main.go startup validation).
@@ -377,6 +388,30 @@ func cachingMirrorOpener(upstreamURL, root string, creds port.CredentialStore) g
 		return m, nil
 	}
 }
+
+// fakeCredStore returns a CredentialStore that reports a throwaway credential
+// for exactly repo (so access.Decide allows read AND write for the test repo),
+// and false for any other repo. The test upstream is an open git-http-backend
+// (GIT_HTTP_EXPORT_ALL=1) that ignores the dummy Basic auth; the push
+// service-leg uses the upstream's own (nil) creds, so pushes still reach the
+// open upstream anonymously. Used by the Start and startWithPolicy harness
+// builders to keep the test repo reachable under deny-by-default.
+func fakeCredStore(repo string) port.CredentialStore {
+	return fakeStore{repo: repo}
+}
+
+// fakeStore is a port.CredentialStore that holds a credential for exactly one
+// repo. The compile check asserts it satisfies the interface.
+type fakeStore struct{ repo string }
+
+func (s fakeStore) CredentialsFor(repo string) (port.Credentials, bool) {
+	if repo == s.repo {
+		return port.Credentials{Username: "git", Password: "git"}, true
+	}
+	return port.Credentials{}, false
+}
+
+var _ port.CredentialStore = fakeStore{}
 
 // writeVault writes a credential vault YAML file and returns its path. The
 // vault maps repo paths to upstream credentials.

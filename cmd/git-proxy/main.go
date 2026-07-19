@@ -23,9 +23,9 @@ import (
 	logalert "github.com/psenna/git-proxy/internal/alert/log"
 	"github.com/psenna/git-proxy/internal/alert/webhook"
 	"github.com/psenna/git-proxy/internal/audit/file"
-	"github.com/psenna/git-proxy/internal/broker"
 	"github.com/psenna/git-proxy/internal/auth/keyauth"
 	"github.com/psenna/git-proxy/internal/auth/token"
+	"github.com/psenna/git-proxy/internal/broker"
 	"github.com/psenna/git-proxy/internal/config"
 	credfile "github.com/psenna/git-proxy/internal/credentials/file"
 	"github.com/psenna/git-proxy/internal/gitproto"
@@ -100,14 +100,14 @@ func run(configPath string) error {
 	// main.go maps the YAML shape into upstream.UpstreamConfig here (carrying
 	// the already-loaded creds so every adapter shares one store).
 	up, err := upstream.Build(upstream.UpstreamConfig{
-		Kind:            cfg.Upstream.Kind,
-		URL:             cfg.Upstream.URL,
+		Kind:             cfg.Upstream.Kind,
+		URL:              cfg.Upstream.URL,
 		CredentialsStore: creds,
 	})
 	if err != nil {
 		return fmt.Errorf("build upstream kind %q: %w", cfg.Upstream.Kind, err)
 	}
-	httpFrontend := httpfront.New(ln, up, cfg.Upstream.URL, cfg.Repos, auth, creds)
+	httpFrontend := httpfront.New(ln, up, cfg.Upstream.URL, cfg.Repos, auth, creds, nil)
 
 	// Audit sink: append-only JSONL file. Built once and wired into BOTH
 	// frontends' proxies (each owns its own *gitproto.Proxy). Empty
@@ -303,8 +303,8 @@ func run(configPath string) error {
 				issueCreds = store
 			}
 			issueUp, err = upstream.Build(upstream.UpstreamConfig{
-				Kind:            cfg.IssueUpstream.Kind,
-				URL:             cfg.IssueUpstream.URL,
+				Kind:             cfg.IssueUpstream.Kind,
+				URL:              cfg.IssueUpstream.URL,
 				CredentialsStore: issueCreds,
 			})
 			if err != nil {
