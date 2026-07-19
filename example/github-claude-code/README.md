@@ -2,14 +2,15 @@
 
 A runnable example where **Claude Code** — backed by **Ollama Cloud** — works
 against a **real GitHub** repo through **git-proxy**. The agent clones/fetches/pushes
-through the proxy's git-protocol leg and opens PRs / queries CI through the proxy's
-**broker** leg, all without ever seeing the GitHub PAT. The proxy holds the PAT and
-attaches it on the proxy→GitHub leg.
+through the proxy's git-protocol leg and opens PRs / queries CI / files and triages
+**issues** through the proxy's **broker** leg, all without ever seeing the GitHub PAT.
+The proxy holds the PAT and attaches it on the proxy→GitHub leg.
 
 This is the counterpart to [`deploy/docker/`](../../deploy/docker), which is a
 self-contained stack over a local Gitea. That one needs no external account; this one
 needs a GitHub account + PAT and an Ollama Cloud key, but exercises the full
-agent-facing surface (git protocol **and** broker) against real GitHub.
+agent-facing surface (git protocol **and** broker — PRs, CI, and issues) against real
+GitHub.
 
 For the git-proxy narrative see [`../../docs/deploy-docker.md`](../../docs/deploy-docker.md).
 
@@ -30,8 +31,9 @@ protocol, Bearer for the broker REST leg).
 ## Prerequisites
 
 - Docker Engine + the `docker compose` plugin.
-- A **GitHub PAT** with repo read/write (push, PR, CI). Classic: the `repo` scope.
-  Fine-grained: `Contents: write`, `Pull requests: write`, `Actions: read`.
+- A **GitHub PAT** with repo read/write (push, PR, CI, issues). Classic: the `repo`
+  scope (covers issues). Fine-grained: `Contents: write`, `Pull requests: write`,
+  `Actions: read`, `Issues: write`.
 - An **Ollama Cloud API key** — create one at <https://ollama.com/settings/keys>.
 - A GitHub repo you can push to (you'll set `GITHUB_REPO` and the matching key in
   `credentials.yaml`).
@@ -86,6 +88,11 @@ PRSupport type-assert at startup):
 curl -s http://127.0.0.1:8090/healthz    # {"status":"ok"}
 ```
 
+This config also sets `issue_upstream.kind: github`, so the broker's **issue routes**
+are wired (`POST /{repo}/issues`, list/get/comment/close/reopen/edit/labels) — see the
+`use-git-proxy` skill for the full surface. With `issue_upstream` omitted, issue routes
+return 501 per-op while PR/CI routes keep working (issues are opt-in).
+
 ## 3. Watch the agent
 
 ```sh
@@ -139,7 +146,10 @@ sudo rm -rf data            # local runtime state
   are generic class strings. You may safely repeat them.
 - **Fail-closed.** Missing/invalid agent Bearer → 401; an upstream that lacks
   PRSupport → the broker refuses to start. The `kind: github` upstream here satisfies
-  PRSupport, so the broker runs.
+  PRSupport, so the broker runs. **Issues are opt-in**: the issue tracker comes from a
+  separate `issue_upstream`; this config sets it to `kind: github` (same PAT), so issue
+  routes work. Without `issue_upstream`, issue routes return 501 per-op while PR/CI
+  routes keep working — the `PRSupport` startup fail-closed is unaffected.
 
 ## Notes
 

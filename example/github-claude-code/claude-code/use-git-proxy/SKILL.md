@@ -1,6 +1,6 @@
 ---
 name: use-git-proxy
-description: Use when the agent needs to clone/fetch/push a git repository or to manipulate pull requests and query CI status through a git-proxy instance. Covers Bearer auth, the git-protocol leg (clone/fetch/push with policy awareness and read protection), and the agent-facing broker REST API (create/get/list/merge PRs, comment/review, CI status). Use it any time a remote URL points at a git-proxy or a task mentions pushing through / opening PRs via git-proxy.
+description: Use when the agent needs to clone/fetch/push a git repository, manipulate pull requests and query CI status, or file/read/comment/close/label issues through a git-proxy instance. Covers Bearer auth, the git-protocol leg (clone/fetch/push with policy awareness and read protection), and the agent-facing broker REST API (PRs, CI status, and issues). Use it any time a remote URL points at a git-proxy or a task mentions pushing through / opening PRs or issues via git-proxy.
 ---
 
 # Use git-proxy
@@ -17,7 +17,7 @@ a git-proxy instance.
 | Leg | What it's for | URL |
 |---|---|---|
 | **Git protocol** | `clone` / `fetch` / `push` (smart-HTTP) | the proxy `listen` address, e.g. `http://127.0.0.1:8080` |
-| **Broker REST API** | create/get/list/merge PRs, comment, review, query CI status | the `broker.listen` address, e.g. `http://127.0.0.1:8090` |
+| **Broker REST API** | PRs (create/get/list/merge, comment, review), CI status, and issues (create/get/list, comment, close, reopen, edit, labels) | the `broker.listen` address, e.g. `http://127.0.0.1:8090` |
 
 ## 0. Prerequisites — establish these first
 
@@ -105,13 +105,20 @@ When a push is rejected, read the reason, fix the offending change, and retry. D
 **not** attempt to circumvent policy (e.g. by rebasing to hide the secret) — the
 deny is the correct outcome.
 
-## 2. Leg two — broker REST API (PRs + CI)
+## 2. Leg two — broker REST API (PRs + CI + issues)
 
 The broker is a separate HTTP server (separate port from the git leg). It lets you
-manipulate PRs and query CI state **without** receiving the upstream GitHub token:
-you send your agent Bearer, the proxy attaches its own GitHub token to the
-proxy→GitHub leg. Use it for any PR/CI workflow instead of shelling out to
-`gh`/`git` against GitHub directly.
+manipulate PRs, query CI state, and work with issues **without** receiving the
+upstream token: you send your agent Bearer, the proxy attaches its own token to the
+proxy→upstream leg. Use it for any PR/CI/issue workflow instead of shelling out to
+`gh`/`git` against the upstream directly.
+
+> **Issues are opt-in.** The issue tracker is sourced from a separately-configured
+> `issue_upstream` (distinct from the SCM upstream that backs PRs/CI). If the
+> deployment did not configure one, every issue route returns **501** per-op while
+> PR/CI routes keep working — see [Error responses](#error-responses). Auth still
+> gates first (a missing/invalid Bearer is 401, not 501, so a 401 never leaks
+> "issues are configured").
 
 ### Repo path encoding — important
 
@@ -178,6 +185,56 @@ least one run failed) | `"success"` (all completed passing) | `"unknown"` (a run
 in a state the roll-up can't classify). Precedence is failure > pending > success
 > unknown.
 
+### Issue operations
+
+Issue routes are served **only when the deployment configured an `issue_upstream`**.
+The repo path is encoded the same way as PRs (`owner%2Frepo.git`).
+
+```sh
+REPO="owner%2Frepo.git"
+AUTH="Authorization: Bearer $GIT_PROXY_TOKEN"
+
+# Create an issue. Body: {title, body}. → 201 {"number":N,"url":"..."}
+curl -s -X POST "$GIT_PROXY_BROKER_URL/$REPO/issues" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"title":"Bug in checkout","body":"steps to reproduce..."}'
+
+# List issues (?state=open|closed|all, defaults to open). → 200 [IssueState,...]
+# Pull requests are filtered out (GitHub models every PR as an issue) — the list
+# is issues only.
+curl -s "$GIT_PROXY_BROKER_URL/$REPO/issues?state=open" -H "$AUTH"
+
+# Get one issue. → 200 IssueState{number,title,state,body,url,labels}
+curl -s "$GIT_PROXY_BROKER_URL/$REPO/issues/42" -H "$AUTH"
+
+# Comment on an issue. → 204.
+curl -s -X POST "$GIT_PROXY_BROKER_URL/$REPO/issues/42/comments" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"body":"Confirmed on main."}'
+
+# Close / reopen an issue. → 204 each (no body).
+curl -s -X POST "$GIT_PROXY_BROKER_URL/$REPO/issues/42/close"  -H "$AUTH"
+curl -s -X POST "$GIT_PROXY_BROKER_URL/$REPO/issues/42/reopen" -H "$AUTH"
+
+# Edit an issue's title and/or body. → 200 IssueState. An EMPTY title/body means
+# "leave unchanged" — the field is omitted from the PATCH, so you do NOT blank a
+# field by accident. Only send a field you intend to set.
+curl -s -X POST "$GIT_PROXY_BROKER_URL/$REPO/issues/42/edit" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"title":"Better title"}'           # body left unchanged
+
+# Add labels. → 200 ["label",...] (the resulting full label set).
+curl -s -X POST "$GIT_PROXY_BROKER_URL/$REPO/issues/42/labels" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"labels":["bug","p1"]}'
+
+# Remove a single label. → 204. The label name travels in the JSON body (the
+# proxy URL-encodes it onto the upstream path), so spaces/emoji are fine.
+curl -s -X POST "$GIT_PROXY_BROKER_URL/$REPO/issues/42/labels/remove" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"label":"needs review"}'
+```
+
+`IssueState.state` is `"open"` or `"closed"`. `labels` is a flat `["name",...]`.
+The issue ops reuse the same sentinel→status map as PRs (see below): a 404 means
+the issue number doesn't exist, a 422 means e.g. an unknown label, a 501 means
+issues are not configured on this deployment.
+
 ### Interpreting `mergeable`
 
 `PRState.mergeable` is a tri-state: `true`/`false`/`null`. GitHub returns `null`
@@ -229,6 +286,16 @@ POST   $BROKER/$R/prs/N/merge      [-d '{"method":"squash"}']                   
 POST   $BROKER/$R/prs/N/comments   -d '{"body":"..."}'                          # 204
 POST   $BROKER/$R/prs/N/reviews    -d '{"event":"APPROVE","body":"..."}'        # 204
 GET    $BROKER/$R/checks/<ref>                                                   # 200
+# Issues (opt-in: 501 per-op if no issue_upstream is configured)
+POST   $BROKER/$R/issues                       -d '{"title","body"}'            # 201
+GET    $BROKER/$R/issues?state=open                                              # 200 (PRs filtered out)
+GET    $BROKER/$R/issues/N                                                       # 200
+POST   $BROKER/$R/issues/N/comments  -d '{"body":"..."}'                        # 204
+POST   $BROKER/$R/issues/N/close                                                 # 204
+POST   $BROKER/$R/issues/N/reopen                                               # 204
+POST   $BROKER/$R/issues/N/edit     [-d '{"title","body"}']  # empty=unchanged  # 200
+POST   $BROKER/$R/issues/N/labels    -d '{"labels":[...]}'                      # 200
+POST   $BROKER/$R/issues/N/labels/remove -d '{"label":"..."}'                   # 204
 GET    $BROKER/healthz                                                           # 200 (no auth)
 ```
 
@@ -262,8 +329,8 @@ task matches its `description`.
   creds on the proxy→upstream leg. Do not attempt to obtain or use the upstream
   token.
 - **Your Bearer is consumed for auth only** — it is never forwarded to the
-  upstream (the broker's PRSupport methods take no token). Do not send your token
-  anywhere except the `Authorization: Bearer` header to the proxy.
+  upstream (the broker's PRSupport/IssueSupport methods take no token). Do not
+  send your token anywhere except the `Authorization: Bearer` header to the proxy.
 - **Deny reasons are no-leak.** Secret-scan reasons are redacted; broker error
   reasons are generic class strings. You may safely repeat them in logs/PRs.
 - **Fail-closed.** Missing token → 401 (never anonymous); non-SCM upstream → the

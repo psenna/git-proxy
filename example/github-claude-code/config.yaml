@@ -30,6 +30,21 @@ auth:
     # The Claude Code container sends this as its git extraHeader / broker Bearer.
     "agent-token-1": "claude-code-agent"
 
+# Issue upstream: an OPTIONAL, separately-configured upstream that sources the
+# broker's issue routes (create/get/list/comment/close/reopen/edit/labels),
+# DISTINCT from the SCM upstream above. v1 sets it to kind: github too — the
+# GitHub adapter implements port.IssueSupport, so the broker's /issues routes
+# work. It MAY point at the same url + credentials_file as the SCM upstream (the
+# v1 GitHub case: PRs and issues from one provider) or a different one (a future
+# issue_upstream.kind: jira). Absent (commented out) → issue routes return 501
+# per-op (issues opt-in) while PR/CI routes keep working. main.go builds a SECOND
+# port.Upstream from this and passes it to the broker; it never references
+# port.IssueSupport (the broker type-asserts internally).
+issue_upstream:
+  kind: github
+  url: "https://github.com"
+  credentials_file: /credentials.yaml   # same PAT as the SCM upstream — one token fills both
+
 policy:
   mode: first_deny            # stop at the first violation; use collect_all to report all
   mirror:
