@@ -69,6 +69,17 @@ $EDITOR credentials.yaml
 leg reads only `username`/`password`; the broker reads `token`). One PAT fills both.
 You can also inject the PAT via the `GITHUB_PASSWORD` / `GITHUB_TOKEN` env vars
 (env > file > empty), e.g. in `docker-compose.yml`, instead of editing this file.
+The env-var name is the profile name **uppercased** (`name: GITHUB` → `GITHUB_PASSWORD`
+/ `GITHUB_TOKEN`), so a profile named e.g. `company_abc` reads `COMPANY_ABC_TOKEN`.
+
+**Deny-by-default.** A repo with no matching credential profile is **denied**
+(403) before the proxy contacts GitHub — it is not anonymous. To expose a repo to
+anonymous (uncredentialed) agents for **read-only** clone/fetch, add it to the
+top-level `public_repos` allowlist in `config.yaml` (wildcards like `public/*`
+allowed; bare `*` / `**` are not). Anonymous pushes to a `public_repos` repo are
+still denied (writes always require a credential profile). The example config
+does not set `public_repos`; every repo the agent reaches is profiled in
+`credentials.yaml`.
 
 ## 2. Bring the stack up
 

@@ -79,6 +79,14 @@ docker compose restart git-proxy        # re-read credentials.yaml
 > `demo`/`demopass`, create the repo and a personal access token under
 > Settings → Applications, then paste the token into `credentials.yaml`.
 
+**Deny-by-default.** A repo with no matching credential profile is rejected
+with 403 before the proxy contacts Gitea — it is not anonymous. To expose a
+repo to anonymous agents for read-only clone/fetch, add it to the top-level
+`public_repos` allowlist in `config.yaml` (wildcards like `public/*` allowed;
+bare `*` / `**` are not). Anonymous pushes are still denied — writes always
+require a credential profile. The demo config does not set `public_repos`;
+`demo/demo.git` is profiled in `credentials.yaml`, so it is served credentialed.
+
 ## 3. Use git through the proxy
 
 The agent authenticates to the proxy with a Bearer token; the proxy holds the

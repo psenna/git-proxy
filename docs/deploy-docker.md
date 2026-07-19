@@ -64,7 +64,7 @@ Everything lives under [`deploy/docker/`](https://github.com/psenna/git-proxy/tr
 | --- | --- |
 | `docker-compose.yml` | The two services + `gitnet` network + volumes. |
 | `config.yaml` | The proxy config: upstream = Gitea, one Bearer token, the full v1 policy. |
-| `credentials.yaml` | Per-repo Basic-auth creds the proxy attaches to Gitea. You fill in the Gitea token. |
+| `credentials.yaml` | Profile-based Basic-auth creds the proxy attaches to Gitea. You fill in the Gitea token (or inject it via env). |
 | `Dockerfile` (repo root) | Multi-stage build; runtime is Alpine + `git` + `ca-certificates`, non-root. |
 | `.dockerignore` (repo root) | Keeps build context lean. |
 
@@ -134,6 +134,19 @@ docker compose restart git-proxy
 > create the repo, then create a personal access token under Settings →
 > Applications (with repository read/write scopes), and paste it into
 > `credentials.yaml`.
+
+### Deny-by-default and `public_repos`
+
+The proxy is **deny-by-default**: a repo with no matching credential profile is
+rejected with 403 **before** the proxy contacts Gitea — it is not anonymous. To
+expose a repo to anonymous (uncredentialed) agents for **read-only** clone/fetch,
+add it to the top-level `public_repos` allowlist in `config.yaml` (wildcards
+like `public/*` allowed; bare `*` / `**` are not). Anonymous pushes to a
+`public_repos` repo are still denied — writes always require a credential
+profile. The demo config does not set `public_repos`: `demo/demo.git` is
+profiled in `credentials.yaml`, so the proxy serves it credentialed; every
+other repo is denied. See `config.yaml`'s commented `public_repos:` block for
+the shape.
 
 ## 3. Use git through the proxy
 
