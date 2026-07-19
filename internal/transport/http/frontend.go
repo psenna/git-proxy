@@ -321,12 +321,19 @@ func (f *Frontend) authenticate(r *http.Request) (auth.AgentIdentity, error) {
 
 // applyUpstreamCreds attaches vault credentials for repo to an upstream request,
 // if any are configured. The agent never sees these: they live only on the
-// proxy→upstream leg.
+// proxy→upstream leg. A token-only profile (Token set, Username and Password
+// both empty) is broker-only: the Token is consumed by the SCM adapter, not by
+// Basic auth, so the git leg skips SetBasicAuth entirely rather than emitting a
+// meaningless "Basic Og==" header (the request stays anonymous on this leg,
+// subject to deny-by-default / public_repos upstream of here).
 func (f *Frontend) applyUpstreamCreds(req *http.Request, repo string) {
 	if f.creds == nil {
 		return
 	}
 	if c, ok := f.creds.CredentialsFor(repo); ok {
+		if c.Username == "" && c.Password == "" {
+			return
+		}
 		req.SetBasicAuth(c.Username, c.Password)
 	}
 }

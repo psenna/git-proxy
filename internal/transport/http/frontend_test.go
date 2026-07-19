@@ -309,4 +309,42 @@ func TestFrontend_DenyByDefault(t *testing.T) {
 			t.Errorf("upstream hit %d times; unauth must not reach upstream", hits)
 		}
 	})
+
+	// Case 5: a token-only credential profile (Token set, Username and Password
+	// both empty) allows the read (access.Decide sees a profile → Allow) and
+	// reaches the upstream, but the upstream request must carry NO
+	// Authorization header. A token-only profile is broker-only (the Token is
+	// consumed by the SCM adapter, not Basic auth); applyUpstreamCreds must
+	// skip SetBasicAuth when both Basic fields are empty rather than emit a
+	// meaningless "Basic Og==" header.
+	t.Run("token_only_profile_no_basic_header", func(t *testing.T) {
+		creds := staticCredStore{"other/x.git": {Username: "", Password: "", Token: "ghp_broker_only"}}
+		up := newRecordingUpstream(t, false) // hit expected (profile allows read)
+		f := newDenyFrontend(t, up, authn, creds, nil)
+		req := httptest.NewRequest(http.MethodGet, "/other/x.git/info/refs?service=git-upload-pack", nil)
+		req.Header.Set("Authorization", "Bearer good-token")
+		rr := httptest.NewRecorder()
+		f.handle(rr, req)
+		if rr.Code == http.StatusForbidden {
+			t.Fatalf("token-only profile read should be allowed; got 403 body=%q", rr.Body.String())
+		}
+		hits, authHdr := up.snapshot()
+		if hits == 0 {
+			t.Fatalf("upstream not hit; token-only profile should allow the read and reach upstream")
+		}
+		if authHdr != "" {
+			t.Errorf("upstream Authorization header = %q; token-only profile must not attach Basic auth on the git leg", authHdr)
+		}
+	})
+}
+
+// staticCredStore is a port.CredentialStore that returns a fixed credential for
+// a fixed set of repos (and false for any other repo). Used to exercise
+// applyUpstreamCreds with specific credential shapes (e.g. a token-only
+// profile) without spinning up the profile store.
+type staticCredStore map[string]port.Credentials
+
+func (s staticCredStore) CredentialsFor(repo string) (port.Credentials, bool) {
+	c, ok := s[repo]
+	return c, ok
 }

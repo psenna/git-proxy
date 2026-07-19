@@ -106,6 +106,36 @@ func TestUpstream_NoCredsWhenVaultEmpty(t *testing.T) {
 	}
 }
 
+// TestUpstream_TokenOnlyNoBasicHeader asserts that a token-only credential
+// profile (Token set, Username and Password both empty) does NOT attach an
+// Authorization header on the git leg. A token-only profile is broker-only
+// (the Token is consumed by the SCM adapter, not by Basic auth); attaching
+// SetBasicAuth("", "") would emit a meaningless "Basic Og==" header. The git
+// leg must skip Basic auth entirely when both Basic fields are empty, leaving
+// the request anonymous (subject to deny-by-default / public_repos upstream).
+func TestUpstream_TokenOnlyNoBasicHeader(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "0000")
+	}))
+	defer srv.Close()
+
+	store := memStore{creds: map[string]port.Credentials{
+		"test.git": {Username: "", Password: "", Token: "ghp_broker_only"},
+	}}
+	up := New(srv.URL, store)
+
+	if _, err := up.ListRefs(context.Background(), "test.git"); err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+	if gotAuth != "" {
+		t.Errorf("token-only profile attached Authorization %q; git leg must skip Basic auth when Username and Password are both empty", gotAuth)
+	}
+}
+
 // TestUpstream_NilVaultNoCreds asserts a nil vault never attaches creds.
 func TestUpstream_NilVaultNoCreds(t *testing.T) {
 	var gotAuth string
