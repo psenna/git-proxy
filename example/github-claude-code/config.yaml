@@ -1,0 +1,62 @@
+# git-proxy configuration for the Claude Code + GitHub compose stack.
+#
+# Unlike deploy/docker (upstream.kind: plain over a local Gitea), this points at
+# REAL github.com with upstream.kind: github. That kind implements port.PRSupport,
+# which is what the broker type-asserts at startup — so the broker (PR + CI ops)
+# works here. The only values you MUST fill in are in credentials.yaml (GitHub PAT)
+# and .env (Ollama key + repo).
+#
+# See ../../docs/deploy-docker.md for the proxy narrative and ./README.md for the
+# quickstart. Every field below is real and grounded in internal/config.
+
+listen: "0.0.0.0:8080"
+
+upstream:
+  # github = the GitHub SCM adapter: git smart-HTTP delegates to the plain
+  # transport (GitHub serves /info/refs, /git-upload-pack, /git-receive-pack), and
+  # PR/CI ops go through the GitHub REST API (internal/upstream/github/rest). The
+  # proxy reaches github.com directly (the agent never uses this URL; it talks to
+  # the proxy).
+  kind: github
+  url: "https://github.com"
+  # Per-repo creds the proxy attaches on the proxy->GitHub leg. For the git
+  # protocol it reads username/password (HTTP Basic); for the broker REST leg it
+  # reads token (Bearer). See credentials.yaml.
+  credentials_file: /credentials.yaml
+
+auth:
+  tokens:
+    # Bearer token -> agent id (auditable identity recorded in every audit event).
+    # The Claude Code container sends this as its git extraHeader / broker Bearer.
+    "agent-token-1": "claude-code-agent"
+
+policy:
+  mode: first_deny            # stop at the first violation; use collect_all to report all
+  mirror:
+    dir: /tmp/git-proxy-mirror # bare inspection-mirror cache root (bind-mounted)
+  rules:
+    history_protect:
+      enabled: true
+      params:
+        refs: ["refs/heads/main"]   # block force-push / rewrite of main
+    branch_pattern:
+      enabled: true
+      params:
+        allow: ["refs/heads/main", "refs/heads/feat/*"]  # only these refs may be pushed
+    secret_scan:
+      enabled: true                 # redacted reasons; matched secret never reaches agent/audit/alert
+  read:
+    deny: ["secrets/**"]            # withhold secrets/ blobs from fetch (use --filter=blob:none to clone)
+
+broker:
+  # Agent-facing PR/CI REST server on a separate port from the git frontend. The
+  # broker type-asserts port.PRSupport off the upstream at startup; a kind: github
+  # upstream satisfies it, so the broker comes up. (A kind: plain upstream would
+  # fail closed at startup — see TestBrokerSmoke_FailsClosedOnPlainUpstream.)
+  listen: "0.0.0.0:8090"
+  # allowed_agents / allowed_ops omitted -> allow all authenticated agents all ops.
+  # Tighten for any real deployment. Example only.
+  merge_method: squash
+
+audit:
+  file: /tmp/git-proxy/audit.jsonl   # append-only JSONL; omit to disable

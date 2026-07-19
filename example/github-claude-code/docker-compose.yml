@@ -1,0 +1,77 @@
+# docker compose stack: Claude Code (on Ollama Cloud) -> git-proxy -> real GitHub.
+#
+# Topology:
+#   claude (agent) --8080(git)/8090(broker)--> git-proxy --https--> github.com
+#     git insteadOf rewrites https://github.com/<x> -> http://git-proxy:8080/<x>
+#     http.extraHeader attaches the agent Bearer
+#   claude --> https://ollama.com   (Ollama Cloud, Anthropic-compatible /v1/messages)
+#
+# The agent never sees the GitHub PAT: git-proxy holds it in credentials.yaml and
+# attaches it on the proxy->GitHub leg (HTTP Basic for the git protocol, Bearer for
+# the broker REST leg). The agent authenticates to the proxy with a Bearer token
+# (auth.tokens in config.yaml).
+#
+# Unlike deploy/docker (self-contained Gitea stack), this points at REAL github.com,
+# so you must supply a GitHub PAT and an Ollama Cloud API key. See ./README.md.
+
+services:
+  git-proxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: git-proxy:dev
+    container_name: github-claude-gitproxy
+    # Run as the image's non-root gitproxy user (uid 1000). The bind-mounted data/
+    # dirs must be writable by uid 1000 — see ./README.md if your host uid differs.
+    user: "1000:1000"
+    ports:
+      - "8080:8080"   # git-protocol leg (clone/fetch/push)
+      - "8090:8090"   # broker REST leg (PR + CI ops)
+    volumes:
+      - ./config.yaml:/config.yaml:ro
+      - ./credentials.yaml:/credentials.yaml:ro
+      - ./data/mirror:/tmp/git-proxy-mirror
+      - ./data/audit:/tmp/git-proxy
+    networks:
+      - proxynet
+
+  claude:
+    build: ./claude-code
+    container_name: github-claude-agent
+    depends_on:
+      - git-proxy
+    # Headless: the prompt IS the compose `command`. The container runs once and
+    # exits. Override with `docker compose run --rm claude "<your prompt>"` to
+    # drive a different task (the entrypoint passes $@ to `claude -p`).
+    command:
+      - >-
+        Clone the repo from https://github.com/${GITHUB_REPO}, create a branch
+        feat/example, add hello.txt, push it, then open a PR via the broker (use
+        the use-git-proxy skill).
+    environment:
+      # --- Ollama Cloud (Anthropic-compatible endpoint) ---
+      ANTHROPIC_BASE_URL: "https://ollama.com"
+      ANTHROPIC_AUTH_TOKEN: "${OLLAMA_API_KEY}"      # = OLLAMA_API_KEY; sent as Bearer to Ollama
+      ANTHROPIC_API_KEY: ""                          # empty: Claude Code must not fall back to an Anthropic login
+      ANTHROPIC_MODEL: "${OLLAMA_MODEL:-gpt-oss:120b}"
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: "${OLLAMA_MODEL:-gpt-oss:120b}"
+      CLAUDE_CODE_ATTRIBUTION_HEADER: "0"            # keeps prompt caching valid on non-Anthropic backends
+      CLAUDE_CONFIG_DIR: "/home/claude/.claude-ollama"  # isolate config from any host claude.ai auth
+      # --- git-proxy legs (consumed by the entrypoint + the use-git-proxy skill) ---
+      AGENT_TOKEN: "${AGENT_TOKEN}"                  # the agent's Bearer to the proxy
+      GITHUB_REPO: "${GITHUB_REPO}"                  # owner/repo.git the agent clones
+      GIT_PROXY_URL: "http://git-proxy:8080"
+      GIT_PROXY_BROKER_URL: "http://git-proxy:8090"
+      GIT_PROXY_TOKEN: "${AGENT_TOKEN}"
+      GIT_PROXY_HEADER: "http.extraheader=Authorization: Bearer ${AGENT_TOKEN}"
+    volumes:
+      - claude-work:/workspace
+    networks:
+      - proxynet
+
+networks:
+  proxynet:
+    driver: bridge
+
+volumes:
+  claude-work: {}
