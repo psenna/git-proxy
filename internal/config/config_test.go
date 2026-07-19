@@ -186,3 +186,68 @@ upstream:
 		t.Errorf("Audit.File = %q, want empty (disabled)", c2.Audit.File)
 	}
 }
+
+func TestParseIssueUpstreamDisabledByDefault(t *testing.T) {
+	c, err := Parse([]byte(validYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.IssueUpstream.Kind != "" || c.IssueUpstream.URL != "" {
+		t.Errorf("IssueUpstream = %+v, want empty (issues disabled by default)", c.IssueUpstream)
+	}
+}
+
+func TestParseIssueUpstreamEnabled(t *testing.T) {
+	c, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  kind: github
+  url: "https://github.com"
+issue_upstream:
+  kind: github
+  url: "https://github.com"
+  credentials_file: /creds/issues.yaml
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.IssueUpstream.Kind != "github" {
+		t.Errorf("IssueUpstream.Kind = %q, want github", c.IssueUpstream.Kind)
+	}
+	if c.IssueUpstream.URL != "https://github.com" {
+		t.Errorf("IssueUpstream.URL = %q", c.IssueUpstream.URL)
+	}
+	if c.IssueUpstream.CredentialsFile != "/creds/issues.yaml" {
+		t.Errorf("IssueUpstream.CredentialsFile = %q", c.IssueUpstream.CredentialsFile)
+	}
+}
+
+func TestParseIssueUpstreamKindWithoutURLRejected(t *testing.T) {
+	_, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "https://github.com"
+issue_upstream:
+  kind: github
+`))
+	if err == nil || !strings.Contains(err.Error(), "issue_upstream.url is required") {
+		t.Fatalf("expected issue_upstream.url required error, got %v", err)
+	}
+}
+
+func TestParseIssueUpstreamAbsentIsValid(t *testing.T) {
+	// No issue_upstream at all: issues disabled, valid (no validation error).
+	c, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "https://github.com"
+broker:
+  listen: "127.0.0.1:8090"
+`))
+	if err != nil {
+		t.Fatalf("Parse (no issue_upstream): %v", err)
+	}
+	if c.IssueUpstream.Kind != "" {
+		t.Errorf("IssueUpstream.Kind = %q, want empty", c.IssueUpstream.Kind)
+	}
+}
