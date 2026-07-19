@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/psenna/git-proxy/internal/access"
 	"github.com/psenna/git-proxy/internal/auth"
 	"github.com/psenna/git-proxy/internal/gitproto"
 	"github.com/psenna/git-proxy/internal/pathmatch"
@@ -31,6 +32,7 @@ type Frontend struct {
 	server      *http.Server
 	creds       port.CredentialStore
 	auth        port.Authenticator
+	publicRepos port.RepoMatcher   // nil → no anonymous-read allowlist (deny-by-default)
 	readDeny    *pathmatch.Matcher // nil → info/refs passthrough (read protection off)
 }
 
@@ -43,7 +45,7 @@ type Frontend struct {
 // only for unauthenticated passthrough (e.g. local tests). creds, if non-nil,
 // is the vault of upstream credentials the proxy attaches when it talks to the
 // upstream; the agent never receives these.
-func New(ln net.Listener, up port.Upstream, upstreamURL string, repos map[string]string, a port.Authenticator, creds port.CredentialStore) *Frontend {
+func New(ln net.Listener, up port.Upstream, upstreamURL string, repos map[string]string, a port.Authenticator, creds port.CredentialStore, publicRepos port.RepoMatcher) *Frontend {
 	f := &Frontend{
 		ln:          ln,
 		upstreamURL: strings.TrimRight(upstreamURL, "/"),
@@ -52,6 +54,7 @@ func New(ln net.Listener, up port.Upstream, upstreamURL string, repos map[string
 		client:      &http.Client{},
 		auth:        a,
 		creds:       creds,
+		publicRepos: publicRepos,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", f.handle)
@@ -166,6 +169,11 @@ func (f *Frontend) handle(w http.ResponseWriter, r *http.Request) {
 // read-protected upload-pack response is v0-only in v1). git-receive-pack
 // advertisements are always passthrough (push is enforced separately).
 func (f *Frontend) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo string) {
+	isWrite := r.URL.Query().Get("service") == "git-receive-pack"
+	if access.Decide(f.creds, f.publicRepos, repo, isWrite) == access.DecisionDeny {
+		f.denyRepo(w, r)
+		return
+	}
 	if f.readDeny != nil && r.URL.Query().Get("service") == "git-upload-pack" {
 		f.handleInfoRefsReadProtected(w, r, repo)
 		return
@@ -199,6 +207,13 @@ func (f *Frontend) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo s
 // Fail-closed: any upstream/parse/encode error yields a 502 (the agent never sees
 // a usable advertisement that would let it fetch unprotected objects).
 func (f *Frontend) handleInfoRefsReadProtected(w http.ResponseWriter, r *http.Request, repo string) {
+	// Defensive: handleInfoRefs already gated on the deny-check and delegated
+	// here only for git-upload-pack. Re-check (always read) so this stays
+	// fail-closed even if a future caller routes here directly.
+	if access.Decide(f.creds, f.publicRepos, repo, false) == access.DecisionDeny {
+		f.denyRepo(w, r)
+		return
+	}
 	url := f.upstreamURL + "/" + repo + "/info/refs?service=git-upload-pack"
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
 	if err != nil {
@@ -250,6 +265,12 @@ func (f *Frontend) handleInfoRefsReadProtected(w http.ResponseWriter, r *http.Re
 // gitproto proxy. gzip request bodies are decompressed first so the upstream
 // receives raw git protocol.
 func (f *Frontend) handleService(w http.ResponseWriter, r *http.Request, repo, service, resultContentType string) {
+	// Deny BEFORE consuming the request body: a denied push must not read the
+	// (potentially large) receive-pack stream. isWrite is true for push.
+	if access.Decide(f.creds, f.publicRepos, repo, service == "git-receive-pack") == access.DecisionDeny {
+		f.denyRepo(w, r)
+		return
+	}
 	body, err := requestBody(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -308,6 +329,15 @@ func (f *Frontend) applyUpstreamCreds(req *http.Request, repo string) {
 	if c, ok := f.creds.CredentialsFor(repo); ok {
 		req.SetBasicAuth(c.Username, c.Password)
 	}
+}
+
+// denyRepo rejects a request for a repo not served by this proxy with a fixed
+// generic 403. It emits a single, constant reason string — no repo path, no OID,
+// no credential — so an unconfigured/unauthorized repo is not leaked to the
+// agent (no-leak). Called after authenticate, so an unauthenticated caller gets
+// 401 before reaching here (401 before 403).
+func (f *Frontend) denyRepo(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, `{"error":"repository not served by this proxy"}`, http.StatusForbidden)
 }
 
 // parsePath splits a smart-HTTP path into the repo and the endpoint suffix.
