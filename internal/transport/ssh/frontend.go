@@ -37,6 +37,7 @@ import (
 	"net"
 	"strings"
 
+	"github.com/psenna/git-proxy/internal/access"
 	"github.com/psenna/git-proxy/internal/auth"
 	"github.com/psenna/git-proxy/internal/gitproto"
 	"github.com/psenna/git-proxy/internal/pathmatch"
@@ -47,13 +48,15 @@ import (
 
 // Frontend is the SSH transport. It implements port.Transport.
 type Frontend struct {
-	ln       net.Listener
-	up       port.Upstream
-	proxy    *gitproto.Proxy
-	repos    map[string]string
-	authn    *keyAuthenticator
-	sshSrv   *ssh.ServerConfig
-	hostKey  ssh.Signer
+	ln          net.Listener
+	up          port.Upstream
+	proxy       *gitproto.Proxy
+	repos       map[string]string
+	authn       *keyAuthenticator
+	sshSrv      *ssh.ServerConfig
+	hostKey     ssh.Signer
+	creds       port.CredentialStore // nil → no credential profiles (deny-by-default)
+	publicRepos port.RepoMatcher     // nil → no anonymous-read allowlist (deny-by-default)
 }
 
 // keyAuthenticator wraps a port.Authenticator (keyauth) with the SSH-specific
@@ -73,7 +76,15 @@ type keyAuthenticator struct {
 // log a warning). Fail-closed: a non-empty path that is missing/unreadable or
 // unparseable returns an error (no silent fallback to ephemeral when a path is
 // configured).
-func New(ln net.Listener, up port.Upstream, repos map[string]string, authn port.Authenticator, hostKeyPath string) (*Frontend, error) {
+//
+// creds is the vault of upstream credentials used by the deny-by-default access
+// check (access.Decide): a repo with a credential profile is allowed (read +
+// write); a repo without one is denied unless publicRepos matches AND the
+// request is a read (push always requires a credential). The proxy→upstream
+// attach path is UNCHANGED — it uses up's own creds (built in main.go with the
+// same store) — only the new access.Decide path uses these Frontend fields.
+// Pass nil for both to fail-closed on every repo (deny-by-default).
+func New(ln net.Listener, up port.Upstream, repos map[string]string, authn port.Authenticator, hostKeyPath string, creds port.CredentialStore, publicRepos port.RepoMatcher) (*Frontend, error) {
 	var signer ssh.Signer
 	var err error
 	if hostKeyPath != "" {
@@ -88,12 +99,14 @@ func New(ln net.Listener, up port.Upstream, repos map[string]string, authn port.
 		return nil, errors.New("sshfront: authenticator is required (fail closed: no key auth = no access)")
 	}
 	f := &Frontend{
-		ln:      ln,
-		up:      up,
-		proxy:   gitproto.New(up),
-		repos:   repos,
-		authn:   &keyAuthenticator{Authenticator: authn},
-		hostKey: signer,
+		ln:          ln,
+		up:          up,
+		proxy:       gitproto.New(up),
+		repos:       repos,
+		authn:       &keyAuthenticator{Authenticator: authn},
+		hostKey:     signer,
+		creds:       creds,
+		publicRepos: publicRepos,
 	}
 	cfg := &ssh.ServerConfig{
 		PublicKeyCallback: f.publicKeyCallback,
@@ -262,6 +275,23 @@ func (f *Frontend) handleExec(ctx context.Context, sconn *ssh.ServerConn, channe
 	}
 	mapped := f.repoPath(repo)
 
+	// Deny-by-default access check (mirrors the HTTP frontend's handleInfoRefs /
+	// handleService gate). Runs AFTER repo mapping (so the check matches
+	// credential / public_repos patterns against the MAPPED upstream repo path,
+	// cross-leg consistent with HTTP) and BEFORE the ref advertisement fetch or
+	// any proxy handoff (fail-closed: a denied repo never reaches upstream, no
+	// upstream creds are attached, no advertisement is fetched). isWrite is true
+	// for git-receive-pack (push); pushes always require a credential, even for
+	// public_repos repos. On Deny, write a structured error (v0 ERR pkt-line for
+	// upload-pack, stderr fatal for receive-pack) + exit non-zero, with a fixed
+	// generic reason (no-leak: no repo path / OID / credential).
+	isWrite := service == "git-receive-pack"
+	if access.Decide(f.creds, f.publicRepos, mapped, isWrite) == access.DecisionDeny {
+		writeSessionError(channel, service, denyReason)
+		_ = sendExitStatus(channel, 1)
+		return
+	}
+
 	// Resolve the authenticated agent identity from key auth and store it in
 	// ctx so the proxy's agentName(ctx) sees it (same context key as HTTP).
 	agentName := ""
@@ -287,7 +317,7 @@ func (f *Frontend) runGitSession(ctx context.Context, channel ssh.Channel, servi
 	// Write the ref advertisement (raw v0, no preamble).
 	if err := f.writeAdvertisement(ctx, channel, service, repo); err != nil {
 		// Fail-closed: advertisement error → ERR pkt-line + no negotiation.
-		writeSessionError(channel, service, err)
+		writeSessionError(channel, service, "proxy error")
 		return err
 	}
 	// Hand the channel's stdin/stdout to the proxy for negotiation + packfile.
@@ -312,7 +342,7 @@ func (f *Frontend) runGitSession(ctx context.Context, channel ssh.Channel, servi
 	case "git-upload-pack":
 		body, rerr := readUploadPackRequest(channel)
 		if rerr != nil {
-			writeSessionError(channel, service, rerr)
+			writeSessionError(channel, service, "proxy error")
 			_ = sendExitStatus(channel, 1)
 			return rerr
 		}
@@ -321,7 +351,7 @@ func (f *Frontend) runGitSession(ctx context.Context, channel ssh.Channel, servi
 		streamErr = f.proxy.ReceivePack(ctx, repo, channel, channel)
 	}
 	if streamErr != nil {
-		writeSessionError(channel, service, streamErr)
+		writeSessionError(channel, service, "proxy error")
 		_ = sendExitStatus(channel, 1)
 		return streamErr
 	}
@@ -359,13 +389,19 @@ func (f *Frontend) writeAdvertisement(ctx context.Context, w io.Writer, service,
 	return nil
 }
 
+// denyReason is the fixed generic reason written to the channel when
+// access.Decide denies a repo (deny-by-default). It is deliberately constant
+// and contains no repo path, OID, or credential (no-leak), matching the HTTP
+// frontend's denyRepo body for cross-leg consistency.
+const denyReason = "repository not served by this proxy"
+
 // writeSessionError writes a structured error to the channel for a failed
 // session. For git-upload-pack it writes a v0 ERR pkt-line (the git client
 // surfaces it as a fetch error); for git-receive-pack it writes a plain stderr
 // message (the push advertisement has no ERR channel). The reason is generic
-// and fail-closed: no upstream credentials, no secret content.
-func writeSessionError(channel ssh.Channel, service string, err error) {
-	reason := "proxy error"
+// and fail-closed: callers MUST pass a constant string with no upstream
+// credentials, no secret content, and no repo path / OID (no-leak).
+func writeSessionError(channel ssh.Channel, service, reason string) {
 	switch service {
 	case "git-upload-pack":
 		_ = gitproto.WriteUploadPackErr(channel, reason)

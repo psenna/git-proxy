@@ -243,7 +243,7 @@ func run(configPath string) error {
 		if err != nil {
 			return fmt.Errorf("ssh listen: %w", err)
 		}
-		sshFE, err := sshfront.New(sshLn, up, cfg.Repos, sshAuthn, cfg.SSH.HostKey)
+		sshFE, err := sshfront.New(sshLn, up, cfg.Repos, sshAuthn, cfg.SSH.HostKey, creds, nil)
 		if err != nil {
 			return fmt.Errorf("ssh frontend: %w", err)
 		}
