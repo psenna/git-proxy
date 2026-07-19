@@ -12,18 +12,19 @@ import (
 )
 
 // TestPRSupport_CoreNeverDepends enforces the binding invariant (v1.md M10) that
-// the proxy core NEVER depends on the optional PRSupport capability sub-interface.
-// Only internal/port may define PRSupport, and an adapter package
-// (internal/upstream/github) may implement it; the core (internal/gitproto,
+// the proxy core NEVER depends on the optional SCM/issue capability sub-interfaces.
+// Only internal/port may define them, and an adapter package
+// (internal/upstream/github) may implement them; the core (internal/gitproto,
 // internal/transport, internal/policy, cmd/git-proxy) must NEVER reference
-// port.PRSupport — code that wants the capability must type-assert at runtime
-// (`if prs, ok := up.(PRSupport); ok { ... }`).
+// port.PRSupport or port.IssueSupport — code that wants a capability must
+// type-assert at runtime (`if prs, ok := up.(PRSupport); ok { ... }`).
 //
 // This test parses the core packages' production source files and FAILS if any
-// references the PRSupport identifier, preventing a silent regression that would
-// couple the core to an SCM-specific capability. It is the enforceable form of the
-// "core never depends on PRSupport" contract: the invariant currently holds (no
-// core file references PRSupport), and this test keeps it held.
+// references a capability-seam identifier (PRSupport or IssueSupport), preventing a
+// silent regression that would couple the core to an SCM/issue-specific capability.
+// It is the enforceable form of the "core never depends on the capability seams"
+// contract: the invariant currently holds (no core file references either), and
+// this test keeps it held.
 func TestPRSupport_CoreNeverDepends(t *testing.T) {
 	// Locate the repo layout from this test file's path: internal/port -> internal -> root.
 	_, here, _, ok := runtime.Caller(0)
@@ -34,15 +35,25 @@ func TestPRSupport_CoreNeverDepends(t *testing.T) {
 	internalDir := filepath.Dir(portDir)  // .../internal
 	rootDir := filepath.Dir(internalDir) // repo root
 
-	// The core packages that must stay free of any PRSupport dependency.
+	// capabilitySeams is the set of optional capability sub-interface identifiers
+	// the core must never reference. Today: PRSupport (PRs / branch protection,
+	// sourced from the SCM upstream) and IssueSupport (issues, sourced from a
+	// separately-configured issue upstream). Adding a future capability seam means
+	// adding its identifier here so the same invariant is enforced for it.
+	capabilitySeams := map[string]bool{
+		"PRSupport":    true,
+		"IssueSupport": true,
+	}
+
+	// The core packages that must stay free of any capability-seam dependency.
 	// gitproto and transport are walked RECURSIVELY (their subpackages —
 	// gitproto/pktline, transport/http, transport/ssh — are core protocol/transport
-	// code that must also stay free of PRSupport; a top-level-only ReadDir would
+	// code that must also stay free of the seams; a top-level-only ReadDir would
 	// miss the frontend files, which is exactly where a core dep would creep in).
 	// policy is scanned TOP-LEVEL ONLY: its subpackage internal/policy/rules holds
-	// rule implementations that MAY legitimately type-assert PRSupport in a future
-	// rule (e.g. "require a PR exists before pushing to a protected branch"), so
-	// scanning rules/ would create false alarms. cmd/git-proxy has no subpackages.
+	// rule implementations that MAY legitimately type-assert a capability in a
+	// future rule (e.g. "require a PR exists before pushing to a protected branch"),
+	// so scanning rules/ would create false alarms. cmd/git-proxy has no subpackages.
 	recursivePkgs := []string{
 		filepath.Join(internalDir, "gitproto"),
 		filepath.Join(internalDir, "transport"),
@@ -62,9 +73,9 @@ func TestPRSupport_CoreNeverDepends(t *testing.T) {
 			if !ok {
 				return true
 			}
-			if ident.Name == "PRSupport" {
-				t.Errorf("%s: %s references PRSupport — the core must not depend on the optional capability sub-interface (type-assert at runtime instead)",
-					fset.Position(ident.Pos()), path)
+			if capabilitySeams[ident.Name] {
+				t.Errorf("%s: %s references %s — the core must not depend on the optional capability sub-interface (type-assert at runtime instead)",
+					fset.Position(ident.Pos()), path, ident.Name)
 				return false
 			}
 			return true
