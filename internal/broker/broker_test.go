@@ -86,7 +86,20 @@ func (r *recordingSink) Record(_ context.Context, e port.AuditEvent) error {
 
 func mustNew(t *testing.T, up port.Upstream, authn port.Authenticator, audit port.AuditSink, cfg Config) *Broker {
 	t.Helper()
-	b, err := New(nil, up, nil, authn, audit, cfg)
+	// No issue upstream: issues disabled (issue routes → 501). Existing PR/CI
+	// tests are unaffected by the issue capability.
+	b, err := New(nil, up, nil, nil, authn, audit, cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return b
+}
+
+// mustNewIssues is mustNew with an issue upstream wired (issueUp), for the
+// issue-route tests.
+func mustNewIssues(t *testing.T, up, issueUp port.Upstream, authn port.Authenticator, audit port.AuditSink, cfg Config) *Broker {
+	t.Helper()
+	b, err := New(nil, up, issueUp, nil, authn, audit, cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -94,7 +107,7 @@ func mustNew(t *testing.T, up port.Upstream, authn port.Authenticator, audit por
 }
 
 func TestNew_FailsClosedWhenUpstreamLacksPRSupport(t *testing.T) {
-	_, err := New(nil, stubUpstream{}, nil, fakeAuthenticator{}, nil, Config{})
+	_, err := New(nil, stubUpstream{}, nil, nil, fakeAuthenticator{}, nil, Config{})
 	if err == nil {
 		t.Fatal("New: want error when upstream does not implement PRSupport (fail closed)")
 	}

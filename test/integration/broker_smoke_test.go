@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -145,3 +146,113 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// writeSmokeConfigWithIssues is writeSmokeConfig plus a separately-configured
+// issue_upstream (github kind, same placeholder URL — never contacted by
+// /healthz). It exercises the main.go path that builds a SECOND port.Upstream
+// and passes it to the broker as the issue upstream.
+func writeSmokeConfigWithIssues(t *testing.T, gitPort, brokerPort int) string {
+	t.Helper()
+	yaml := fmt.Sprintf(`
+listen: "127.0.0.1:%d"
+upstream:
+  kind: github
+  url: "https://github.com/owner/repo.git"
+auth:
+  tokens:
+    agent-token-1: agent-1
+broker:
+  listen: "127.0.0.1:%d"
+issue_upstream:
+  kind: github
+  url: "https://github.com/owner/repo.git"
+`, gitPort, brokerPort)
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(p, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return p
+}
+
+// TestBrokerSmoke_IssueUpstreamStarts is the PR6 smoke test: with an
+// issue_upstream configured, main.go builds the second upstream and passes it
+// to the broker; the broker must still come up (/healthz 200). Proves the
+// issue-upstream wiring does not break broker startup. (Issue routes are
+// exercised end-to-end in the broker integration test.)
+func TestBrokerSmoke_IssueUpstreamStarts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("smoke test builds + runs the binary")
+	}
+	bin := buildBinary(t)
+	gitPort := freePort(t)
+	brokerPort := freePort(t)
+	cfgPath := writeSmokeConfigWithIssues(t, gitPort, brokerPort)
+	brokerAddr := fmt.Sprintf("127.0.0.1:%d", brokerPort)
+
+	cmd := exec.Command(bin, "-config", cfgPath)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start git-proxy: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+	})
+
+	resp := waitForHealthy(t, brokerAddr, 5*time.Second)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/healthz status = %d, want 200 (broker must start with issue_upstream wired)", resp.StatusCode)
+	}
+}
+
+// TestBrokerSmoke_IssueRoutes501WhenNoIssueUpstream asserts the end-to-end
+// wiring: with a broker enabled and NO issue_upstream, an issue route returns
+// 501 per-op (issues opt-in) while the broker is up and PR routes are
+// unaffected. The agent's auth still gates first (a missing Bearer → 401).
+func TestBrokerSmoke_IssueRoutes501WhenNoIssueUpstream(t *testing.T) {
+	if testing.Short() {
+		t.Skip("smoke test builds + runs the binary")
+	}
+	bin := buildBinary(t)
+	gitPort := freePort(t)
+	brokerPort := freePort(t)
+	// No issue_upstream → issues disabled.
+	cfgPath := writeSmokeConfig(t, gitPort, brokerPort, "github")
+	brokerAddr := fmt.Sprintf("127.0.0.1:%d", brokerPort)
+
+	cmd := exec.Command(bin, "-config", cfgPath)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start git-proxy: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+	})
+
+	// Wait for the broker to come up.
+	resp := waitForHealthy(t, brokerAddr, 5*time.Second)
+	_ = resp.Body.Close()
+
+	// POST an issue create with a valid bearer → 501 (issues not configured).
+	req, err := http.NewRequest(http.MethodPost, "http://"+brokerAddr+"/owner%2Frepo.git/issues", stringReader(`{"title":"t"}`))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer agent-token-1")
+	req.Header.Set("Content-Type", "application/json")
+	iresp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer func() { _ = iresp.Body.Close() }()
+	if iresp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("issue create status = %d, want 501 (no issue_upstream → issues opt-in 501)", iresp.StatusCode)
+	}
+}
+
+// stringReader returns a non-nil reader for a body so the smoke test can POST.
+func stringReader(s string) *strings.Reader { return strings.NewReader(s) }
