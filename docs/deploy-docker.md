@@ -41,6 +41,16 @@ The two containers share a private bridge network (`gitnet`); only the proxy
 (`:8080`) and Gitea's web UI (`:3000`, for one-time setup) are published to the
 host.
 
+> **This stack is git-protocol-only.** It runs `upstream.kind: plain` with no
+> `broker.listen`, so it exercises clone/fetch/push enforcement but not the
+> agent-facing broker (PRs, CI, issues). The broker requires an SCM adapter
+> (`port.PRSupport`); the PR + CI + **issue** surface lives in
+> [`example/github-claude-code/`](https://github.com/psenna/git-proxy/tree/main/example/github-claude-code),
+> which sets `upstream.kind: github` and `issue_upstream.kind: github`. Issues are
+> opt-in: the issue tracker comes from a separately-configured `issue_upstream`,
+> and without it the broker's `/issues` routes return 501 per-op while PR/CI routes
+> keep working.
+
 ## Prerequisites
 
 - Docker Engine with the `docker compose` plugin.

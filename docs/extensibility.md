@@ -25,10 +25,11 @@ the worked example for each seam, grounded in the code as of v1 (M10).
 |---|---|---|---|---|
 | Policy rule | `port.Rule` | `policy.RegisterRule` | `policy.rules.<name>` | `internal/policy/rules/secret_scan.go` |
 | SCM provider | `port.Upstream` (+ optional `port.PRSupport`) | `upstream.Register` | `upstream.kind` | `internal/upstream/plain`, `internal/upstream/github` |
+| Issue tracker | `port.Upstream` (+ optional `port.IssueSupport`) | `upstream.Register` | `issue_upstream.kind` | `internal/upstream/github` (v1) |
 | Frontend | `port.Transport` | (constructed in `main.go`) | `listen` / `ssh.listen` | `internal/transport/http`, `internal/transport/ssh` |
 | Auth method | `port.Authenticator` | (constructed in `main.go`) | `auth.tokens` / `ssh.authorized_keys` | `internal/auth/token`, `internal/auth/keyauth` |
 | Secret scanner | `port.SecretScanner` | (constructed in the rule) | (inside `secret_scan` rule config) | `internal/secret/regex` |
-| Credential store | `port.CredentialStore` | (constructed in `main.go`) | `upstream.credentials_file` | `internal/credentials/file` |
+| Credential store | `port.CredentialStore` | (constructed in `main.go`) | `upstream.credentials_file` / `issue_upstream.credentials_file` | `internal/credentials/file` |
 | Audit sink | `port.AuditSink` | (constructed in `main.go`) | `audit.file` | `internal/audit/file` |
 | Alert sink | `port.AlertSink` | (constructed in `main.go`) | `alerts.webhook` | `internal/alert/webhook`, `internal/alert/log`, `internal/alert` (Multi) |
 
@@ -106,8 +107,9 @@ sub-interface (branch protection, pull requests); the core never depends on
    )
 
    var (
-       _ port.Upstream  = (*Adapter)(nil)
-       _ port.PRSupport = (*Adapter)(nil)
+       _ port.Upstream    = (*Adapter)(nil)
+       _ port.PRSupport   = (*Adapter)(nil)
+       _ port.IssueSupport = (*Adapter)(nil) // optional: the issue-tracker capability
    )
 
    type Adapter struct {
@@ -157,13 +159,81 @@ sub-interface (branch protection, pull requests); the core never depends on
 fail-closes on an unknown kind (no silent fallback). Duplicate registration panics
 (matching the rule registry).
 
-**The core never depends on `PRSupport`** — enforced by a `go/parser` AST-scan
-test (`internal/port/prsupport_core_isolation_test.go`) that fails if any
-production file in `internal/gitproto`, `internal/transport`, `internal/policy`,
-or `cmd` references `port.PRSupport`. (The scan walks `gitproto`, `transport`, and
-`cmd` recursively so the frontend subpackages `transport/http` and `transport/ssh`
-are covered; `policy` is scanned top-level only so `policy/rules` — which may
-legitimately type-assert `PRSupport` in a future rule — is excluded.)
+**The core never depends on `PRSupport` or `IssueSupport`** — enforced by a
+`go/parser` AST-scan test (`internal/port/prsupport_core_isolation_test.go`) that
+fails if any production file in `internal/gitproto`, `internal/transport`,
+`internal/policy`, or `cmd` references either capability identifier. (The scan
+walks `gitproto`, `transport`, and `cmd` recursively so the frontend subpackages
+`transport/http` and `transport/ssh` are covered; `policy` is scanned top-level
+only so `policy/rules` — which may legitimately type-assert a capability in a
+future rule — is excluded.) `cmd/git-proxy/main.go` passes a `port.Upstream` (or
+`nil`) for the issue upstream and never names `IssueSupport`; the type-asserts
+live in `internal/broker`, which is outside the scanned core set.
+
+---
+
+## Issue tracker (`port.IssueSupport`)
+
+Issues are a **distinct, optional** capability — an adapter may offer issues
+without offering PRs (a future Jira adapter implements `IssueSupport` only).
+Crucially, the issue tracker is sourced from a **separately-configured
+`issue_upstream`**, decoupled from the SCM `upstream` that backs `PRSupport`:
+
+- v1 sets **both** to `kind: github` (the GitHub adapter implements both
+  `PRSupport` and `IssueSupport`; two `*Adapter` instances are built — one as the
+  SCM upstream, one as the issue upstream — sharing the same URL/creds file). PRs
+  and issues both come from GitHub.
+- The same seam lets a future deployment set `upstream.kind: github` (SCM/PRs) +
+  `issue_upstream.kind: jira` (issues) with **no core change** — mirroring how
+  `PRSupport` already lets a future GitLab adapter slot in.
+
+`port.IssueSupport` (`internal/port/issues.go`) is nine methods:
+`CreateIssue`, `GetIssue`, `ListIssues`, `CommentIssue`, `CloseIssue`,
+`ReopenIssue`, `EditIssue`, `AddLabels`, `RemoveLabel`, with `Issue` (the create
+result) and `IssueState` (the read shape) types. It reuses the existing `port`
+sentinels — no new ones — so the broker's no-leak `writeError` mapping is
+unchanged (404/403/422/429/502/501 all map generically).
+
+**To add one** (worked example = the GitHub adapter, which implements
+`IssueSupport` alongside `PRSupport`):
+
+1. In your adapter package, satisfy `port.IssueSupport` (a `var _ port.IssueSupport
+   = (*Adapter)(nil)` compile check) and implement the nine methods. Each builds a
+   REST client from the per-repo token (fail-closed via the same `tokenFor` the
+   `PRSupport` methods use — never anonymous) and calls the matching REST op. The
+   github adapter maps `rest.Issue`→`port.Issue` and `rest.IssueState`→
+   `port.IssueState` explicitly so the `rest` package stays a pure client with no
+   `port` import for its response shapes.
+2. The package is already registered (the same `init()` that registers it as an
+   SCM provider). `upstream.Build` resolves it by `issue_upstream.kind`.
+3. `cmd/git-proxy/main.go` builds the issue upstream only when
+   `issue_upstream.kind` is set: it resolves a second `port.CredentialStore` from
+   `issue_upstream.credentials_file` and calls `upstream.Build` a second time,
+   passing the result (or `nil`) to the broker. **`main.go` never references
+   `port.IssueSupport`** — it hands the broker a `port.Upstream`; the broker
+   type-asserts `IssueSupport` off it.
+4. Select in config:
+   ```yaml
+   issue_upstream:
+     kind: github
+     url: "https://github.com"
+     credentials_file: /credentials.yaml
+   ```
+
+**The broker consumes `IssueSupport` additively** (`internal/broker`): `New` takes
+an `issueUp port.Upstream` (may be `nil`); it type-asserts `IssueSupport` off it
+**non-fatal** — `issueUp == nil` or it lacks `IssueSupport` → `b.issues = nil`,
+no error. The `PRSupport` startup fail-closed is **unchanged** (the broker still
+refuses to start if the *SCM* upstream lacks `PRSupport`). With `b.issues == nil`,
+every issue route returns **501 per-op** (issues are opt-in), while PR/CI routes
+keep working — auth still gates first (401 before 501, so a missing Bearer never
+leaks "issues are configured"). Nine issue routes are exposed
+(`POST /{repo}/issues`, `GET /{repo}/issues[/{number}[/{comments|close|reopen|edit|labels[/remove]}]]`);
+handlers reuse the same `authOK`→`issuesOK`→decode→call→`audit`/`opFail` flow as
+the PR handlers. `EditIssue` sends only non-empty fields (pointer-omitted JSON)
+so an agent never blanks a field by accident; `RemoveLabel` URL-encodes the label
+on the upstream path (the broker takes it in the JSON body, so path-encoding
+concerns stay inside the REST client).
 
 ---
 
