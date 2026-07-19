@@ -221,3 +221,142 @@ func TestPRSupport_RealCallsAttachTokenAndFailClosed(t *testing.T) {
 type emptyVault struct{}
 
 func (emptyVault) CredentialsFor(repo string) (port.Credentials, bool) { return port.Credentials{}, false }
+
+// TestBuild_GitHubReturnsIssueSupport asserts Build with Kind "github" returns
+// a port.Upstream that ALSO satisfies port.IssueSupport — proving the GitHub
+// adapter implements the issue seam, so it can be built separately as the
+// issue_upstream and the broker can type-assert IssueSupport off it.
+func TestBuild_GitHubReturnsIssueSupport(t *testing.T) {
+	up, err := upstream.Build(upstream.UpstreamConfig{
+		Kind: "github",
+		URL:  "https://github.com/owner/repo",
+	})
+	if err != nil {
+		t.Fatalf("Build github: %v", err)
+	}
+	is, ok := up.(port.IssueSupport)
+	if !ok {
+		t.Fatal("Build github: Upstream does not satisfy port.IssueSupport (type-assert failed)")
+	}
+	if is == nil {
+		t.Fatal("Build github: IssueSupport is nil")
+	}
+}
+
+// TestIssueSupport_RealCallsAttachTokenAndFailClosed boots a fake GitHub REST
+// server and an adapter with a real token vault, then drives each IssueSupport
+// method end-to-end through the REST client. It asserts the proxy's token
+// (ghp_test) is sent as a Bearer header, the request paths use owner/repo (no
+// .git), the rest→port mapping (Issue/IssueState with flat labels) is correct,
+// and that a repo with no token fails closed with ErrUnauthorized rather than
+// calling GitHub anonymously. The adapter is built as it would be for the
+// issue_upstream — the same github adapter, used for issues.
+func TestIssueSupport_RealCallsAttachTokenAndFailClosed(t *testing.T) {
+	const proxyToken = "ghp_test"
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /api/v3/repos/owner/repo/issues":
+			_, _ = w.Write([]byte(`{"number":11,"title":"t","state":"open","body":"b","html_url":"https://gh/issues/11","labels":[]}`))
+			return
+		case "GET /api/v3/repos/owner/repo/issues/11":
+			_, _ = w.Write([]byte(`{"number":11,"title":"t","state":"open","body":"b","html_url":"https://gh/issues/11","labels":[{"name":"bug"}]}`))
+			return
+		case "GET /api/v3/repos/owner/repo/issues":
+			// One real issue + one PR (GitHub models every PR as an issue); the PR
+			// carries a non-null pull_request object and must be filtered out.
+			_, _ = w.Write([]byte(`[{"number":11,"state":"open","html_url":"u"},{"number":12,"state":"open","html_url":"p","pull_request":{"url":"x"}}]`))
+			return
+		case "POST /api/v3/repos/owner/repo/issues/11/comments":
+			w.WriteHeader(http.StatusCreated)
+			return
+		case "PATCH /api/v3/repos/owner/repo/issues/11":
+			_, _ = w.Write([]byte(`{"number":11,"title":"t","state":"open","body":"b","html_url":"https://gh/issues/11","labels":[{"name":"bug"},{"name":"p1"}]}`))
+			return
+		case "POST /api/v3/repos/owner/repo/issues/11/labels":
+			_, _ = w.Write([]byte(`[{"name":"bug"},{"name":"p1"}]`))
+			return
+		case "DELETE /api/v3/repos/owner/repo/issues/11/labels/bug":
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	adapter := New(upstream.UpstreamConfig{Kind: "github", URL: srv.URL, CredentialsStore: fakeVault{token: proxyToken}})
+	// Compile-time check that *Adapter satisfies port.IssueSupport (panics at
+	// build time if it ever stops conforming); avoids an unchecked assertion.
+	var is port.IssueSupport = adapter
+	ctx := context.Background()
+
+	issue, err := is.CreateIssue(ctx, "owner/repo.git", "t", "b")
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if issue.Number != 11 || issue.URL != "https://gh/issues/11" {
+		t.Errorf("CreateIssue Issue = %+v", issue)
+	}
+	if gotAuth != "Bearer "+proxyToken {
+		t.Errorf("CreateIssue auth = %q, want Bearer %q", gotAuth, proxyToken)
+	}
+
+	state, err := is.GetIssue(ctx, "owner/repo.git", 11)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if state.Number != 11 || state.Title != "t" || state.State != "open" || state.URL != "https://gh/issues/11" {
+		t.Errorf("GetIssue IssueState = %+v", state)
+	}
+	if len(state.Labels) != 1 || state.Labels[0] != "bug" {
+		t.Errorf("GetIssue Labels = %v, want [bug] (flat, from label objects)", state.Labels)
+	}
+
+	list, err := is.ListIssues(ctx, "owner/repo.git", "open")
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	// The PR (#12) must be filtered out; only the issue (#11) remains.
+	if len(list) != 1 || list[0].Number != 11 {
+		t.Errorf("ListIssues = %+v, want only [#11] (PR filtered)", list)
+	}
+
+	if err := is.CommentIssue(ctx, "owner/repo.git", 11, "note"); err != nil {
+		t.Fatalf("CommentIssue: %v", err)
+	}
+	if err := is.CloseIssue(ctx, "owner/repo.git", 11); err != nil {
+		t.Fatalf("CloseIssue: %v", err)
+	}
+	if err := is.ReopenIssue(ctx, "owner/repo.git", 11); err != nil {
+		t.Fatalf("ReopenIssue: %v", err)
+	}
+
+	edited, err := is.EditIssue(ctx, "owner/repo.git", 11, "t", "")
+	if err != nil {
+		t.Fatalf("EditIssue: %v", err)
+	}
+	if edited.Number != 11 {
+		t.Errorf("EditIssue IssueState = %+v", edited)
+	}
+
+	labels, err := is.AddLabels(ctx, "owner/repo.git", 11, []string{"bug", "p1"})
+	if err != nil {
+		t.Fatalf("AddLabels: %v", err)
+	}
+	if len(labels) != 2 || labels[0] != "bug" || labels[1] != "p1" {
+		t.Errorf("AddLabels = %v, want [bug p1]", labels)
+	}
+
+	if err := is.RemoveLabel(ctx, "owner/repo.git", 11, "bug"); err != nil {
+		t.Fatalf("RemoveLabel: %v", err)
+	}
+
+	// Fail-closed: a repo with no token configured must NOT call GitHub
+	// anonymously; it returns ErrUnauthorized before any request leaves.
+	noTokenAdapter := New(upstream.UpstreamConfig{Kind: "github", URL: srv.URL, CredentialsStore: emptyVault{}})
+	var unknownIssues port.IssueSupport = noTokenAdapter
+	if _, err := unknownIssues.CreateIssue(ctx, "owner/repo.git", "t", "b"); !errors.Is(err, port.ErrUnauthorized) {
+		t.Errorf("CreateIssue with no token err = %v, want ErrUnauthorized", err)
+	}
+}

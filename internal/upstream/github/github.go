@@ -22,12 +22,17 @@ import (
 	"github.com/psenna/git-proxy/internal/upstream/plain"
 )
 
-// Compile-time checks that the adapter satisfies both seams. The first is the
-// core seam (port.Upstream); the second is the optional capability seam
-// (port.PRSupport) the core never depends on — only type-asserting code does.
+// Compile-time checks that the adapter satisfies the core seam and both
+// optional capability seams. The first is the core seam (port.Upstream); the
+// next two are the optional capability seams (port.PRSupport for PRs / branch
+// protection, port.IssueSupport for the issue tracker) the core never depends
+// on — only type-asserting code does. PRSupport is sourced from the SCM
+// upstream; IssueSupport is the same adapter built separately as the
+// issue_upstream — the broker type-asserts each off its own upstream.
 var (
-	_ port.Upstream  = (*Adapter)(nil)
-	_ port.PRSupport = (*Adapter)(nil)
+	_ port.Upstream   = (*Adapter)(nil)
+	_ port.PRSupport  = (*Adapter)(nil)
+	_ port.IssueSupport = (*Adapter)(nil)
 )
 
 // Adapter is the GitHub SCM adapter. It embeds a plain HTTP upstream for the
@@ -197,6 +202,7 @@ func (a *Adapter) Checks(ctx context.Context, repo, ref string) (port.CheckSumma
 // restClient builds a REST client for repo's per-repo token. It fails closed
 // (returns an error, never an anonymous client) when no token is configured
 // for repo, and surfaces a malformed upstream URL (baseErr) the same way.
+// Shared by the PRSupport and IssueSupport methods.
 func (a *Adapter) restClient(repo string) (*rest.Client, error) {
 	if a.baseErr != nil {
 		return nil, a.baseErr
@@ -221,6 +227,137 @@ func (a *Adapter) tokenFor(repo string) (string, error) {
 		return "", port.ErrUnauthorized
 	}
 	return c.Token, nil
+}
+
+// CreateIssue opens an issue on repo with title and an optional body. GitHub
+// REST: POST /repos/{owner}/{repo}/issues. It is the create-side counterpart of
+// GetIssue: it returns the minimal port.Issue (Number + URL), while GetIssue/
+// ListIssues return the richer port.IssueState. The per-repo token is attached
+// only on the proxy→GitHub leg (fail-closed via restClient when absent).
+func (a *Adapter) CreateIssue(ctx context.Context, repo, title, body string) (port.Issue, error) {
+	c, err := a.restClient(repo)
+	if err != nil {
+		return port.Issue{}, err
+	}
+	issue, err := c.CreateIssue(ctx, repo, title, body)
+	if err != nil {
+		return port.Issue{}, err
+	}
+	return port.Issue{Number: issue.Number, URL: issue.URL}, nil
+}
+
+// GetIssue fetches a single issue by number and maps the rest shape to
+// port.IssueState. GitHub REST: GET /repos/{owner}/{repo}/issues/{number}.
+func (a *Adapter) GetIssue(ctx context.Context, repo string, number int) (port.IssueState, error) {
+	c, err := a.restClient(repo)
+	if err != nil {
+		return port.IssueState{}, err
+	}
+	st, err := c.GetIssue(ctx, repo, number)
+	if err != nil {
+		return port.IssueState{}, err
+	}
+	return toIssueState(st), nil
+}
+
+// ListIssues lists issues on repo filtered by state and maps each rest issue to
+// port.IssueState. The rest client filters out pull requests (GitHub models
+// every PR as an issue) so the result is issues only. GitHub REST:
+// GET /repos/{owner}/{repo}/issues?state={state}.
+func (a *Adapter) ListIssues(ctx context.Context, repo, state string) ([]port.IssueState, error) {
+	c, err := a.restClient(repo)
+	if err != nil {
+		return nil, err
+	}
+	issues, err := c.ListIssues(ctx, repo, state)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]port.IssueState, 0, len(issues))
+	for _, is := range issues {
+		out = append(out, toIssueState(is))
+	}
+	return out, nil
+}
+
+// CommentIssue adds a line comment to issue number. GitHub REST:
+// POST /repos/{owner}/{repo}/issues/{number}/comments.
+func (a *Adapter) CommentIssue(ctx context.Context, repo string, number int, body string) error {
+	c, err := a.restClient(repo)
+	if err != nil {
+		return err
+	}
+	return c.CommentIssue(ctx, repo, number, body)
+}
+
+// CloseIssue closes issue number. GitHub REST:
+// PATCH /repos/{owner}/{repo}/issues/{number} with {"state":"closed"}.
+func (a *Adapter) CloseIssue(ctx context.Context, repo string, number int) error {
+	c, err := a.restClient(repo)
+	if err != nil {
+		return err
+	}
+	return c.CloseIssue(ctx, repo, number)
+}
+
+// ReopenIssue reopens issue number. GitHub REST:
+// PATCH /repos/{owner}/{repo}/issues/{number} with {"state":"open"}.
+func (a *Adapter) ReopenIssue(ctx context.Context, repo string, number int) error {
+	c, err := a.restClient(repo)
+	if err != nil {
+		return err
+	}
+	return c.ReopenIssue(ctx, repo, number)
+}
+
+// EditIssue edits the title and/or body of issue number. An empty title or body
+// means "leave unchanged" (the rest client omits it from the PATCH). GitHub REST:
+// PATCH /repos/{owner}/{repo}/issues/{number}. Returns the updated issue.
+func (a *Adapter) EditIssue(ctx context.Context, repo string, number int, title, body string) (port.IssueState, error) {
+	c, err := a.restClient(repo)
+	if err != nil {
+		return port.IssueState{}, err
+	}
+	st, err := c.EditIssue(ctx, repo, number, title, body)
+	if err != nil {
+		return port.IssueState{}, err
+	}
+	return toIssueState(st), nil
+}
+
+// AddLabels adds labels to issue number and returns the resulting label set.
+// GitHub REST: POST /repos/{owner}/{repo}/issues/{number}/labels.
+func (a *Adapter) AddLabels(ctx context.Context, repo string, number int, labels []string) ([]string, error) {
+	c, err := a.restClient(repo)
+	if err != nil {
+		return nil, err
+	}
+	return c.AddLabels(ctx, repo, number, labels)
+}
+
+// RemoveLabel removes a single label from issue number. GitHub REST:
+// DELETE /repos/{owner}/{repo}/issues/{number}/labels/{name}.
+func (a *Adapter) RemoveLabel(ctx context.Context, repo string, number int, label string) error {
+	c, err := a.restClient(repo)
+	if err != nil {
+		return err
+	}
+	return c.RemoveLabel(ctx, repo, number, label)
+}
+
+// toIssueState maps the rest-internal IssueState to port.IssueState. The fields
+// line up one-for-one; the mapping is explicit (rather than a shared struct) so
+// the rest package stays a pure GitHub client with no port dependency for its
+// response shapes, matching toPRState/toCheckSummary.
+func toIssueState(s rest.IssueState) port.IssueState {
+	return port.IssueState{
+		Number: s.Number,
+		Title:  s.Title,
+		State:  s.State,
+		Body:   s.Body,
+		URL:    s.URL,
+		Labels: s.Labels,
+	}
 }
 
 // toPRState maps the rest-internal PR shape to port.PRState. The fields line up
