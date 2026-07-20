@@ -24,5 +24,11 @@ git config --global http."http://git-proxy:8080/".extraHeader "Authorization: Be
 mkdir -p /workspace/.claude/skills/use-git-proxy
 cp /opt/skills/use-git-proxy/SKILL.md /workspace/.claude/skills/use-git-proxy/SKILL.md
 
+# Make the agent aware of its rootless DinD environment. CLAUDE.md is always
+# loaded by Claude Code (project root); the use-docker skill is on-demand.
+cp /opt/agent-context/CLAUDE.md /workspace/CLAUDE.md
+mkdir -p /workspace/.claude/skills/use-docker
+cp /opt/skills/use-docker/SKILL.md /workspace/.claude/skills/use-docker/SKILL.md
+
 # The compose `command` (or `docker compose run --rm claude "<prompt>"`) becomes $@.
 exec claude -p "$@"

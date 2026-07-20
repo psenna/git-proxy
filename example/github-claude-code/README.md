@@ -81,6 +81,92 @@ still denied (writes always require a credential profile). The example config
 does not set `public_repos`; every repo the agent reaches is profiled in
 `credentials.yaml`.
 
+## Docker for the agent (rootless Docker-in-Docker via sysbox)
+
+The `claude` agent can run arbitrary container images — node, python, golang,
+postgres, minio, anything — by issuing `docker run …` from inside its container.
+A rootless Docker-in-Docker daemon (the `docker` compose service) provides this,
+isolated from git-proxy's credentials.
+
+### Host prerequisite (hard): install sysbox on a Linux host
+
+The `docker` service uses `runtime: sysbox-runc`. Sysbox (Nestybox **sysbox-ce**,
+open source, `github.com/nestybox/sysbox`) must be installed on the host running
+`docker compose`:
+
+- **Linux host with systemd**, kernel ≥ 4.18. **Not Docker Desktop** on macOS or
+  Windows — its Linux VM cannot add a custom runtime. On macOS/Windows, run this
+  example on a Linux VM or server.
+- Install via Nestybox's apt/rpm repo or the `.deb`/`.rpm` package from the
+  sysbox-ce GitHub releases. The installer registers sysbox with Docker
+  (`/etc/docker/daemon.json` → `runtimes`) and restarts Docker.
+- Verify:
+  ```sh
+  docker info | grep -i sysbox    # shows the registered runtime
+  docker run --runtime=sysbox-runc --rm alpine echo ok
+  ```
+
+If sysbox is not installed, `docker compose up` fails with
+`runtime sysbox-runc not found` for the `docker` service.
+
+### What was added
+
+- A **`docker` service** (`docker:27-dind`, `runtime: sysbox-runc`, **no
+  `--privileged`**) running the daemon on TCP `2375`, on an isolated **`dinernet`**
+  bridge. `git-proxy` is on `proxynet` only — it is NOT on `dinernet`.
+- The **`claude` service** joins both `proxynet` and `dinernet`, gets the docker
+  CLI client, and sets `DOCKER_HOST=tcp://docker:2375`.
+- A shared **`workspace` named volume** mounted at `/workspace` in BOTH `claude`
+  and `docker` — the only file-exchange point between the agent and the containers
+  it launches.
+- A **`CLAUDE.md`** (always loaded by Claude Code) and a **`use-docker`** skill
+  that the entrypoint drops into `/workspace`, so the agent knows it has Docker
+  and how to use it.
+
+### How the agent uses it
+
+```sh
+# Inside the claude container (your repo is already at /workspace):
+docker run --rm -v /workspace:/work -w /work node:22-alpine node script.js
+docker run --rm -v /workspace:/work -w /work python:3-alpine python script.py
+docker run --rm -v /workspace:/work -w /work golang:1-alpine go test ./...
+```
+
+**The one rule:** `/workspace` is the only path shared with workload containers.
+Files a container must read/write live under `/workspace` (mount it as
+`-v /workspace:/work`). Bind-mounting any other path silently mounts an empty
+directory — the daemon is in a separate container and cannot see the agent's
+filesystem outside the shared volume.
+
+### Security model
+
+The DinD daemon runs as **root inside the sysbox sandbox**, but sysbox's
+user-namespace mapping maps that in-container root to an **unprivileged host
+user**. The daemon has **no host privileges**, **no access to host devices**, and
+**cannot see git-proxy's bind mounts** (including `credentials.yaml`).
+Additionally, `git-proxy` is on `proxynet` only — it has no interface on
+`dinernet` — so a compromised daemon has no network route to the proxy either.
+
+This is "rootless from the host's perspective" (no privileged container, no host
+root), which is the property that protects the credential-isolation model. It is
+*not* rootless in the `rootlesskit`/rootless-dockerd sense (the dockerd process
+itself is root inside its sandbox); that stronger property is achievable but
+unnecessary here.
+
+### Troubleshooting
+
+- **`runtime sysbox-runc not found`** on `docker compose up` → sysbox is not installed
+  on the host. Install it (see above) and restart Docker.
+- **`docker run -v /some/other/path:/x …` shows empty files** → only `/workspace`
+  is shared. Put the files under `/workspace` and mount `-v /workspace:/work`.
+- **`Cannot connect to the Docker daemon` from the agent** → the `docker` service
+  is still starting. `docker compose up` waits for its healthcheck before
+  starting `claude` (`depends_on: service_healthy`); if you `exec` in during a
+  window, wait a few seconds and retry.
+- **Image-pull / overlay errors inside the daemon** → on some filesystems the
+  daemon's default `overlay2` storage driver may need `vfs`. Add
+  `--storage-driver=vfs` to the `docker` service `command:` list and retry.
+
 ## 2. Bring the stack up
 
 ```sh
@@ -148,7 +234,7 @@ grep -E 'ghp_|x-access-token' data/audit/audit.jsonl && echo "LEAK!" || echo "no
 ## 6. Tear it down
 
 ```sh
-docker compose down -v      # -v removes the claude-work volume too
+docker compose down -v      # -v removes the workspace and docker-cache volumes too
 sudo rm -rf data            # local runtime state
 ```
 
