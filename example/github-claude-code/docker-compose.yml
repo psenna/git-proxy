@@ -35,11 +35,41 @@ services:
     networks:
       - proxynet
 
+  # Rootless Docker-in-Docker daemon. The agent (claude) uses it to run arbitrary
+  # images (node, python, golang, postgres, minio, …) via DOCKER_HOST. Runs under
+  # the sysbox runtime with NO --privileged: sysbox user-namespace mapping makes
+  # the inner dockerd unprivileged on the host, so it cannot access host devices
+  # or git-proxy's bind mounts (incl. credentials.yaml). It is on dinernet ONLY —
+  # git-proxy is not on dinernet, so a compromised daemon has no route to the proxy.
+  # Host prerequisite: sysbox must be installed on a Linux host (see README).
+  docker:
+    image: docker:27-dind
+    runtime: sysbox-runc
+    container_name: github-claude-dind
+    # The docker:dind entrypoint (dockerd-entrypoint.sh) execs `dockerd "$@"`, so
+    # `command:` is the dockerd args. Listen on TCP for cross-container access on
+    # dinernet AND on the unix socket for the in-container healthcheck.
+    command: ["--host=tcp://0.0.0.0:2375", "--host=unix:///var/run/docker.sock"]
+    volumes:
+      - docker-cache:/var/lib/docker   # image/layer cache survives restarts
+      - workspace:/workspace           # shared with claude (the exchange point)
+    networks:
+      - dinernet
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
   claude:
     build: ./claude-code
     container_name: github-claude-agent
     depends_on:
-      - git-proxy
+      git-proxy:
+        condition: service_started
+      docker:
+        condition: service_healthy
     # Headless: the prompt IS the compose `command`. The container runs once and
     # exits. Override with `docker compose run --rm claude "<your prompt>"` to
     # drive a different task (the entrypoint passes $@ to `claude -p`).
@@ -56,7 +86,7 @@ services:
       ANTHROPIC_MODEL: "${OLLAMA_MODEL:-gpt-oss:120b}"
       ANTHROPIC_DEFAULT_HAIKU_MODEL: "${OLLAMA_MODEL:-gpt-oss:120b}"
       CLAUDE_CODE_ATTRIBUTION_HEADER: "0"            # keeps prompt caching valid on non-Anthropic backends
-      CLAUDE_CONFIG_DIR: "/home/claude/.claude-ollama"  # isolate config from any host claude.ai auth
+      CLAUDE_CONFIG_DIR: "/home/node/.claude-ollama"  # isolate config from any host claude.ai auth
       # --- git-proxy legs (consumed by the entrypoint + the use-git-proxy skill) ---
       AGENT_TOKEN: "${AGENT_TOKEN}"                  # the agent's Bearer to the proxy
       GITHUB_REPO: "${GITHUB_REPO}"                  # owner/repo.git the agent clones
@@ -64,14 +94,21 @@ services:
       GIT_PROXY_BROKER_URL: "http://git-proxy:8090"
       GIT_PROXY_TOKEN: "${AGENT_TOKEN}"
       GIT_PROXY_HEADER: "http.extraheader=Authorization: Bearer ${AGENT_TOKEN}"
+      # Docker client -> the rootless DinD daemon on the isolated dinernet.
+      DOCKER_HOST: "tcp://docker:2375"
+      DOCKER_TLS_VERIFY: ""
     volumes:
-      - claude-work:/workspace
+      - workspace:/workspace
     networks:
       - proxynet
+      - dinernet
 
 networks:
   proxynet:
     driver: bridge
+  dinernet:
+    driver: bridge
 
 volumes:
-  claude-work: {}
+  workspace: {}
+  docker-cache: {}
