@@ -7,6 +7,9 @@
 # What this does:
 #   1. Installs Docker Engine + the compose plugin NATIVELY via apt (sysbox does
 #      not work with snap Docker — it refuses, and the daemon can't see the runtime).
+#      Pinned to Docker Engine 28.x + containerd 1.7.x (the combo sysbox-ce
+#      v${SYSBOX_VER} is validated against) and HELD so an `apt upgrade` can't
+#      bump them to an incompatible major (e.g. containerd 2.x) and break sysbox.
 #   2. Installs jq (required by the sysbox installer).
 #   3. Installs sysbox-ce from the official Nestybox .deb. The installer registers
 #      the `sysbox-runc` runtime with Docker (/etc/docker/daemon.json) and SIGHUPs
@@ -22,8 +25,9 @@
 #     kernels; for kernel >= 6.3 it is not even needed (ID-mapped mounts are used).
 #   - Run with sudo (root).
 #
-# Re-running is safe: it skips Docker if already installed natively, skips sysbox
-# if `sysbox-runc` is already registered, and only downloads/installs what's missing.
+# Re-running is safe: it skips Docker only if docker-ce + containerd.io are already
+# installed, HELD, and on the pinned majors (otherwise it (re)pins them); skips
+# sysbox if `sysbox-runc` is already registered; and only downloads what's missing.
 #
 # Usage:
 #   sudo bash example/github-claude-code/setup-ubuntu-host.sh
@@ -33,7 +37,9 @@
 set -euo pipefail
 
 # ---- tunables ---------------------------------------------------------------
-SYSBOX_VER="0.7.0"   # sysbox-ce release; bump here when a newer version is out.
+SYSBOX_VER="0.7.0"        # sysbox-ce release; bump here when a newer version is out.
+DOCKER_MAJOR="28"         # pin docker-ce + docker-ce-cli to this major (sysbox-ce v0.7.0).
+CONTAINERD_MAJOR="1.7"    # pin containerd.io to this series (NOT 2.x — sysbox-ce v0.7.0).
 # ----------------------------------------------------------------------------
 
 log()  { printf '\n\033[1;34m[setup]\033[0m %s\n' "$*"; }
@@ -69,8 +75,19 @@ fi
 ok "kernel: $(uname -r) (>= 4.18)"
 
 # ---- 1. Docker Engine + compose plugin (native apt, NOT snap) ---------------
+
+# Resolve the newest available version of $1 whose upstream version starts with $2
+# (e.g. resolve_ver docker-ce 28 → 28.1.3-1~ubuntu.24.04~noble). Reads from the
+# Docker apt repo already added to sources.list. Empty result = no matching version.
+resolve_ver() {
+  apt-cache madison "$1" 2>/dev/null \
+    | awk -F'|' '{gsub(/^ +| +$/,"",$2); print $2}' \
+    | grep -E "^$(printf '%s' "$2" | sed 's/\./\\./g')\." \
+    | sort -V | tail -n1
+}
+
 install_docker() {
-  log "Installing Docker Engine + compose plugin (native apt)…"
+  log "Installing Docker Engine ${DOCKER_MAJOR}.x + containerd ${CONTAINERD_MAJOR}.x (native apt, pinned + held)…"
   apt-get update -y
   apt-get install -y ca-certificates curl gnupg
   install -m0755 -d /etc/apt/keyrings
@@ -82,8 +99,25 @@ install_docker() {
   echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${ID} ${CODENAME} stable" \
     > /etc/apt/sources.list.d/docker.list
   apt-get update -y
-  apt-get install -y docker-ce docker-ce-cli containerd.io \
-                    docker-buildx-plugin docker-compose-plugin
+
+  # Pin to the sysbox-validated majors. Resolve the newest patch in each series so
+  # we always install the latest security fix within the major (not a frozen .0).
+  DOCKER_VER="$(resolve_ver docker-ce "${DOCKER_MAJOR}")"
+  CLI_VER="$(resolve_ver docker-ce-cli "${DOCKER_MAJOR}")"
+  CONTAINERD_VER="$(resolve_ver containerd.io "${CONTAINERD_MAJOR}")"
+  [[ -n "$DOCKER_VER" ]]     || die "no docker-ce ${DOCKER_MAJOR}.* found in the Docker apt repo for ${ID} ${CODENAME}."
+  [[ -n "$CLI_VER" ]]        || die "no docker-ce-cli ${DOCKER_MAJOR}.* found in the Docker apt repo."
+  [[ -n "$CONTAINERD_VER" ]] || die "no containerd.io ${CONTAINERD_MAJOR}.* found in the Docker apt repo (it may only ship containerd 2.x now). Pin a newer CONTAINERD_MAJOR only if a sysbox-ce release validates it."
+
+  log "pinning docker-ce=${DOCKER_VER}  docker-ce-cli=${CLI_VER}  containerd.io=${CONTAINERD_VER}"
+  apt-get install -y \
+    "docker-ce=${DOCKER_VER}" "docker-ce-cli=${CLI_VER}" "containerd.io=${CONTAINERD_VER}" \
+    docker-buildx-plugin docker-compose-plugin
+
+  # Hold the pinned packages so `apt upgrade` can't bump them to a major sysbox
+  # isn't validated against (e.g. containerd 2.x). Unhold with
+  # `apt-mark unhold docker-ce docker-ce-cli containerd.io` to upgrade on purpose.
+  apt-mark hold docker-ce docker-ce-cli containerd.io
 }
 
 # Refuse snap Docker outright — sysbox cannot work with it.
@@ -94,11 +128,27 @@ if command -v docker >/dev/null 2>&1; then
   fi
 fi
 
-if docker version >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-  ok "Docker Engine + compose plugin already installed ($(docker version --format '{{.Server.Version}}' 2>/dev/null || echo present))."
+# True only if docker-ce + containerd.io are installed, HELD, and on the pinned
+# majors. Anything else (missing, unpinned, or a wrong major — e.g. docker 29 or
+# containerd 2.x) triggers a (re)install to the pinned versions.
+docker_pinned_ok() {
+  dpkg-query -W -f='${Status}' docker-ce 2>/dev/null | grep -qx 'install ok installed' || return 1
+  dpkg-query -W -f='${Status}' containerd.io 2>/dev/null | grep -qx 'install ok installed' || return 1
+  local dver cver
+  dver="$(dpkg-query -W -f='${Version}' docker-ce 2>/dev/null)"
+  cver="$(dpkg-query -W -f='${Version}' containerd.io 2>/dev/null)"
+  [[ "$dver" == ${DOCKER_MAJOR}.* ]] || return 1
+  [[ "$cver" == ${CONTAINERD_MAJOR}.* ]] || return 1
+  apt-mark showhold 2>/dev/null | grep -qx docker-ce || return 1
+  apt-mark showhold 2>/dev/null | grep -qx containerd.io || return 1
+  command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1
+}
+
+if docker_pinned_ok; then
+  ok "Docker Engine ${DOCKER_MAJOR}.x + containerd ${CONTAINERD_MAJOR}.x already installed and held ($(docker version --format '{{.Server.Version}}' 2>/dev/null || echo present))."
 else
   install_docker
-  ok "Docker Engine + compose plugin installed."
+  ok "Docker Engine + compose plugin installed (docker-ce ${DOCKER_MAJOR}.x, containerd ${CONTAINERD_MAJOR}.x) and held."
 fi
 
 # Ensure the docker group exists and the calling user is in it (so they can run
@@ -208,4 +258,8 @@ Then run the E2E checks (see the README "Docker for the agent" section and the
 verification runbook), e.g.:
   docker compose exec claude sh -c 'docker run --rm -v /workspace:/work -w /work node:22-alpine node -e "console.log(42)"'
 
+Pinned packages are held so an 'apt upgrade' won't bump them to a major sysbox
+isn't validated against:
+  apt-mark showhold                                            # docker-ce, docker-ce-cli, containerd.io
+  sudo apt-mark unhold docker-ce docker-ce-cli containerd.io   # before upgrading them on purpose
 EOF
