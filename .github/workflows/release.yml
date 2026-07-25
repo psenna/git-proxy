@@ -1,0 +1,52 @@
+name: release
+
+# Build the git-proxy Docker image and publish it to the GitHub Container
+# Registry (GHCR) when a GitHub Release is published. The image is tagged with
+# the release tag (verbatim, e.g. release tag "v1.0.0" → ghcr.io/<owner>/git-proxy:v1.0.0).
+#
+# Safety: this workflow only runs on the canonical repository AND only for
+# releases cut from `main`. Forks and releases created from other branches are
+# skipped (the job-level `if` below no-ops them).
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read    # checkout the tagged commit
+  packages: write   # push the image to ghcr.io
+
+jobs:
+  docker-publish:
+    name: publish docker image to GHCR
+    runs-on: ubuntu-latest
+    # Only the canonical repo, and only releases whose target branch is main.
+    # github.event.release.target_commitish is the branch the release was created
+    # from; a release cut from a feature branch is skipped here.
+    if: github.repository == 'psenna/git-proxy' && github.event.release.target_commitish == 'main'
+    steps:
+      - name: checkout release tag
+        # actions/checkout defaults to the ref that triggered the event — for a
+        # release, that is the tag's commit (detached HEAD). We build exactly the
+        # tagged source, not whatever main points at when the run starts.
+        uses: actions/checkout@v4
+
+      - name: log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # The release tag verbatim, as the image tag.
+          tags: ghcr.io/${{ github.repository_owner }}/git-proxy:${{ github.event.release.tag_name }}
+          # Keep the manifest a classic single-platform image (no provenance
+          # attestation manifest list) so it matches what `docker build` produces
+          # locally and what the example compose consumes.
+          provenance: false
