@@ -1,13 +1,15 @@
-# docker compose stack: Claude Code (on Ollama Cloud) -> git-proxy -> real GitHub.
+# docker compose stack: Claude Code (via Ollama Cloud) → git-proxy → real GitHub.
 #
 # Topology:
+#   ollama (daemon) serves Anthropic-compatible /v1/messages on :11434
+#     └── proxies :cloud models to ollama.com (authenticated via OLLAMA_API_KEY)
+#   claude (agent) → http://ollama:11434 (Anthropic-compatible API)
 #   claude (agent) --8080(git)/8090(broker)--> git-proxy --https--> github.com
 #     git insteadOf rewrites https://github.com/<x> -> http://git-proxy:8080/<x>
 #     http.extraHeader attaches the agent Bearer
-#   claude --> https://ollama.com   (Ollama Cloud, Anthropic-compatible /v1/messages)
 #
 # The agent never sees the GitHub PAT: git-proxy holds it in credentials.yaml and
-# attaches it on the proxy->GitHub leg (HTTP Basic for the git protocol, Bearer for
+# attaches it on the proxy→GitHub leg (HTTP Basic for the git protocol, Bearer for
 # the broker REST leg). The agent authenticates to the proxy with a Bearer token
 # (auth.tokens in config.yaml).
 #
@@ -15,6 +17,28 @@
 # so you must supply a GitHub PAT and an Ollama Cloud API key. See ./README.md.
 
 services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: github-claude-ollama
+    # The Ollama daemon serves the Anthropic-compatible /v1/messages endpoint.
+    # Cloud models (:cloud suffix) are proxied to ollama.com using OLLAMA_API_KEY.
+    # Local models are downloaded and run on-device.
+    # No host port mapping needed — the claude container reaches Ollama via the
+    # shared proxynet Docker network (http://ollama:11434).
+    environment:
+      OLLAMA_API_KEY: "${OLLAMA_API_KEY}"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - proxynet
+    # The ollama image has no curl; use bash's /dev/tcp to check the daemon is up.
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/11434'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+
   git-proxy:
     build:
       context: ../..
@@ -66,6 +90,8 @@ services:
     build: ./claude-code
     container_name: github-claude-agent
     depends_on:
+      ollama:
+        condition: service_healthy
       git-proxy:
         condition: service_started
       docker:
@@ -73,18 +99,20 @@ services:
     # Headless: the prompt IS the compose `command`. The container runs once and
     # exits. Override with `docker compose run --rm claude "<your prompt>"` to
     # drive a different task (the entrypoint passes $@ to `claude -p`).
+    # For an interactive session: `docker compose run --rm claude` (no command)
+    # drops into an interactive Claude Code shell.
     command:
       - >-
         Clone the repo from https://github.com/${GITHUB_REPO}, create a branch
         feat/example, add hello.txt, push it, then open a PR via the broker (use
         the use-git-proxy skill).
     environment:
-      # --- Ollama Cloud (Anthropic-compatible endpoint) ---
-      ANTHROPIC_BASE_URL: "https://ollama.com"
-      ANTHROPIC_AUTH_TOKEN: "${OLLAMA_API_KEY}"      # = OLLAMA_API_KEY; sent as Bearer to Ollama
-      ANTHROPIC_API_KEY: ""                          # empty: Claude Code must not fall back to an Anthropic login
-      ANTHROPIC_MODEL: "${OLLAMA_MODEL:-gpt-oss:120b}"
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: "${OLLAMA_MODEL:-gpt-oss:120b}"
+      # --- Ollama daemon (Anthropic-compatible /v1/messages) ---
+      ANTHROPIC_BASE_URL: "http://ollama:11434"     # local Ollama daemon (Anthropic-compatible)
+      ANTHROPIC_AUTH_TOKEN: "ollama"                 # fixed token for local Ollama (not a real secret)
+      ANTHROPIC_API_KEY: ""                          # empty: no Anthropic cloud fallback
+      ANTHROPIC_MODEL: "${OLLAMA_MODEL:-glm-5.1:cloud}"
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: "${OLLAMA_MODEL:-glm-5.1:cloud}"
       CLAUDE_CODE_ATTRIBUTION_HEADER: "0"            # keeps prompt caching valid on non-Anthropic backends
       CLAUDE_CONFIG_DIR: "/home/node/.claude-ollama"  # isolate config from any host claude.ai auth
       # --- git-proxy legs (consumed by the entrypoint + the use-git-proxy skill) ---
@@ -110,5 +138,6 @@ networks:
     driver: bridge
 
 volumes:
+  ollama-data: {}
   workspace: {}
   docker-cache: {}

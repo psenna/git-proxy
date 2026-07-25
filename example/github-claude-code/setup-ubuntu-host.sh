@@ -80,10 +80,14 @@ ok "kernel: $(uname -r) (>= 4.18)"
 # (e.g. resolve_ver docker-ce 28 → 28.1.3-1~ubuntu.24.04~noble). Reads from the
 # Docker apt repo already added to sources.list. Empty result = no matching version.
 resolve_ver() {
-  apt-cache madison "$1" 2>/dev/null \
-    | awk -F'|' '{gsub(/^ +| +$/,"",$2); print $2}' \
-    | grep -E "^$(printf '%s' "$2" | sed 's/\./\\./g')\." \
-    | sort -V | tail -n1
+    local pkg="$1"
+    local major="$2"
+
+    apt-cache madison "$pkg" |
+        awk -F'|' '{gsub(/^ +| +$/, "", $2); print $2}' |
+        grep -E "^([0-9]+:)?${major//./\\.}\." |
+        sort -V |
+        tail -1
 }
 
 install_docker() {
