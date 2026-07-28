@@ -3,10 +3,34 @@ package rules
 import (
 	"fmt"
 
+	"github.com/psenna/git-proxy/internal/pathmatch"
 	"github.com/psenna/git-proxy/internal/policy"
 	"github.com/psenna/git-proxy/internal/port"
 	"github.com/psenna/git-proxy/internal/secret/regex"
 )
+
+// builtinIgnorePaths are repo-relative paths secret_scan NEVER scans. They are
+// universally non-secret integrity/lockfile manifests whose high-entropy hashes
+// trip the entropy heuristic but carry no secret material:
+//   - go.sum / go.mod: Go module integrity hashes (h1:<base64-SHA256>) and the
+//     module graph — mandatory, published, reproducible. A go.sum h1: hash is a
+//     44-char base64 run that always satisfies the {40,} length gate and the
+//     >=4.5 entropy threshold, so without this ignore it is a permanent false
+//     positive that blocks every Go push touching go.sum.
+//   - *-lock files: npm/yarn/pnpm/Cargo/composer/poetry dependency lockfiles
+//     carry sha512 integrity hashes with the same problem.
+//
+// A pattern with no '/' matches at any depth in pathmatch, so a nested module's
+// go.sum or a vendored lockfile is also exempt. This mirrors how the scanner
+// ships built-in DETECTION patterns that cannot be removed; operators extend
+// the ignore set with the ignore_paths param (which adds to, never replaces,
+// these built-ins). Built-ins are trusted constants and not validated; only
+// operator ignore_paths entries are fail-closed-validated in newSecretScanRule.
+var builtinIgnorePaths = []string{
+	"go.sum", "go.mod",
+	"package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+	"Cargo.lock", "composer.lock", "poetry.lock",
+}
 
 const secretScanName = "secret_scan"
 
@@ -36,6 +60,20 @@ func newSecretScanRule(cfg policy.RuleConfig) port.Rule {
 		return r
 	}
 	r.scanner = sc
+	// ignore_paths extends the built-in ignore set (builtinIgnorePaths). Both
+	// are gitignore-style path patterns (internal/pathmatch); a pattern with no
+	// '/' matches at any depth. Fail-closed on a malformed configured pattern
+	// (the built-ins are trusted constants, not validated) so a typo never
+	// silently disables the ignore — same shape as path_acl's deny and
+	// secret_scan's extra_patterns compile errors.
+	ignorePaths := parseStringList(cfg.Params, "ignore_paths")
+	for _, p := range ignorePaths {
+		if pathmatch.IsMalformed(p) {
+			r.compileErr = fmt.Errorf("secret_scan: malformed ignore_paths pattern %q", p)
+			return r
+		}
+	}
+	r.ignore = pathmatch.New(append(append([]string{}, builtinIgnorePaths...), ignorePaths...))
 	return r
 }
 
@@ -45,7 +83,8 @@ func newSecretScanRule(cfg policy.RuleConfig) port.Rule {
 // scanning — Task 9).
 type secretScanRule struct {
 	scanner    port.SecretScanner
-	compileErr error // set when an extra pattern failed to compile
+	ignore     *pathmatch.Matcher // built-in + ignore_paths; nil only when compileErr is set
+	compileErr error              // set when an extra pattern or ignore_paths pattern failed to compile
 }
 
 func (r *secretScanRule) Name() string { return secretScanName }
@@ -58,6 +97,14 @@ func (r *secretScanRule) EvaluatePush(req port.PushRequest) (port.Decision, erro
 		return policy.Allow(), nil
 	}
 	for _, f := range req.ChangedFiles {
+		// Skip files in the ignore set (built-in manifests + operator
+		// ignore_paths) BEFORE scanning. go.sum/go.mod/lockfiles carry
+		// high-entropy integrity hashes that are not secrets; scanning them
+		// is a permanent false positive. The matcher is always non-nil here
+		// (built-ins), but guard for the compileErr path where it is nil.
+		if r.ignore != nil && r.ignore.Match(f.Path) {
+			continue
+		}
 		// Only scan added/modified blobs with content. Deleted files have no
 		// new blob to scan.
 		if f.Status == "D" || len(f.Content) == 0 {
