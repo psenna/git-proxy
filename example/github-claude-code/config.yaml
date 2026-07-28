@@ -73,6 +73,13 @@ policy:
         allow: ["refs/heads/main", "refs/heads/feat/*"]  # only these refs may be pushed
     secret_scan:
       enabled: true                 # redacted reasons; matched secret never reaches agent/audit/alert
+      # Built-in ignore set (always applied, not removable): go.sum, go.mod,
+      # package-lock.json, yarn.lock, pnpm-lock.yaml, Cargo.lock, composer.lock,
+      # poetry.lock. These carry high-entropy integrity hashes (h1:/sha512-) that
+      # trip the entropy heuristic but are published, mandatory, non-secret. A
+      # pattern with no '/' matches at any depth (nested module go.sum is covered).
+      # params:
+      #   ignore_paths: ["third-party/**/*.sum"]   # extends the built-ins (fail-closed on a malformed pattern)
   read:
     deny: ["secrets/**"]            # withhold secrets/ blobs from fetch (use --filter=blob:none to clone)
 
