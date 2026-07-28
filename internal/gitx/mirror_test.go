@@ -317,3 +317,97 @@ func TestMirror_ConcurrentRefreshIngestIsAncestorNoLockError(t *testing.T) {
 		}
 	}
 }
+// makeThinPackfile builds a THIN packfile: objects reachable from `want` but
+// NOT from `not`, with deltas allowed against the excluded `not` objects (which
+// the receiver is assumed to already have). This is what `git push` over HTTP
+// actually sends — unlike makePackfile, which builds a self-contained full pack.
+func makeThinPackfile(t *testing.T, dir, want, not string) []byte {
+	t.Helper()
+	cmd := exec.Command("git", "-C", dir,
+		"-c", "pack.window=100", "-c", "pack.depth=50",
+		"pack-objects", "--stdout", "--thin", "--revs")
+	cmd.Stdin = strings.NewReader(want + "\n^" + not + "\n")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("pack-objects --thin --revs: %v", err)
+	}
+	if out.Len() == 0 {
+		t.Fatalf("pack-objects --thin produced no bytes for want=%s not=%s", want, not)
+	}
+	return out.Bytes()
+}
+
+// TestMirrorIngestThinPack verifies IngestPackfile can ingest a THIN pack — the
+// kind `git push` over HTTP sends — whose deltas reference bases the mirror
+// already has. Before --fix-thin was added to index-pack, this failed with
+// "fatal: pack has N unresolved deltas" and every follow-up branch push was
+// rejected with an opaque "inspection failed" (the first push of a branch
+// happened to send a non-thin pack and passed; subsequent pushes were thin and
+// failed). See internal/gitproto/proxy.go "inspection failed".
+func TestMirrorIngestThinPack(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	// A large base blob so the tip's small modification deltas against it —
+	// delta creation must be deterministic for the thin-pack condition to
+	// reproduce (tiny one-line files don't always produce deltas).
+	source := t.TempDir()
+	mustGit(t, "", "init", "-q", "-b", "main", source)
+	mustGit(t, source, "config", "user.email", "test@example.com")
+	mustGit(t, source, "config", "user.name", "Test")
+	base := strings.Repeat("base content line\n", 400)
+	if err := os.WriteFile(filepath.Join(source, "big.txt"), []byte(base), 0o644); err != nil {
+		t.Fatalf("write big.txt: %v", err)
+	}
+	mustGit(t, source, "add", "big.txt")
+	mustGit(t, source, "commit", "-q", "-m", "base B")
+	B := revParseHead(t, source)
+
+	// Upstream (bare) has only B — push B before creating the tip.
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+
+	// Tip T: small append to big.txt, committed on main, NOT pushed upstream.
+	tip := base + "extra line at end\n"
+	if err := os.WriteFile(filepath.Join(source, "big.txt"), []byte(tip), 0o644); err != nil {
+		t.Fatalf("write big.txt tip: %v", err)
+	}
+	mustGit(t, source, "add", "big.txt")
+	mustGit(t, source, "commit", "-q", "-m", "tip T")
+	T := revParseHead(t, source)
+
+	// Thin pack of T excluding B — exactly what a client push of T sends.
+	pack := makeThinPackfile(t, source, T, B)
+
+	// Sanity guard: confirm the pack is genuinely thin/dependent (a delta base
+	// is omitted) by failing to index it standalone in an empty bare repo. If
+	// git instead produced a self-contained pack, the regression can't be
+	// reproduced here — skip rather than pass vacuously.
+	emptyBare := t.TempDir()
+	mustGit(t, "", "init", "--bare", "-q", emptyBare)
+	standalone := exec.Command("git", "-C", emptyBare, "index-pack", "--stdin")
+	standalone.Stdin = bytes.NewReader(pack)
+	if err := standalone.Run(); err == nil {
+		t.Skip("git produced a self-contained pack (no delta against B); cannot reproduce thin-pack regression")
+	}
+
+	// Mirror holds B (cloned + Refreshed from the upstream); T is absent.
+	root := t.TempDir()
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", root, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := m.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	// Without --fix-thin this returned "fatal: pack has N unresolved deltas".
+	if err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
+		t.Fatalf("IngestPackfile(thin pack) = %v; index-pack must run with --fix-thin", err)
+	}
+	if ok, err := m.IsAncestor(ctx, B, T); err != nil || !ok {
+		t.Fatalf("after Ingest thin pack, IsAncestor(B,T) = (%v, %v), want (true, nil)", ok, err)
+	}
+}
