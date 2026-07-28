@@ -142,18 +142,31 @@ func (m *Mirror) Refresh(ctx context.Context) error {
 }
 
 // IngestPackfile writes a pushed packfile's objects into the mirror's object
-// store via `git index-pack --stdin` WITHOUT updating any ref. After this, both
-// the old (from Refresh) and the new (from the pack) objects are present for
-// ancestry walks. The packfile is read to EOF from r. The per-mirror mutex is
-// held so index-pack does not race a concurrent Refresh or another IngestPackfile
-// on the same bare dir.
+// store via `git index-pack --stdin --fix-thin` WITHOUT updating any ref. After
+// this, both the old (from Refresh) and the new (from the pack) objects are
+// present for ancestry walks. The packfile is read to EOF from r. The
+// per-mirror mutex is held so index-pack does not race a concurrent Refresh or
+// another IngestPackfile on the same bare dir.
+//
+// --fix-thin is required: `git push` over HTTP sends a THIN pack — deltas
+// reference bases the receiver is assumed to already have. Plain
+// `index-pack --stdin` (without --fix-thin) refuses to complete a thin pack
+// and fails with "fatal: pack has N unresolved deltas", so every follow-up
+// push to a branch (whose pack is thin against the just-pushed objects) was
+// rejected with an opaque "inspection failed". --fix-thin makes index-pack
+// copy the referenced bases from the mirror's object store into the pack
+// before indexing — exactly what real `receive-pack` does (it always invokes
+// `index-pack --stdin --fix-thin`). The bases are present in the mirror:
+// Refresh fetched them from the upstream, and prior IngestPackfile calls
+// wrote the previously-pushed objects. --fix-thin is a no-op on an
+// already-complete (non-thin) pack, so this is backward-compatible.
 func (m *Mirror) IngestPackfile(ctx context.Context, r io.Reader) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cmd := exec.CommandContext(ctx, "git", "-C", m.dir, "index-pack", "--stdin")
+	cmd := exec.CommandContext(ctx, "git", "-C", m.dir, "index-pack", "--stdin", "--fix-thin")
 	cmd.Stdin = r
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("gitx: index-pack --stdin: %w: %s", err, redactCreds(strings.TrimSpace(string(out))))
+		return fmt.Errorf("gitx: index-pack --stdin --fix-thin: %w: %s", err, redactCreds(strings.TrimSpace(string(out))))
 	}
 	return nil
 }
