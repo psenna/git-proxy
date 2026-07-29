@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -107,6 +108,42 @@ func uploadPackRequestFilter(t *testing.T, tip string, sideband bool) *gitproto.
 	// "filter blob:none" cap appears as two entries. Appending them here
 	// reproduces that tokenization; clientRequestedFilter matches on "filter".
 	req.Caps = append(req.Caps, "filter", "blob:none")
+	return req
+}
+
+// uploadPackRequestDeepen builds a v0 upload-pack request wanting tip with a
+// `deepen <N>` directive (in the want-list section, before the first flush),
+// followed by `done`. Used by the shallow-preamble unit test to exercise the
+// enforce path's shallow computation + preamble emission. When sideband=false,
+// side-band-64k is omitted.
+func uploadPackRequestDeepen(t *testing.T, tip string, depth int, sideband bool) *gitproto.UploadPackRequest {
+	t.Helper()
+	var buf bytes.Buffer
+	e := pktline.NewEncoder(&buf)
+	caps := "ofs-delta thin-pack"
+	if sideband {
+		caps += " side-band-64k"
+	}
+	caps += " no-progress"
+	if err := e.EncodeString("want " + tip + " " + caps + "\n"); err != nil {
+		t.Fatalf("encode want: %v", err)
+	}
+	if err := e.EncodeString(fmt.Sprintf("deepen %d\n", depth)); err != nil {
+		t.Fatalf("encode deepen: %v", err)
+	}
+	if err := e.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if err := e.EncodeString("done\n"); err != nil {
+		t.Fatalf("encode done: %v", err)
+	}
+	if err := e.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	req, err := gitproto.ParseUploadPackRequest(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
 	return req
 }
 
@@ -287,6 +324,127 @@ func TestServeUploadPackEnforced_DenyWithholdsSecretBlob(t *testing.T) {
 	assertPackHasBlobOIDs(t, m.Dir(), pack,
 		[]string{readmeOID, guideOID}, // public blobs present
 		[]string{secretOID})           // secret blob withheld
+}
+
+// TestServeUploadPackEnforced_ShallowPreambleBeforeNAK verifies a `deepen 1`
+// request makes the enforce path emit the shallow preamble — `shallow <tip>\n`
+// followed by a flush-pkt — BEFORE the NAK and the sideband packfile, matching
+// real git's v0 stateless framing (captured from `git upload-pack
+// --stateless-rpc`). The repo has two commits so deepen 1 cuts the tip's parent
+// and the tip becomes the shallow boundary. A nil deny matcher isolates the
+// shallow preamble from the withhold path.
+func TestServeUploadPackEnforced_ShallowPreambleBeforeNAK(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	// Two commits: the tip has a parent, so deepen 1 excludes the parent and
+	// the tip is the shallow boundary.
+	source, tip1 := readRepoForProtection(t)
+	writeFile(t, source, "another.txt", "more content\n")
+	mustGit(t, source, "add", "another.txt")
+	mustGit(t, source, "commit", "-q", "-m", "second commit")
+	m := readProtectionMirror(t, source)
+	tip := revParseHead(t, source)
+	if tip == tip1 {
+		t.Fatalf("second commit did not advance the tip")
+	}
+
+	req := uploadPackRequestDeepen(t, tip, 1, true)
+	matcher := pathmatch.New(nil) // no denial → isolate the preamble
+
+	var out bytes.Buffer
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced: %v", err)
+	}
+
+	// Byte-exact preamble BEFORE the NAK: `shallow <tip>\n`, flush, NAK, then
+	// the sideband packfile, then a terminating flush-pkt.
+	r := bytes.NewReader(out.Bytes())
+	s := pktline.NewScanner(r)
+	if !s.Scan() {
+		t.Fatalf("no shallow pkt-line; scan err=%v", s.Err())
+	}
+	if s.Marker() != pktline.Data || string(s.Bytes()) != "shallow "+tip+"\n" {
+		t.Fatalf("first pkt-line = marker=%v bytes=%q, want \"shallow %s\\n\"", s.Marker(), s.Bytes(), tip)
+	}
+	if !s.Scan() || s.Marker() != pktline.Flush {
+		t.Fatalf("expected flush after shallow line, got marker=%v", s.Marker())
+	}
+	if !s.Scan() {
+		t.Fatalf("no NAK pkt-line; scan err=%v", s.Err())
+	}
+	if s.Marker() != pktline.Data || string(s.Bytes()) != "NAK\n" {
+		t.Fatalf("expected NAK after shallow section, got marker=%v bytes=%q", s.Marker(), s.Bytes())
+	}
+	// The sideband packfile follows the NAK; demux and assert PACK magic.
+	d := sideband.NewDemuxer(sideband.Sideband64k, r)
+	pack, err := io.ReadAll(d)
+	if err != nil {
+		t.Fatalf("demux packfile: %v", err)
+	}
+	if !bytes.HasPrefix(pack, []byte("PACK")) {
+		t.Fatalf("demuxed packfile missing PACK magic; got %x", pack[:min(8, len(pack))])
+	}
+	if !bytes.HasSuffix(out.Bytes(), []byte("0000")) {
+		t.Fatalf("sideband response not terminated by flush-pkt 0000; got %x", out.Bytes()[max(0, out.Len()-8):])
+	}
+}
+
+// TestServeUploadPackEnforced_ShallowPreliminaryRoundNoPack verifies the
+// enforce path emits ONLY the shallow preamble (shallow + flush) — no NAK, no
+// packfile — for a shallow request WITHOUT `done` (the stateless deepen
+// preliminary round). Emitting a pack on the no-`done` round leaves a pack
+// leftover that leaks into the next round's response (`expected shallow list`).
+func TestServeUploadPackEnforced_ShallowPreliminaryRoundNoPack(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, tip1 := readRepoForProtection(t)
+	writeFile(t, source, "another.txt", "more content\n")
+	mustGit(t, source, "add", "another.txt")
+	mustGit(t, source, "commit", "-q", "-m", "second commit")
+	m := readProtectionMirror(t, source)
+	tip := revParseHead(t, source)
+	if tip == tip1 {
+		t.Fatalf("second commit did not advance the tip")
+	}
+
+	// Build a deepen request WITHOUT `done` (preliminary round).
+	var buf bytes.Buffer
+	e := pktline.NewEncoder(&buf)
+	mustEncode(t, e, "want "+tip+" ofs-delta thin-pack side-band-64k no-progress\n")
+	mustEncode(t, e, "deepen 1\n")
+	mustFlush(t, e)
+	mustFlush(t, e) // terminate the no-haves/no-done request body
+	req, err := gitproto.ParseUploadPackRequest(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if req.Done {
+		t.Fatalf("test setup: request has done=true, want false")
+	}
+
+	matcher := pathmatch.New(nil)
+	var out bytes.Buffer
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced: %v", err)
+	}
+
+	// The preliminary-round response is exactly: `shallow <tip>\n` + flush.
+	// No NAK, no packfile, no trailing sideband flush.
+	s := pktline.NewScanner(bytes.NewReader(out.Bytes()))
+	if !s.Scan() {
+		t.Fatalf("no shallow pkt-line; scan err=%v", s.Err())
+	}
+	if s.Marker() != pktline.Data || string(s.Bytes()) != "shallow "+tip+"\n" {
+		t.Fatalf("first pkt-line = marker=%v bytes=%q, want \"shallow %s\\n\"", s.Marker(), s.Bytes(), tip)
+	}
+	if !s.Scan() || s.Marker() != pktline.Flush {
+		t.Fatalf("expected flush after shallow line, got marker=%v", s.Marker())
+	}
+	if s.Scan() {
+		t.Fatalf("preliminary round emitted extra pkt-line after shallow+flush (no NAK/pack expected): marker=%v bytes=%q", s.Marker(), s.Bytes())
+	}
 }
 
 // TestServeUploadPackEnforced_AllowWhenNoDeny verifies that with no deny

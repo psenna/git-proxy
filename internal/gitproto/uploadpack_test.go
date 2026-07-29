@@ -1,12 +1,14 @@
 package gitproto_test
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/psenna/git-proxy/internal/gitproto"
+	"github.com/psenna/git-proxy/internal/gitproto/pktline"
 )
 
 // fixture reads a golden protocol byte stream from test/integration/fixtures.
@@ -174,5 +176,64 @@ func TestParseUploadPackRequestWantHave(t *testing.T) {
 	}
 	if len(req.Caps) != 2 || req.Caps[0] != "ofs-delta" || req.Caps[1] != "no-progress" {
 		t.Fatalf("caps = %v", req.Caps)
+	}
+}
+
+// TestParseUploadPackRequestShallow parses a synthetic shallow/`deepen` request
+// (want + caps, `deepen N`, `deepen-not <sha>`, `deepen-since <ts>`, client
+// `shallow <sha>`, flush, have, done, flush) and asserts the shallow directives
+// land in the right fields and ShallowRequested() is true.
+func TestParseUploadPackRequestShallow(t *testing.T) {
+	var buf bytes.Buffer
+	e := pktline.NewEncoder(&buf)
+	mustEncode(t, e, "want 0000000000000000000000000000000000000001 ofs-delta no-progress side-band-64k shallow\n")
+	mustEncode(t, e, "deepen 3\n")
+	mustEncode(t, e, "deepen-not 2222222222222222222222222222222222222222\n")
+	mustEncode(t, e, "deepen-since 1700000000\n")
+	mustEncode(t, e, "shallow 3333333333333333333333333333333333333333\n")
+	mustFlush(t, e)
+	mustEncode(t, e, "have 4444444444444444444444444444444444444444\n")
+	mustEncode(t, e, "done\n")
+	mustFlush(t, e)
+
+	req, err := gitproto.ParseUploadPackRequest(strings.NewReader(buf.String()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if req.Deepen != 3 {
+		t.Fatalf("Deepen = %d, want 3", req.Deepen)
+	}
+	if len(req.DeepenNot) != 1 || req.DeepenNot[0] != "2222222222222222222222222222222222222222" {
+		t.Fatalf("DeepenNot = %v", req.DeepenNot)
+	}
+	if req.DeepenSince != "1700000000" {
+		t.Fatalf("DeepenSince = %q, want 1700000000", req.DeepenSince)
+	}
+	if len(req.Shallows) != 1 || req.Shallows[0] != "3333333333333333333333333333333333333333" {
+		t.Fatalf("Shallows = %v", req.Shallows)
+	}
+	if len(req.Haves) != 1 || req.Haves[0] != "4444444444444444444444444444444444444444" {
+		t.Fatalf("Haves = %v", req.Haves)
+	}
+	if !req.Done {
+		t.Fatalf("done = false, want true")
+	}
+	if !req.ShallowRequested() {
+		t.Fatalf("ShallowRequested = false, want true")
+	}
+}
+
+// TestParseUploadPackRequestNotShallow asserts a plain (non-deepen) request
+// reports ShallowRequested() false.
+func TestParseUploadPackRequestNotShallow(t *testing.T) {
+	req, err := gitproto.ParseUploadPackRequest(buildWantHaveStream(t,
+		"0000000000000000000000000000000000000001",
+		"1111111111111111111111111111111111111111",
+		"2222222222222222222222222222222222222222"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if req.ShallowRequested() {
+		t.Fatalf("ShallowRequested = true for a plain request, want false")
 	}
 }

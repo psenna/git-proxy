@@ -129,9 +129,76 @@ func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRe
 		return UploadPackEnforceResult{DeniedOIDs: []string{deniedOID}}, err
 	}
 
-	objs, err := mirror.WantedObjects(ctx, req.Wants, req.Haves)
-	if err != nil {
-		return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: wanted objects: %w", err)
+	// --- Shallow / `deepen` fetch handling ---
+	//
+	// A `git fetch --depth=N` (or `--shallow-exclude` / `--shallow-since`) sends
+	// `deepen`/`deepen-not`/`deepen-since` lines (parsed in ParseUploadPackRequest).
+	// The read-protected path must compute a shallow object set and emit a
+	// `shallow`/`unshallow` preamble BEFORE the NAK — without it the client fails
+	// with `expected shallow/unshallow, got NAK` (the user's reported bug). The
+	// plain (non-deepen) path is unchanged (WantedObjects + withhold, no
+	// preamble).
+	//
+	// A request carrying ONLY client `shallow` lines (no `deepen`/`deepen-not`/
+	// `deepen-since`) is a shallow client doing an incremental fetch with no new
+	// cut: the server applies no new boundary and emits no preamble — fall
+	// through to the plain path (the client's existing shallows are unchanged).
+	//
+	// `deepen-since` (date-based boundary) is deferred: emit an actionable ERR
+	// instead of the current silent cryptic NAK (a documented gap, not a
+	// regression — strict improvement over the v0.0.2 behavior).
+	if req.DeepenSince != "" {
+		log.Printf("gitproto: upload-pack enforce: refusing shallow-since fetch for repo %q (unsupported)", repo)
+		reason := errDeepenSinceUnsupported
+		if err := writeUploadPackErr(w, reason); err != nil {
+			return UploadPackEnforceResult{DeniedReason: reason}, err
+		}
+		return UploadPackEnforceResult{DeniedReason: reason}, nil
+	}
+
+	var shallowLines []string
+	var objs []gitx.ObjectPath
+	var err error
+	if req.Deepen > 0 || len(req.DeepenNot) > 0 {
+		plan, perr := planShallowFetch(ctx, mirror, req, repo)
+		if perr != nil {
+			return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: %w", perr)
+		}
+		objs = plan.objects
+		shallowLines = plan.shallowLines
+	} else {
+		objs, err = mirror.WantedObjects(ctx, req.Wants, req.Haves)
+		if err != nil {
+			return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: wanted objects: %w", err)
+		}
+	}
+
+	// Stateless deepen is a multi-round negotiation (verified against real
+	// `git upload-pack --stateless-rpc` + the fetch-pack state machine): the
+	// client sends a preliminary round (want+deepen+flush, NO haves, NO done)
+	// to learn the shallow boundaries, then rounds with haves, and a final round
+	// with `done` that carries the pack. For every round the client reads a
+	// shallow preamble (the initial `if(deepen)` block, then consume_shallow_list
+	// per round) — so the preamble MUST be emitted on every round, including the
+	// no-`done` ones. But the pack MUST be sent ONLY on the final (`done`)
+	// round: emitting NAK+pack on a no-`done` round leaves a pack leftover that
+	// the streaming HTTP response does not fully drain, and it leaks into the
+	// next round's read (reproduced: `expected shallow list`). So for a shallow
+	// request without `done`, emit ONLY the shallow preamble (shallow/unshallow
+	// lines + a flush) and stop — no NAK, no pack. The boundaries are commit
+	// OIDs (not blob paths), so nothing secret is emitted and the deny
+	// withholding (which only strips pack blobs) does not apply.
+	if (req.Deepen > 0 || len(req.DeepenNot) > 0) && !req.Done {
+		e := pktline.NewEncoder(w)
+		for _, line := range shallowLines {
+			if err := e.EncodeString(line + "\n"); err != nil {
+				return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: encode shallow line: %w", err)
+			}
+		}
+		if err := e.Flush(); err != nil {
+			return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: flush shallow section: %w", err)
+		}
+		return UploadPackEnforceResult{}, nil
 	}
 
 	// Collect unique OIDs (in first-seen order) and their resolving paths. Only
@@ -219,19 +286,30 @@ func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRe
 		return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: pack-objects: %w", err)
 	}
 
-	if err := writeV0UploadPackResponse(w, packReader, packWait, req.Caps); err != nil {
+	if err := writeV0UploadPackResponse(w, packReader, packWait, req.Caps, shallowLines); err != nil {
 		return UploadPackEnforceResult{DeniedPaths: deniedPaths}, err
 	}
 	return UploadPackEnforceResult{DeniedPaths: deniedPaths}, nil
 }
 
-// writeV0UploadPackResponse writes a v0 upload-pack response to w: a NAK
-// pkt-line, then the packfile (read from pack and produced by pack-objects)
-// muxed over side-band-64k (or side-band) channel 1 with a terminating
-// flush-pkt when the client requested a sideband capability, or the packfile
-// raw after the NAK pkt-line when no sideband was negotiated. A real git clone
-// always requests side-band-64k, so the muxed path is the validated one; the
-// raw path covers non-sideband clients.
+// writeV0UploadPackResponse writes a v0 upload-pack response to w: an optional
+// shallow preamble (`shallow`/`unshallow` lines + a flush-pkt, only for a
+// `deepen` fetch), then a NAK pkt-line, then the packfile (read from pack and
+// produced by pack-objects) muxed over side-band-64k (or side-band) channel 1
+// with a terminating flush-pkt when the client requested a sideband capability,
+// or the packfile raw after the NAK pkt-line when no sideband was negotiated. A
+// real git clone always requests side-band-64k, so the muxed path is the
+// validated one; the raw path covers non-sideband clients.
+//
+// SHALLOW FRAMING: real git's v0 stateless upload-pack emits the shallow
+// preamble BEFORE the NAK (verified by capturing `git upload-pack
+// --stateless-rpc` with a `deepen` request): `shallow <sha>\n` / `unshallow
+// <sha>\n` lines, a `0000` flush terminating the shallow section, then the NAK
+// (+ ACK lines when haves are common), then the sideband/raw pack, then `0000`.
+// shallowLines carries the `shallow <sha>` / `unshallow <sha>` payloads (without
+// trailing newline — the encoder adds it); an empty slice means a plain
+// (non-deepen) fetch and the preamble is omitted, keeping the response
+// byte-identical to the pre-shallow behavior.
 //
 // STREAMING + FAIL-CLOSED: the packfile is streamed through the side-band muxer
 // in bounded chunks (the muxer splits each Write into MaxPackedSize64k frames;
@@ -245,18 +323,21 @@ func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRe
 //     If pack-objects fails to start (no output + a wait error), the error is
 //     returned and NOTHING is written — the caller denies the fetch, no
 //     unprotected/partial packfile reaches the agent.
-//  2. Once a non-empty head chunk is in hand, commits to streaming (writes the
-//     NAK + head + remainder). If pack-objects then fails MID-STREAM, the wait
-//     error is surfaced and the sideband flush-pkt ("0000") is NOT written, so
-//     the agent receives a truncated, trailer-less packfile that does not look
-//     complete rather than a valid-looking pack — fail-closed in the sense that
-//     no valid complete pack is served. The returned error lets the caller log
-//     the failure.
+//  2. For an empty pack, confirms pack-objects succeeded (packWait) BEFORE
+//     writing the shallow preamble + NAK, so a pack-objects error still writes
+//     nothing.
+//  3. Once a non-empty head chunk is in hand, commits to streaming (writes the
+//     shallow preamble + NAK + head + remainder). If pack-objects then fails
+//     MID-STREAM, the wait error is surfaced and the sideband flush-pkt ("0000")
+//     is NOT written, so the agent receives a truncated, trailer-less packfile
+//     that does not look complete rather than a valid-looking pack —
+//     fail-closed in the sense that no valid complete pack is served. The
+//     returned error lets the caller log the failure.
 //
 // packWait MUST be called exactly once after the reader is drained or abandoned;
 // it closes the reader (unblocking the producer goroutine) and returns the
 // pack-objects exit error.
-func writeV0UploadPackResponse(w io.Writer, pack io.Reader, packWait func() error, caps []string) error {
+func writeV0UploadPackResponse(w io.Writer, pack io.Reader, packWait func() error, caps []string, shallowLines []string) error {
 	// Read the first chunk to detect a pack-objects startup failure BEFORE
 	// committing any bytes to w. 4 KiB is large enough to be meaningful yet
 	// bounded; the muxer re-chunks the remainder regardless.
@@ -272,13 +353,38 @@ func writeV0UploadPackResponse(w io.Writer, pack io.Reader, packWait func() erro
 		return fmt.Errorf("gitproto: read pack head: %w", readErr)
 	}
 
-	// Empty pack (n == 0): nothing to stream. Check packWait for a hidden
-	// error, then emit NAK + sideband flush only (or NAK only for raw).
+	// Empty pack (n == 0): nothing to stream. Confirm pack-objects succeeded
+	// BEFORE writing anything (fail-closed: a pack-objects error writes no
+	// response — no shallow preamble, no NAK).
 	if n == 0 {
 		if werr := packWait(); werr != nil {
 			return fmt.Errorf("gitproto: pack-objects: %w", werr)
 		}
-		e := pktline.NewEncoder(w)
+	}
+
+	// Shallow preamble: for a `deepen` fetch, emit the `shallow <sha>` /
+	// `unshallow <sha>` boundary lines followed by a flush-pkt BEFORE the NAK
+	// (matching real git's v0 stateless framing). Emitted after the head-read
+	// (and, for the empty-pack case, after pack-objects success) so a
+	// pack-objects failure writes nothing. An empty shallowLines slice (plain
+	// fetch) skips this entirely — the response stays byte-identical to the
+	// pre-shallow behavior.
+	e := pktline.NewEncoder(w)
+	for _, line := range shallowLines {
+		if err := e.EncodeString(line + "\n"); err != nil {
+			_ = packWait()
+			return fmt.Errorf("gitproto: encode shallow line: %w", err)
+		}
+	}
+	if len(shallowLines) > 0 {
+		if err := e.Flush(); err != nil {
+			_ = packWait()
+			return fmt.Errorf("gitproto: flush shallow section: %w", err)
+		}
+	}
+
+	// Empty pack: NAK + sideband flush only (or NAK only for raw).
+	if n == 0 {
 		if err := e.EncodeString("NAK\n"); err != nil {
 			return fmt.Errorf("gitproto: encode NAK: %w", err)
 		}
@@ -294,7 +400,6 @@ func writeV0UploadPackResponse(w io.Writer, pack io.Reader, packWait func() erro
 	// the remainder through the muxer (or raw). The muxer splits each Write into
 	// MaxPackedSize64k (or MaxPackedSize) frames internally, so memory stays
 	// bounded by io.Copy's 32 KiB buffer + one muxer frame.
-	e := pktline.NewEncoder(w)
 	if err := e.EncodeString("NAK\n"); err != nil {
 		return fmt.Errorf("gitproto: encode NAK: %w", err)
 	}
@@ -478,4 +583,180 @@ func uploadPackSidebandType(caps []string) sideband.Type {
 		}
 	}
 	return sideband.Type(-1) // sentinel: no sideband
+}
+
+// errDeepenSinceUnsupported is the actionable, fail-closed reason emitted when a
+// read-protected fetch requests `deepen-since` (--shallow-since): the date-based
+// boundary semantics are not implemented on the enforce path. Generic: no
+// credentials, no secret content, no paths/OIDs — names the unsupported flag so
+// the agent can retry without it.
+const errDeepenSinceUnsupported = "shallow-since fetches (--shallow-since / deepen-since) are not yet supported through the read-protected path; retry without --shallow-since"
+
+// shallowPlan is the output of planShallowFetch: the shallow packfile's object
+// set (replacing WantedObjects for a `deepen` fetch, with the SAME deny
+// withholding applied downstream) and the `shallow <sha>` / `unshallow <sha>`
+// preamble lines emitted before the NAK. shallowLines payloads carry no trailing
+// newline — the pkt-line encoder adds it.
+type shallowPlan struct {
+	objects      []gitx.ObjectPath
+	shallowLines []string
+}
+
+// planShallowFetch computes the shallow object set and the shallow/unshallow
+// boundary lines for a `deepen N` or `deepen-not <sha>` fetch, using the unified
+// "excluded set E" mechanism:
+//
+//   - E = the commits the shallow cut removes.
+//   - `deepen N`: E = commits at generation ≥ N from the wants (BFS over the
+//     full ancestry — no `--not`, so a have at a low generation correctly
+//     suppresses a boundary; verified against real-git captures).
+//   - `deepen-not <sha>`: E = the ancestry of the exclude refs.
+//   - objects = `git rev-list --objects <wants> --not <E> --not <haves>`
+//     (mirror.ShallowObjects): the packfile's object set within the cut,
+//     excluding the boundary commits' objects and the client's haves. Denied
+//     blobs are withheld from this set by the EXISTING loop in
+//     ServeUploadPackEnforced (unchanged).
+//   - shallow boundaries = included commits (in the graph, NOT in E) with at
+//     least one parent in E. Haves do NOT create boundaries: a have at a low
+//     generation is included (suppresses the boundary); a have at/after the cut
+//     is in E (excluded). This matches the V3 capture (want B, have A, deepen 1
+//     → `shallow B`; with deepen 5, B is NOT shallow because A at gen 1 < 5).
+//   - unshallow = client `req.Shallows` now fully included (in the graph, not in
+//     E, all parents present and not in E) — the new walk extended past the
+//     client's old cut.
+//
+// `deepen-since` is handled by the caller (ServeUploadPackEnforced) before this
+// runs. A request carrying only client `shallow` lines (no new cut) takes the
+// plain path and never reaches here.
+//
+// Memory note (v1): the `deepen N` BFS loads all commits reachable from wants
+// (no `--not`), comparable to WantedObjects' object traversal. Acceptable for
+// v1; documented. Fail-closed: any git error returns an error and the caller
+// denies the fetch (no unprotected pack).
+func planShallowFetch(ctx context.Context, mirror *gitx.Mirror, req *UploadPackRequest, repo string) (*shallowPlan, error) {
+	cps, err := mirror.CommitParents(ctx, req.Wants)
+	if err != nil {
+		return nil, fmt.Errorf("shallow commit graph: %w", err)
+	}
+	parentOf := make(map[string][]string, len(cps))
+	present := make(map[string]bool, len(cps))
+	for _, cp := range cps {
+		parentOf[cp.OID] = cp.Parents
+		present[cp.OID] = true
+	}
+
+	// E = the excluded (shallow-cut) commit set.
+	var eSet map[string]bool
+	switch {
+	case req.Deepen > 0:
+		eSet = depthExcludedSet(req.Wants, parentOf, req.Deepen)
+	default: // len(req.DeepenNot) > 0 (caller only reaches here for Deepen or DeepenNot)
+		anc, aerr := mirror.Ancestors(ctx, req.DeepenNot)
+		if aerr != nil {
+			return nil, fmt.Errorf("shallow deepen-not: %w", aerr)
+		}
+		eSet = make(map[string]bool, len(anc))
+		for _, o := range anc {
+			eSet[o] = true
+		}
+	}
+
+	// Shallow pack object set: objects reachable from wants, not from E, not
+	// from haves. Denied blobs are withheld downstream by the existing loop.
+	excludes := make([]string, 0, len(eSet))
+	for o := range eSet {
+		excludes = append(excludes, o)
+	}
+	objs, oerr := mirror.ShallowObjects(ctx, req.Wants, excludes, req.Haves)
+	if oerr != nil {
+		return nil, fmt.Errorf("shallow objects: %w", oerr)
+	}
+
+	clientShallows := make(map[string]bool, len(req.Shallows))
+	for _, s := range req.Shallows {
+		clientShallows[s] = true
+	}
+
+	// Shallow boundaries: included commits (in the graph, not in E) with at
+	// least one parent in E. Iterate the graph in rev-list order (stable, and
+	// already deduplicated by OID).
+	var shallowLines []string
+	emitted := make(map[string]bool)
+	for _, cp := range cps {
+		if eSet[cp.OID] {
+			continue // excluded by the cut — not an included commit
+		}
+		boundary := false
+		for _, p := range cp.Parents {
+			if eSet[p] {
+				boundary = true
+				break
+			}
+		}
+		if boundary && !clientShallows[cp.OID] && !emitted[cp.OID] {
+			shallowLines = append(shallowLines, "shallow "+cp.OID)
+			emitted[cp.OID] = true
+		}
+	}
+
+	// Unshallow: client shallows now fully included (reachable, not in E, and
+	// every parent reachable and not in E). A root commit that was a client
+	// shallow and is now included has no parents and is resolved → unshallow.
+	for _, s := range req.Shallows {
+		if !present[s] || eSet[s] || emitted[s] {
+			continue // not reachable, still cut, or already emitted as a boundary
+		}
+		resolved := true
+		for _, p := range parentOf[s] {
+			if eSet[p] || !present[p] {
+				resolved = false
+				break
+			}
+		}
+		if resolved {
+			shallowLines = append(shallowLines, "unshallow "+s)
+			emitted[s] = true
+		}
+	}
+
+	if len(shallowLines) > 0 {
+		log.Printf("gitproto: upload-pack enforce: shallow fetch for repo %q: %d shallow line(s)", repo, len(shallowLines))
+	}
+	return &shallowPlan{objects: objs, shallowLines: shallowLines}, nil
+}
+
+// depthExcludedSet computes the `deepen N` excluded set E = commits at
+// generation ≥ N from the wants. Generation is the BFS distance (number of
+// parent edges) from the nearest want, so a want is gen 0, its parents gen 1,
+// etc. BFS first-visit is the shortest path on the unweighted commit DAG, so the
+// first assigned generation is the minimum (no relax step needed). Commits not
+// reachable from any want are absent from E (and from the graph) — unreachable
+// objects are not the server's concern. wants not in parentOf (bogus want)
+// surface as an error upstream (CommitParents errors on unknown revisions).
+func depthExcludedSet(wants []string, parentOf map[string][]string, depth int) map[string]bool {
+	gen := make(map[string]int, len(parentOf))
+	queue := make([]string, 0, len(wants))
+	for _, w := range wants {
+		if _, ok := gen[w]; !ok {
+			gen[w] = 0
+			queue = append(queue, w)
+		}
+	}
+	for head := 0; head < len(queue); head++ {
+		c := queue[head]
+		g := gen[c]
+		for _, p := range parentOf[c] {
+			if _, ok := gen[p]; !ok {
+				gen[p] = g + 1
+				queue = append(queue, p)
+			}
+		}
+	}
+	eSet := make(map[string]bool, len(parentOf))
+	for o, g := range gen {
+		if g >= depth {
+			eSet[o] = true
+		}
+	}
+	return eSet
 }
