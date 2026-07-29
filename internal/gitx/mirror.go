@@ -250,6 +250,110 @@ func parseObjectPaths(out []byte) []ObjectPath {
 	return objs
 }
 
+// CommitParents is a commit OID plus its parent commit OIDs, as
+// `git rev-list --parents` prints them: one line per commit, the commit OID
+// followed by zero or more parent OIDs, all space-separated. Used by the
+// shallow-`deepen N` path to BFS the commit graph and assign generations so the
+// enforce path can compute the depth-cut excluded set E and the shallow
+// boundaries (included commits with a parent in E).
+type CommitParents struct {
+	OID     string
+	Parents []string
+}
+
+// CommitParents returns the commit graph reachable from wants with each
+// commit's parents, via `git rev-list --parents <wants>` (NO `--not`: haves are
+// excluded from the pack elsewhere; the generation walk must see the full
+// ancestry so a have at a low generation correctly suppresses a shallow
+// boundary). The per-mirror mutex is held for the synchronous rev-list. A
+// nil/empty wants list yields nil with no error.
+func (m *Mirror) CommitParents(ctx context.Context, wants []string) ([]CommitParents, error) {
+	if len(wants) == 0 {
+		return nil, nil
+	}
+	args := make([]string, 0, 2+len(wants))
+	args = append(args, "rev-list", "--parents")
+	args = append(args, wants...)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out, err := runGit(ctx, m.dir, args...)
+	if err != nil {
+		return nil, fmt.Errorf("gitx: commit parents: %w", err)
+	}
+	return parseCommitParents(out), nil
+}
+
+// parseCommitParents parses `git rev-list --parents` output into CommitParents
+// values. Each line is `<oid> <p1> <p2> …` (the commit OID followed by zero or
+// more parent OIDs); `parseObjectPaths` does NOT fit this format (it would put
+// the first parent into the Path field).
+func parseCommitParents(out []byte) []CommitParents {
+	lines := splitCleanLines(out)
+	cps := make([]CommitParents, 0, len(lines))
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		cp := CommitParents{OID: fields[0]}
+		if len(fields) > 1 {
+			cp.Parents = fields[1:]
+		}
+		cps = append(cps, cp)
+	}
+	return cps
+}
+
+// ShallowObjects returns the objects reachable from wants excluding the shallow
+// cut set (excludes) and the client's haves, via
+// `git rev-list --objects <wants> --not <excludes> --not <haves>`. This is the
+// shallow packfile's object set: commits/trees/blobs within the cut, excluding
+// the depth/exclude boundary commits' objects and objects the client already
+// has. Output is parsed with the existing parseObjectPaths (same `<oid>` /
+// `<oid> <path>` format as WantedObjects). The per-mirror mutex is held for the
+// synchronous rev-list. nil/empty wants yields nil with no error.
+func (m *Mirror) ShallowObjects(ctx context.Context, wants, excludes, haves []string) ([]ObjectPath, error) {
+	if len(wants) == 0 {
+		return nil, nil
+	}
+	args := make([]string, 0, 4+len(wants)+len(excludes)+len(haves))
+	args = append(args, "rev-list", "--objects")
+	args = append(args, wants...)
+	if len(excludes) > 0 {
+		args = append(args, "--not")
+		args = append(args, excludes...)
+	}
+	if len(haves) > 0 {
+		args = append(args, "--not")
+		args = append(args, haves...)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out, err := runGit(ctx, m.dir, args...)
+	if err != nil {
+		return nil, fmt.Errorf("gitx: shallow objects: %w", err)
+	}
+	return parseObjectPaths(out), nil
+}
+
+// Ancestors returns the OIDs of the commits reachable from refs (the refs
+// themselves and all their ancestors) via `git rev-list <refs>`. Used by the
+// `deepen-not` path to build the excluded set E (the ancestry of the
+// shallow-exclude refs). The per-mirror mutex is held for the synchronous
+// rev-list. nil/empty refs yields nil with no error.
+func (m *Mirror) Ancestors(ctx context.Context, refs []string) ([]string, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out, err := runGit(ctx, m.dir, append([]string{"rev-list"}, refs...)...)
+	if err != nil {
+		return nil, fmt.Errorf("gitx: ancestors: %w", err)
+	}
+	return splitCleanLines(out), nil
+}
+
 // ReadEnforceThin is the thin flag the read-enforce path MUST pass to
 // PackObjects/PackObjectsStream. A thin pack re-includes withheld blobs as
 // delta bases (`git pack-objects --thin` without a receiver have-set walks the

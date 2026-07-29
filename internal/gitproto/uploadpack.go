@@ -3,6 +3,7 @@ package gitproto
 import (
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/psenna/git-proxy/internal/gitproto/pktline"
@@ -84,6 +85,29 @@ type UploadPackRequest struct {
 	Haves []string
 	Done  bool
 	Caps  []string
+	// Shallow-fetch directives. A client that advertised the `shallow` capability
+	// (the proxy passes it through from upstream) may send these in the want-list
+	// section, before the first flush-pkt:
+	//   - Deepen: the `deepen <N>` generation cutoff (--depth=N). 0 = none.
+	//   - DeepenNot: the `deepen-not <sha>` exclusion refs (--shallow-exclude).
+	//   - DeepenSince: the `deepen-since <timestamp>` cutoff (--shallow-since).
+	//   - Shallows: the client's existing `shallow <sha>` boundaries (a shallow
+	//     client tells the server where it is already cut, so the server can
+	//     `unshallow` them if the new walk extends past them).
+	// The read-protected enforce path (ServeUploadPackEnforced) uses these to
+	// compute a shallow object set + boundaries and emit `shallow`/`unshallow`
+	// lines before the NAK. Plain (non-shallow) fetches leave them zero/empty.
+	Deepen      int
+	DeepenNot   []string
+	DeepenSince string
+	Shallows    []string
+}
+
+// ShallowRequested reports whether the client asked for a shallow/`deepen`
+// fetch (any of the shallow directives is set). The enforce path branches on
+// this to decide whether to compute + emit a shallow preamble before the NAK.
+func (r *UploadPackRequest) ShallowRequested() bool {
+	return r.Deepen > 0 || len(r.DeepenNot) > 0 || r.DeepenSince != "" || len(r.Shallows) > 0
 }
 
 // ParseUploadPackRequest parses a git-upload-pack request pkt-line stream. It
@@ -109,6 +133,18 @@ func ParseUploadPackRequest(r io.Reader) (*UploadPackRequest, error) {
 				}
 			case strings.HasPrefix(line, "have "):
 				req.Haves = append(req.Haves, strings.TrimSpace(strings.TrimPrefix(line, "have ")))
+			case strings.HasPrefix(line, "deepen "):
+				n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "deepen ")))
+				if err != nil {
+					return nil, fmt.Errorf("gitproto: upload-pack request: malformed deepen %q: %w", line, err)
+				}
+				req.Deepen = n
+			case strings.HasPrefix(line, "deepen-not "):
+				req.DeepenNot = append(req.DeepenNot, strings.TrimSpace(strings.TrimPrefix(line, "deepen-not ")))
+			case strings.HasPrefix(line, "deepen-since "):
+				req.DeepenSince = strings.TrimSpace(strings.TrimPrefix(line, "deepen-since "))
+			case strings.HasPrefix(line, "shallow "):
+				req.Shallows = append(req.Shallows, strings.TrimSpace(strings.TrimPrefix(line, "shallow ")))
 			case line == "done":
 				req.Done = true
 			}
