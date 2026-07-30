@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +28,31 @@ func advanceUpstreamNewFile(t *testing.T, h *Harness, name, content string) stri
 	return h.UpstreamRef(t, "refs/heads/main")
 }
 
+// seedManyCommits advances the upstream bare repo (via file://, bypassing the
+// proxy) with n distinct NON-secret files, one per commit. The point is to grow
+// the repo past git's stateless first-flush threshold (16 haves) so a subsequent
+// incremental `git fetch` advertises ≥16 haves and sends a preliminary no-`done`
+// negotiation round — the round that exposed issue #64
+// (`expected ACK/NAK, got '?PACK'`). 40 sits comfortably above 16 (and above a
+// possible 32 threshold in newer git), with margin. Returns the new upstream tip.
+func seedManyCommits(t *testing.T, h *Harness, n int) string {
+	t.Helper()
+	work := t.TempDir()
+	mustRun(t, "git", "clone", "-q", "file://"+h.BarePath, work)
+	mustRun(t, "git", "-C", work, "config", "user.email", "test@example.com")
+	mustRun(t, "git", "-C", work, "config", "user.name", "Test")
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("file-%d.txt", i)
+		if err := os.WriteFile(filepath.Join(work, name), []byte(fmt.Sprintf("content %d\n", i)), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		mustRun(t, "git", "-C", work, "add", name)
+		mustRun(t, "git", "-C", work, "commit", "-q", "-m", "add "+name)
+	}
+	mustRun(t, "git", "-C", work, "push", "-q", "origin", "main")
+	return h.UpstreamRef(t, "refs/heads/main")
+}
+
 // TestRepro_PartialCloneThenPlainFetch is the faithful reproduction of the
 // ai-sandbox agent's reported failure: a read-protected repo (read.deny:
 // secrets/**) cloned with --filter=blob:none, then advanced upstream, then a
@@ -37,6 +63,13 @@ func advanceUpstreamNewFile(t *testing.T, h *Harness, name, content string) stri
 func TestRepro_PartialCloneThenPlainFetch(t *testing.T) {
 	h := StartWithPolicy(t, "test.git", policyReadDeny("secrets/**"))
 	seedProtectedFiles(t, h) // README + docs/guide.md + secrets/secret.txt
+	// Grow the repo past git's stateless first-flush threshold (16 haves) so the
+	// incremental fetch below advertises ≥16 haves and sends a preliminary
+	// no-`done` negotiation round — the round that exposed issue #64
+	// (`expected ACK/NAK, got '?PACK'`). 40 sits comfortably above 16 (and above a
+	// possible 32 threshold in newer git), with margin. Without this the repro
+	// passes vacuously (≤16 haves → single `done` round).
+	seedManyCommits(t, h, 40)
 
 	// Partial clone through the enforce path. Checkout aborts on the withheld
 	// secret blob (expected); the repo + refs are still created.

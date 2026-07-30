@@ -167,6 +167,34 @@ func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRe
 		objs = plan.objects
 		shallowLines = plan.shallowLines
 	} else {
+		// Plain (non-deepen) stateless negotiation. A request WITHOUT `done` is a
+		// preliminary round in which the client advertises haves to discover common
+		// ground (git flushes its first 16 haves with no `done` once a fetch has
+		// that many to send). The server response is the ACK/NAK section with NO
+		// packfile — verified against real `git upload-pack --stateless-rpc`, which
+		// emits `ACK <oid> common` per common have, then `ACK <last> ready`, then
+		// `NAK`, and STOP: critically it sends NO terminating flush-pkt (the
+		// stateless HTTP response body boundary delimits the round). Emitting the
+		// pack here (pre-#64) made the client parse the sideband channel byte (\x01)
+		// + PACK magic as an ACK/NAK line -> `expected ACK/NAK, got '?PACK'`. A
+		// trailing flush-pkt after the NAK (the first #64 attempt) is ALSO wrong:
+		// git's multi_ack_detailed state machine, on reading NAK, breaks out of the
+		// ACK loop WITHOUT consuming a trailing flush, leaving it in the read
+		// buffer; the next round then reads that leftover `0000` first -> `expected
+		// ACK/NAK, got a flush packet`. So the preliminary response is a single
+		// `NAK` pkt-line and NOTHING else (no pack, no flush). NAK (no common
+		// reported) is valid — the client sends more haves, then `done`, and the
+		// done-round WantedObjects(wants, haves) excludes the haves server-side, so
+		// the served pack is incremental regardless of the negotiation's ACKs.
+		// (Sending `ACK <oid> common`/`ready` to collapse the rounds is a
+		// documented efficiency follow-up; correctness is NAK-only here.)
+		if !req.Done {
+			e := pktline.NewEncoder(w)
+			if err := e.EncodeString("NAK\n"); err != nil {
+				return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: encode NAK (preliminary): %w", err)
+			}
+			return UploadPackEnforceResult{}, nil
+		}
 		objs, err = mirror.WantedObjects(ctx, req.Wants, req.Haves)
 		if err != nil {
 			return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: wanted objects: %w", err)
