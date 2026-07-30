@@ -49,7 +49,15 @@ func seedManyCommits(t *testing.T, h *Harness, n int) string {
 		mustRun(t, "git", "-C", work, "add", name)
 		mustRun(t, "git", "-C", work, "commit", "-q", "-m", "add "+name)
 	}
-	mustRun(t, "git", "-C", work, "push", "-q", "origin", "main")
+	// Consolidate the n new loose objects into a single pack before the file://
+	// push, and push --no-thin so the receiver gets a self-contained pack. The
+	// bare upstream has gc.auto=0 (objects stay loose), and on CI's overlayfs a
+	// thin-pack push of many fresh loose objects intermittently failed with
+	// `remote unpack failed: eof before pack header` / `unable to read <oid>` on
+	// the sender. Repacking cuts send-pack's loose-object reads to one pack, and
+	// --no-thin removes the receiver's thin-pack base resolution entirely.
+	mustRun(t, "git", "-C", work, "repack", "-a", "-d", "-q")
+	mustRun(t, "git", "-C", work, "push", "--no-thin", "-q", "origin", "main")
 	return h.UpstreamRef(t, "refs/heads/main")
 }
 
