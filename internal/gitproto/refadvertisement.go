@@ -63,15 +63,30 @@ func EmitRefAdvertisementV0(w io.Writer, adv *RefAdvertisement, extraCaps []stri
 	return nil
 }
 
-// buildV0Caps merges the upstream capabilities with extraCaps, stripping any
-// `version 2` capability (so the client falls back to v0) and de-duplicating so
-// an extra cap already present is not repeated. The order preserves the
-// upstream order with extra caps appended.
+// buildV0Caps merges the upstream capabilities with extraCaps, stripping
+// capabilities the read-protected enforce path does NOT implement, and
+// de-duplicating so an extra cap already present is not repeated. The order
+// preserves the upstream order with extra caps appended.
+//
+// Stripped caps (binding — each is a capability the enforce path cannot honor,
+// so advertising it would be a false claim):
+//
+//   - `version 2`: the enforce path assembles a v0 upload-pack response, so the
+//     client must fall back to v0 for the subsequent fetch request.
+//   - `no-done`: the no-done protocol lets the server send the packfile WITHOUT
+//     the client sending `done`, by emitting `ACK <oid> ready`. The enforce path
+//     never sends `ready` (it replies NAK to every no-`done` round — see
+//     ServeUploadPackEnforced), so it does not implement no-done. Advertising it
+//     would be a false claim; stripping it forces the client to send `done` on
+//     the final round, which the enforce path's done-round (NAK + pack) handles.
+//     This is a correctness measure (do not advertise an unimplemented cap); it
+//     is orthogonal to the #64 fix itself, which is the no-trailing-flush on
+//     preliminary rounds in ServeUploadPackEnforced.
 func buildV0Caps(upstream, extra []string) []string {
 	seen := make(map[string]bool, len(upstream)+len(extra))
 	merged := make([]string, 0, len(upstream)+len(extra))
 	for _, c := range upstream {
-		if c == "version 2" {
+		if c == "version 2" || c == "no-done" {
 			continue
 		}
 		if seen[c] {

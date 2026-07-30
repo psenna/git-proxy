@@ -447,6 +447,83 @@ func TestServeUploadPackEnforced_ShallowPreliminaryRoundNoPack(t *testing.T) {
 	}
 }
 
+// TestServeUploadPackEnforced_PlainPreliminaryRoundNoPack verifies the
+// enforce path emits ONLY the ACK/NAK section (a single NAK pkt-line) — no
+// packfile, and NO trailing flush-pkt — for a PLAIN (non-deepen) request WITHOUT
+// `done` (the stateless negotiation preliminary round). This is the user's issue
+// #64: when a read-protected repo has grown past ~16 commits, `git fetch` sends a
+// preliminary no-`done` round (want + first haves + flush), and the server must
+// reply with the ACK/NAK section and NO pack. The response shape was verified
+// against real `git upload-pack --stateless-rpc`, which emits `ACK <oid> common`
+// per common have, then `ACK <last> ready`, then `NAK`, and STOP — critically
+// with NO terminating flush-pkt (the stateless HTTP response body boundary
+// delimits the round). Two failure modes are pinned here:
+//
+//   - Emitting the pack on the no-`done` round made the client parse the sideband
+//     channel byte (\x01) + PACK magic as an ACK/NAK line -> `expected ACK/NAK,
+//     got '?PACK'` (the original #64).
+//   - A trailing flush-pkt after the NAK is ALSO wrong: git's multi_ack_detailed
+//     state machine, on reading NAK, breaks out of the ACK loop WITHOUT consuming
+//     a trailing flush, leaving it in the read buffer; the next round reads that
+//     leftover `0000` first -> `expected ACK/NAK, got a flush packet`.
+//
+// So the preliminary response is exactly one `NAK` pkt-line and nothing else.
+// The shallow no-`done` case is covered by
+// TestServeUploadPackEnforced_ShallowPreliminaryRoundNoPack; this is the plain
+// (the far more common incremental-fetch) counterpart.
+func TestServeUploadPackEnforced_PlainPreliminaryRoundNoPack(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	// Two commits: the tip has a real parent to advertise as a `have` (a plain
+	// no-`done` round carries haves to negotiate common ground).
+	source, tip1 := readRepoForProtection(t)
+	writeFile(t, source, "another.txt", "more content\n")
+	mustGit(t, source, "add", "another.txt")
+	mustGit(t, source, "commit", "-q", "-m", "second commit")
+	m := readProtectionMirror(t, source)
+	tip := revParseHead(t, source)
+	if tip == tip1 {
+		t.Fatalf("second commit did not advance the tip")
+	}
+
+	// Build a plain request WITHOUT `done` (preliminary negotiation round): want
+	// the tip + a have (the parent) + flush, no `done` line.
+	var buf bytes.Buffer
+	e := pktline.NewEncoder(&buf)
+	mustEncode(t, e, "want "+tip+" ofs-delta thin-pack side-band-64k no-progress\n")
+	mustEncode(t, e, "have "+tip1+"\n")
+	mustFlush(t, e)
+	mustFlush(t, e) // terminate the no-`done` request body
+	req, err := gitproto.ParseUploadPackRequest(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if req.Done {
+		t.Fatalf("test setup: request has done=true, want false")
+	}
+
+	// Nil matcher: isolate the negotiation framing from the withhold path.
+	matcher := pathmatch.New(nil)
+	var out bytes.Buffer
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced: %v", err)
+	}
+
+	// The preliminary-round response is exactly: a single `NAK\n` pkt-line and
+	// NOTHING else — no packfile, no sideband frame, and no trailing flush-pkt.
+	s := pktline.NewScanner(bytes.NewReader(out.Bytes()))
+	if !s.Scan() {
+		t.Fatalf("no NAK pkt-line; scan err=%v", s.Err())
+	}
+	if s.Marker() != pktline.Data || string(s.Bytes()) != "NAK\n" {
+		t.Fatalf("first pkt-line = marker=%v bytes=%q, want \"NAK\\n\"", s.Marker(), s.Bytes())
+	}
+	if s.Scan() {
+		t.Fatalf("preliminary round emitted extra pkt-line after NAK (no flush/pack expected): marker=%v bytes=%q", s.Marker(), s.Bytes())
+	}
+}
+
 // TestServeUploadPackEnforced_AllowWhenNoDeny verifies that with no deny
 // patterns (empty matcher) the full packfile is served — read protection OFF
 // at the path level means nothing is withheld.
