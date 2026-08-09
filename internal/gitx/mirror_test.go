@@ -411,3 +411,75 @@ func TestMirrorIngestThinPack(t *testing.T) {
 		t.Fatalf("after Ingest thin pack, IsAncestor(B,T) = (%v, %v), want (true, nil)", ok, err)
 	}
 }
+
+// TestMirrorRepair verifies that Repair re-clones the mirror from upstream after
+// its object store is corrupted. After Repair, WantedObjects must succeed on the
+// same query that failed before.
+func TestMirrorRepair(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	tips := makeSourceRepo(t, source, 3)
+	C := tips[2]
+
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+
+	root := t.TempDir()
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", root, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// Verify the mirror works before corruption.
+	objs, err := m.WantedObjects(ctx, []string{C}, nil)
+	if err != nil {
+		t.Fatalf("WantedObjects before corruption: %v", err)
+	}
+	if len(objs) == 0 {
+		t.Fatal("WantedObjects before corruption returned no objects")
+	}
+
+	// Corrupt the mirror by deleting all pack files. git clone --mirror packs
+	// everything into a single pack, so removing the pack makes rev-list fail
+	// with a corruption error ("bad object").
+	packDir := filepath.Join(m.Dir(), "objects", "pack")
+	for _, pat := range []string{"*.pack", "*.idx", "*.rev"} {
+		files, gerr := filepath.Glob(filepath.Join(packDir, pat))
+		if gerr != nil {
+			t.Fatalf("glob %s: %v", pat, gerr)
+		}
+		for _, f := range files {
+			t.Logf("removing %s to simulate corruption", filepath.Base(f))
+			if rerr := os.Remove(f); rerr != nil {
+				t.Fatalf("remove %s: %v", f, rerr)
+			}
+		}
+	}
+
+	// Verify WantedObjects now fails with a corruption error.
+	_, err = m.WantedObjects(ctx, []string{C}, nil)
+	if err == nil {
+		t.Fatal("WantedObjects after corruption unexpectedly succeeded; want corruption error")
+	}
+	if !gitx.IsCorruptionError(err) {
+		t.Fatalf("WantedObjects after corruption returned non-corruption error: %v", err)
+	}
+	t.Logf("WantedObjects after corruption correctly returned: %v", err)
+
+	// Repair the mirror.
+	if err := m.Repair(ctx); err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+
+	// Verify WantedObjects works again after Repair.
+	objs2, err := m.WantedObjects(ctx, []string{C}, nil)
+	if err != nil {
+		t.Fatalf("WantedObjects after Repair: %v", err)
+	}
+	if len(objs2) == 0 {
+		t.Fatal("WantedObjects after Repair returned no objects")
+	}
+}

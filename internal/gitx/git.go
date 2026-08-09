@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"strings"
 )
 
 // runGit runs `git -C dir <args...>` with ctx, returning stdout. A non-zero exit
@@ -46,4 +47,35 @@ var credURLRe = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)([^\s/@:]+(?::[
 // unchanged.
 func redactCreds(s string) string {
 	return credURLRe.ReplaceAllString(s, "${1}***@")
+}
+
+// corruptionPatterns are substrings that appear in git error messages when the
+// object store is corrupt or missing objects. IsCorruptionError matches these
+// against the full error chain (runGit wraps git stderr into the error message).
+var corruptionPatterns = []string{
+	"bad object",      // git rev-list/cat-file: "fatal: bad object <sha>"
+	"missing object",  // git: "fatal: missing object <sha>"
+	"corrupt",          // git fsck/rev-list: "error: corrupt object"
+	"loose object",    // git: "error: loose object <sha> (in ...) is corrupt"
+	"unable to unpack", // git pack-objects: "fatal: unable to unpack <sha> header"
+}
+
+// IsCorruptionError reports whether err indicates a corrupt or missing object
+// in a git mirror's object store. It matches git error message patterns that
+// surface when the mirror's object database is damaged — the patterns that
+// appear when an object the mirror believes it has (based on refs) is absent or
+// unreadable. This covers rev-list, cat-file, pack-objects, and fsck failure
+// modes. Designed for the mirror self-healing retry: a corruption error triggers
+// a mirror Repair (re-clone) and a single retry of the enforce operation.
+func IsCorruptionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, pat := range corruptionPatterns {
+		if strings.Contains(msg, pat) {
+			return true
+		}
+	}
+	return false
 }

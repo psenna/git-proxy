@@ -85,6 +85,16 @@ func clientRequestedFilter(caps []string) bool {
 // is written and no passthrough fallback when read protection is on. The agent
 // never sees upstream credentials (mirror errors are already redacted by gitx).
 //
+// Self-healing: if the first attempt fails with a corruption error (missing or
+// damaged object in the mirror), the mirror is repaired (re-cloned from
+// upstream) and the enforce is retried once. Corruption errors are detected by
+// gitx.IsCorruptionError, which matches git error patterns like "bad object",
+// "missing object", "corrupt", "loose object", and "unable to unpack". If the
+// repair or the retry fails, the original error is returned (fail-closed).
+// Policy denials and parse errors are NOT retried — only corruption errors.
+// No bytes have been written to w before corruption errors occur, so retry is
+// safe (the HTTP response is still unwritten).
+//
 // This is a PROXY-LEVEL per-path filter (pathmatch), NOT the engine's
 // all-or-nothing EvaluateFetch; it is not routed through the policy engine.
 //
@@ -93,6 +103,31 @@ func clientRequestedFilter(caps []string) bool {
 // so the client negotiates v0 here. v2 fetch support is a documented v1
 // follow-up.
 func ServeUploadPackEnforced(ctx context.Context, w io.Writer, req *UploadPackRequest,
+	mirror *gitx.Mirror, readDenyMatcher *pathmatch.Matcher, repo string) (UploadPackEnforceResult, error) {
+
+	result, err := serveUploadPackEnforcedInner(ctx, w, req, mirror, readDenyMatcher, repo)
+	if err != nil && gitx.IsCorruptionError(err) {
+		log.Printf("upload-pack enforce: mirror corruption detected for repo %q: %v; attempting repair", repo, err)
+		if repairErr := mirror.Repair(ctx); repairErr != nil {
+			log.Printf("upload-pack enforce: mirror repair failed for repo %q: %v", repo, repairErr)
+			return result, err
+		}
+		// Defense-in-depth refresh after repair. The inner function also calls
+		// Refresh, but this ensures the mirror is up-to-date even if the inner
+		// Refresh is ever removed or restructured.
+		if refreshErr := mirror.Refresh(ctx); refreshErr != nil {
+			log.Printf("upload-pack enforce: mirror refresh after repair failed for repo %q: %v", repo, refreshErr)
+			return result, err
+		}
+		result, err = serveUploadPackEnforcedInner(ctx, w, req, mirror, readDenyMatcher, repo)
+	}
+	return result, err
+}
+
+// serveUploadPackEnforcedInner is the core read-protected fetch enforcement
+// logic, extracted from ServeUploadPackEnforced for the retry-on-corruption
+// wrapper. See ServeUploadPackEnforced for full documentation.
+func serveUploadPackEnforcedInner(ctx context.Context, w io.Writer, req *UploadPackRequest,
 	mirror *gitx.Mirror, readDenyMatcher *pathmatch.Matcher, repo string) (UploadPackEnforceResult, error) {
 
 	if err := mirror.Refresh(ctx); err != nil {
