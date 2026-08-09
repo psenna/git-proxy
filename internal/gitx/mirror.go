@@ -141,6 +141,40 @@ func (m *Mirror) Refresh(ctx context.Context) error {
 	return nil
 }
 
+// Repair re-clones the mirror from the upstream, replacing the existing bare
+// directory. It is used for self-healing after a corruption error (missing or
+// damaged objects): the per-mirror mutex serializes Repair with all other mirror
+// operations so no concurrent git invocation accesses a partially-cloned
+// directory. The MirrorOpener cache entry remains valid after Repair — the same
+// *Mirror struct with the same dir and upstreamURL now points at a fresh clone.
+//
+// If RemoveAll succeeds but the re-clone fails (e.g. upstream is down), the
+// mirror directory is gone and subsequent operations on this Mirror will fail
+// until Repair succeeds. This is acceptable: if the upstream is down, no amount
+// of retrying will help, and the next Repair attempt will try again (RemoveAll
+// of a nonexistent directory succeeds, then clone fails again).
+//
+// Thundering herd: if concurrent requests detect corruption on the same mirror,
+// they will serialize on the mutex and each call RemoveAll + re-clone. The end
+// state is correct (the last Repair wins and the mirror is healthy), but the
+// extra clones are wasteful. This is acceptable for v1 (Repair is rare) and can
+// be optimized with a "already repaired" check under the mutex in a future
+// iteration.
+func (m *Mirror) Repair(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := os.RemoveAll(m.dir); err != nil {
+		return fmt.Errorf("gitx: repair mirror: remove: %w", err)
+	}
+	if err := cloneMirror(ctx, m.dir, m.upstreamURL); err != nil {
+		return fmt.Errorf("gitx: repair mirror: clone: %w", err)
+	}
+	if _, err := runGit(ctx, m.dir, "config", "gc.auto", "0"); err != nil {
+		return fmt.Errorf("gitx: repair mirror: gc.auto: %w", err)
+	}
+	return nil
+}
+
 // IngestPackfile writes a pushed packfile's objects into the mirror's object
 // store via `git index-pack --stdin --fix-thin` WITHOUT updating any ref. After
 // this, both the old (from Refresh) and the new (from the pack) objects are

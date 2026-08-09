@@ -58,6 +58,10 @@ type Harness struct {
 	// AuditFile is the filesystem path to the JSONL audit log when the proxy is
 	// started with audit enabled (StartWithPolicyAndAudit). Empty when no audit.
 	AuditFile string
+	// MirrorRoot is the filesystem directory containing the mirror cache when the
+	// proxy is started with enforcement. Empty for the passthrough harness (Start).
+	// Used by tests that need to corrupt the mirror to exercise self-healing.
+	MirrorRoot string
 
 	upstreamSrv *httptest.Server
 	ln          net.Listener
@@ -284,6 +288,7 @@ func startWithPolicy(t *testing.T, repo, agentToken string, pol config.PolicyCon
 
 	mirrorRoot := tolerantTempDir(t)
 	opener := cachingMirrorOpener(h.UpstreamURL, mirrorRoot, nil)
+	h.MirrorRoot = mirrorRoot
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

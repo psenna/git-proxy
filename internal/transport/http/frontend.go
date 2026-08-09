@@ -294,9 +294,11 @@ func (f *Frontend) handleService(w http.ResponseWriter, r *http.Request, repo, s
 		// If no bytes were written yet, we can still set a proper status.
 		// Once streaming has begun, the status is already committed; the
 		// best we can do is end the response (the agent will see a truncated
-		// stream).
+		// stream). 502 Bad Gateway is the correct status for errors where
+		// the proxy failed to get a valid response from its upstream (the
+		// mirror or the real upstream) — the proxy is a gateway.
 		if !fw.wrote {
-			http.Error(w, streamErr.Error(), http.StatusInternalServerError)
+			http.Error(w, streamErr.Error(), http.StatusBadGateway)
 		} else {
 			log.Printf("httpfront: %s stream error after partial write: %v", service, streamErr)
 		}
