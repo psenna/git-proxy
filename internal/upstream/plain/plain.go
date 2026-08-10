@@ -117,19 +117,19 @@ func (u *Upstream) post(ctx context.Context, repo, service, contentType string, 
 }
 
 // applyCreds attaches vault credentials for repo to req, if any are configured.
-// A token-only profile (Token set, Username and Password both empty) is
-// broker-only: the Token is consumed by the SCM adapter, not by Basic auth, so
-// the git leg skips SetBasicAuth entirely rather than emitting a meaningless
-// "Basic Og==" header. The request stays anonymous on this leg (subject to
+// A token-only profile (Token set, Username/Password empty) is synthesized as a
+// GitHub PAT Basic credential (username "x-access-token", password the token)
+// via Credentials.BasicUserPassword, so it authenticates the git leg as well as
+// the broker leg (which sends Token as a Bearer header). When no usable
+// credential is present the request stays anonymous on this leg (subject to
 // deny-by-default / public_repos upstream of here).
 func (u *Upstream) applyCreds(req *http.Request, repo string) {
 	if u.creds == nil {
 		return
 	}
 	if c, ok := u.creds.CredentialsFor(repo); ok {
-		if c.Username == "" && c.Password == "" {
-			return
+		if user, pass, hasCreds := c.BasicUserPassword(); hasCreds {
+			req.SetBasicAuth(user, pass)
 		}
-		req.SetBasicAuth(c.Username, c.Password)
 	}
 }
