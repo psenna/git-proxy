@@ -47,11 +47,20 @@ func repoSlug(repo string) string {
 // fetch leg authenticates without a git credential helper. The agent never sees
 // this URL: it lives only inside the mirror's remote config.
 //
+// A token-only profile (Token set, Username/Password empty) is synthesized as a
+// GitHub PAT Basic credential (username "x-access-token", password the token)
+// via Credentials.BasicUserPassword, so it authenticates the git leg as well as
+// the broker leg. creds==nil, a secretless profile, or a profile with no usable
+// credential yields a bare URL with no userinfo (passthrough/test upstreams).
+//
 // DEV NOTE (flagged for reviewer): inline-URL cred embedding is the simplest
-// testable option and works for HTTP Basic auth upstreams. It does not cover
-// SSH or token-in-header upstreams (those will need a per-mirror credential
-// helper or http.extraHeader, to be added with the SSH frontend / richer
-// upstreams). creds==nil means no credentials are attached (passthrough/test
+// testable option and works for HTTP Basic auth upstreams (including the
+// synthesized x-access-token:<token> form for GitHub PATs). It does not cover
+// SSH upstreams (those will need a per-mirror credential helper, to be added
+// with the SSH frontend / richer upstreams). The userinfo is embedded in the
+// mirror's remote.origin.url at clone time and is NOT re-read on Refresh, so a
+// credential change requires a mirror Repair (re-clone) or a proxy restart to
+// take effect. creds==nil means no credentials are attached (passthrough/test
 // upstreams).
 func upstreamRepoURL(upstreamURL, repo string, creds port.CredentialStore) string {
 	base := strings.TrimRight(upstreamURL, "/")
@@ -63,11 +72,15 @@ func upstreamRepoURL(upstreamURL, repo string, creds port.CredentialStore) strin
 	if !ok {
 		return raw
 	}
+	user, pass, hasCreds := c.BasicUserPassword()
+	if !hasCreds {
+		return raw
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return raw
 	}
-	u.User = url.UserPassword(c.Username, c.Password)
+	u.User = url.UserPassword(user, pass)
 	return u.String()
 }
 

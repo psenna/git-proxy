@@ -142,8 +142,8 @@ func New(path string) (*Store, error) {
 			log.Printf("profile %q (%s) has no usable credential; set %s_PASSWORD/%s_TOKEN (or a file value); repos under it will not be credentialed",
 				rp.Name, rp.Description, up, up)
 		case c.Password == "":
-			log.Printf("profile %q (%s) has token but no password — broker-only; git-HTTP clone will not be credentialed; set %s_PASSWORD (or a file value) to enable it",
-				rp.Name, rp.Description, up)
+			log.Printf("profile %q (%s) has token but no password; the git leg will authenticate as x-access-token:<token> (GitHub PAT Basic form). For a non-GitHub upstream, set %s_USERNAME/%s_PASSWORD (or a file value) instead",
+				rp.Name, rp.Description, up, up)
 		case c.Token == "":
 			log.Printf("profile %q (%s) has password but no token — git-only; broker ops will not be credentialed; set %s_TOKEN (or a file value) to enable it",
 				rp.Name, rp.Description, up)

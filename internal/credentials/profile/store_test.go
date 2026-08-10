@@ -478,7 +478,7 @@ func TestStartupNonFatal_OneLeggedTokenOnly(t *testing.T) {
 	body := `
 credentials:
   - name: company_abc
-    description: "broker-only profile"
+    description: "token-only profile"
     token: lit-tok
     repos: ["mycompany/repo1.git"]
 `
@@ -491,8 +491,17 @@ credentials:
 		t.Fatalf("New: %v", err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "broker-only") {
-		t.Errorf("expected broker-only info line; got:\n%s", out)
+	// A token-only profile now authenticates the git leg too (synthesized
+	// x-access-token:<token> Basic), so the warning explains that form and
+	// names the env vars to set for a non-GitHub upstream instead of claiming
+	// the git leg is uncredentialed.
+	for _, want := range []string{"x-access-token", "git leg", "COMPANY_ABC_PASSWORD"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("warning missing %q; got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "lit-tok") {
+		t.Errorf("LEAK: warning includes the token value; got:\n%s", out)
 	}
 }
 

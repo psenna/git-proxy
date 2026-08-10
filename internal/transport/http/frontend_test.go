@@ -3,6 +3,7 @@ package httpfront
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -312,12 +313,12 @@ func TestFrontend_DenyByDefault(t *testing.T) {
 
 	// Case 5: a token-only credential profile (Token set, Username and Password
 	// both empty) allows the read (access.Decide sees a profile → Allow) and
-	// reaches the upstream, but the upstream request must carry NO
-	// Authorization header. A token-only profile is broker-only (the Token is
-	// consumed by the SCM adapter, not Basic auth); applyUpstreamCreds must
-	// skip SetBasicAuth when both Basic fields are empty rather than emit a
-	// meaningless "Basic Og==" header.
-	t.Run("token_only_profile_no_basic_header", func(t *testing.T) {
+	// reaches the upstream. The git leg synthesizes a GitHub PAT Basic credential
+	// (username "x-access-token", password the token) so the upstream request
+	// carries "Authorization: Basic <base64(x-access-token:token)>" — the token
+	// works on both legs (broker sends it as Bearer) instead of leaving the git
+	// leg anonymous and failing with 401/502.
+	t.Run("token_only_profile_synthesizes_basic", func(t *testing.T) {
 		creds := staticCredStore{"other/x.git": {Username: "", Password: "", Token: "ghp_broker_only"}}
 		up := newRecordingUpstream(t, false) // hit expected (profile allows read)
 		f := newDenyFrontend(t, up, authn, creds, nil)
@@ -332,8 +333,9 @@ func TestFrontend_DenyByDefault(t *testing.T) {
 		if hits == 0 {
 			t.Fatalf("upstream not hit; token-only profile should allow the read and reach upstream")
 		}
-		if authHdr != "" {
-			t.Errorf("upstream Authorization header = %q; token-only profile must not attach Basic auth on the git leg", authHdr)
+		want := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:ghp_broker_only"))
+		if authHdr != want {
+			t.Errorf("upstream Authorization header = %q; token-only profile must synthesize %q on the git leg", authHdr, want)
 		}
 	})
 }

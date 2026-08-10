@@ -318,7 +318,11 @@ credentials:
     description: "Main org token" # optional, human-only (logged in warnings)
     username: ci-bot
     password: hunter2            # git-HTTP Basic
-    token: ghp_broker_token      # broker REST (Bearer); empty = git-only
+    token: ghp_broker_token      # broker REST (Bearer); empty = git-only.
+                                 # A token-only profile (token set, username/
+                                 # password empty) synthesizes git-HTTP Basic as
+                                 # x-access-token:<token>, so token-only works
+                                 # for both legs (GitHub PATs).
     repos: ["mycompany/*"]       # patterns matched against the upstream repo path
 ```
 
@@ -342,8 +346,12 @@ credentials:
     or same wildcard pattern in two profiles.
   - **Warning** (non-fatal, proxy starts): a secretless profile (password AND
     token both empty after env resolution) or a one-legged profile (token set,
-    password empty, or vice versa). The warning names the **env-var NAMES** and
-    the **description** — never the resolved secret.
+    password empty, or vice versa). A token-only profile is no longer
+    broker-only — the git leg synthesizes `x-access-token:<token>` Basic — so
+    its info line explains that form and names the env vars to set for a
+    non-GitHub upstream; a password-only profile is git-only (broker ops will
+    not be credentialed). The warning names the **env-var NAMES** and the
+    **description** — never the resolved secret.
 - **Secretless profile → `(zero, false)`.** A profile whose resolved password
   and token are both empty still matches its `repos`, but `CredentialsFor`
   returns `(zero, false)`, so the deny decision falls through to `public_repos`

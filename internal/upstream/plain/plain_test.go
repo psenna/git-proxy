@@ -106,14 +106,13 @@ func TestUpstream_NoCredsWhenVaultEmpty(t *testing.T) {
 	}
 }
 
-// TestUpstream_TokenOnlyNoBasicHeader asserts that a token-only credential
-// profile (Token set, Username and Password both empty) does NOT attach an
-// Authorization header on the git leg. A token-only profile is broker-only
-// (the Token is consumed by the SCM adapter, not by Basic auth); attaching
-// SetBasicAuth("", "") would emit a meaningless "Basic Og==" header. The git
-// leg must skip Basic auth entirely when both Basic fields are empty, leaving
-// the request anonymous (subject to deny-by-default / public_repos upstream).
-func TestUpstream_TokenOnlyNoBasicHeader(t *testing.T) {
+// TestUpstream_TokenOnlySynthesizesBasic asserts that a token-only credential
+// profile (Token set, Username and Password both empty) authenticates the git
+// leg by synthesizing a GitHub PAT Basic credential: the upstream request must
+// carry "Authorization: Basic <base64(x-access-token:token)>". This lets a
+// token-only profile work on both legs (the broker sends Token as Bearer)
+// instead of leaving the git leg anonymous and failing with 401/502.
+func TestUpstream_TokenOnlySynthesizesBasic(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
@@ -131,8 +130,9 @@ func TestUpstream_TokenOnlyNoBasicHeader(t *testing.T) {
 	if _, err := up.ListRefs(context.Background(), "test.git"); err != nil {
 		t.Fatalf("ListRefs: %v", err)
 	}
-	if gotAuth != "" {
-		t.Errorf("token-only profile attached Authorization %q; git leg must skip Basic auth when Username and Password are both empty", gotAuth)
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:ghp_broker_only"))
+	if gotAuth != want {
+		t.Errorf("token-only profile Authorization = %q, want %q (synthesized x-access-token Basic)", gotAuth, want)
 	}
 }
 
