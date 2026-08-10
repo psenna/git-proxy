@@ -19,6 +19,21 @@ func TestIsCorruptionError(t *testing.T) {
 		{fmt.Errorf("error: corrupt loose object abc"), true},
 		{fmt.Errorf("error: loose object abc (in .git/objects/...) is corrupt"), true},
 		{fmt.Errorf("fatal: unable to unpack abc123 header"), true},
+		// Type-specific "bad <type> object" variants — git uses these when a
+		// non-commit object (tree, blob, tag) is missing from the object store.
+		// The generic "bad object" pattern does NOT match these (e.g. "bad tree
+		// object" does not contain the substring "bad object"), so they MUST be
+		// listed explicitly. Without them, the self-healing wrapper never
+		// triggers on a missing tree/blob and the fetch fails with HTTP 502
+		// (issues #69/#71 regression).
+		{fmt.Errorf("git rev-list: exit status 128: fatal: bad tree object 6015b9f19393e2b6"), true},
+		{fmt.Errorf("gitx: wanted objects: git rev-list: exit status 128: fatal: bad tree object deadbeef"), true},
+		{fmt.Errorf("fatal: bad blob object cafef00d"), true},
+		{fmt.Errorf("fatal: bad commit object 1234abcd"), true},
+		{fmt.Errorf("fatal: bad tag object 5678ef90"), true},
+		// The full wrapped error from the enforce path (matches the production
+		// log from issue #69 with a tree instead of a commit).
+		{fmt.Errorf("gitproto: upload-pack enforce: wanted objects: gitx: wanted objects: git rev-list: exit status 128: fatal: bad tree object 6015b9f19393e2b6"), true},
 		// Wrapped errors — still match.
 		{fmt.Errorf("enforce: %w", fmt.Errorf("bad object 1234")), true},
 		// Nil — not corruption.
