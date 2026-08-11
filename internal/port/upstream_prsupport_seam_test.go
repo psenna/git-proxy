@@ -31,7 +31,7 @@ func TestPRSupport_SeamAndErrNotImplemented(t *testing.T) {
 	if _, err := got.BranchProtection(context.Background(), "repo", "branch"); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("BranchProtection err = %v, want ErrNotImplemented", err)
 	}
-	if _, err := got.EnsurePR(context.Background(), "repo", "head", "base", "title"); !errors.Is(err, ErrNotImplemented) {
+	if _, err := got.EnsurePR(context.Background(), "repo", "head", "base", "title", "body"); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("EnsurePR err = %v, want ErrNotImplemented", err)
 	}
 	// The v2 PR/CI capability methods are also part of the seam; a stub that
@@ -72,7 +72,7 @@ func (prSupportStub) BranchProtection(ctx context.Context, repo, branch string) 
 	return BranchProtection{}, ErrNotImplemented
 }
 
-func (prSupportStub) EnsurePR(ctx context.Context, repo, head, base, title string) (PR, error) {
+func (prSupportStub) EnsurePR(ctx context.Context, repo, head, base, title, body string) (PR, error) {
 	return PR{}, ErrNotImplemented
 }
 

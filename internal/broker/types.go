@@ -11,6 +11,7 @@ type createPRReq struct {
 	Head  string `json:"head"`
 	Base  string `json:"base"`
 	Title string `json:"title"`
+	Body  string `json:"body"`
 }
 
 // mergePRReq is the body of POST /{repo}/prs/{number}/merge. Method is optional

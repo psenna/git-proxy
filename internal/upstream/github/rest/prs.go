@@ -6,16 +6,17 @@ import (
 	"net/http"
 )
 
-// CreatePR opens a pull request on repo from head into base with title.
+// CreatePR opens a pull request on repo from head into base with title and an
+// optional markdown description (body).
 // GitHub REST: POST /repos/{owner}/{repo}/pulls. Returns the new PR (number,
 // url, head/base/state).
-func (c *Client) CreatePR(ctx context.Context, repo, head, base, title string) (PR, error) {
+func (c *Client) CreatePR(ctx context.Context, repo, head, base, title, body string) (PR, error) {
 	p, err := repoPath(repo)
 	if err != nil {
 		return PR{}, err
 	}
 	var payload prPayload
-	if _, err := c.do(ctx, http.MethodPost, p+"/pulls", createPRRequest{Head: head, Base: base, Title: title}, &payload); err != nil {
+	if _, err := c.do(ctx, http.MethodPost, p+"/pulls", createPRRequest{Head: head, Base: base, Title: title, Body: body}, &payload); err != nil {
 		return PR{}, err
 	}
 	return payload.toPR(), nil

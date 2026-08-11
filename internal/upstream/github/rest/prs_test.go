@@ -51,7 +51,7 @@ func TestCreatePR(t *testing.T) {
 	defer s.Close()
 	c := New(s.URL, "tok")
 
-	pr, err := c.CreatePR(context.Background(), "owner/repo.git", "feat", "main", "fix")
+	pr, err := c.CreatePR(context.Background(), "owner/repo.git", "feat", "main", "fix", "body")
 	if err != nil {
 		t.Fatalf("CreatePR: %v", err)
 	}

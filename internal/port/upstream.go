@@ -66,10 +66,11 @@ type PRSupport interface {
 	// GitHub REST: GET /repos/{owner}/{repo}/branches/{branch}/protection.
 	// v1 skeleton returns ErrNotImplemented.
 	BranchProtection(ctx context.Context, repo, branch string) (BranchProtection, error)
-	// EnsurePR creates a pull request on repo from head to base with title.
+	// EnsurePR creates a pull request on repo from head to base with title and
+	// an optional markdown description (body).
 	// GitHub REST: POST /repos/{owner}/{repo}/pulls.
 	// v1 skeleton returns ErrNotImplemented.
-	EnsurePR(ctx context.Context, repo, head, base, title string) (PR, error)
+	EnsurePR(ctx context.Context, repo, head, base, title, body string) (PR, error)
 
 	// GetPR fetches a single pull request by number. GitHub REST:
 	// GET /repos/{owner}/{repo}/pulls/{number}.

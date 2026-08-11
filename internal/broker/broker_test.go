@@ -34,7 +34,7 @@ type stubPRSupport struct {
 func (s stubPRSupport) BranchProtection(context.Context, string, string) (port.BranchProtection, error) {
 	return port.BranchProtection{}, port.ErrNotImplemented
 }
-func (s stubPRSupport) EnsurePR(context.Context, string, string, string, string) (port.PR, error) {
+func (s stubPRSupport) EnsurePR(context.Context, string, string, string, string, string) (port.PR, error) {
 	return port.PR{Number: s.prNumber, URL: "https://gh/pull/" + itoa(s.prNumber)}, s.prErr
 }
 func (s stubPRSupport) GetPR(context.Context, string, int) (port.PRState, error) {

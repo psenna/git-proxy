@@ -58,6 +58,7 @@ type createPRRequest struct {
 	Head  string `json:"head"`
 	Base  string `json:"base"`
 	Title string `json:"title"`
+	Body  string `json:"body"`
 }
 
 // mergePRRequest is the body of PUT /repos/{owner}/{repo}/pulls/{n}/merge.

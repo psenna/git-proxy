@@ -66,7 +66,7 @@ func (b *Broker) handleCreate(w http.ResponseWriter, r *http.Request) {
 		b.opFail(w, r, agent.Name, repo, op, err)
 		return
 	}
-	pr, err := b.prs.EnsurePR(r.Context(), repo, req.Head, req.Base, req.Title)
+	pr, err := b.prs.EnsurePR(r.Context(), repo, req.Head, req.Base, req.Title, req.Body)
 	if err != nil {
 		b.opFail(w, r, agent.Name, repo, op, err)
 		return
