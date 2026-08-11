@@ -254,25 +254,85 @@ type ObjectPath struct {
 	Path string
 }
 
+// filterPresentHaves probes which of haves are present in the mirror's object
+// store via `git cat-file --batch-check` and returns only the present OIDs, in
+// input order. A have absent from the mirror (a stale/unknown commit the client
+// advertises but the mirror does not have) is "not common ground": it must NOT
+// be passed to `git rev-list --not`, which fails with `fatal: bad object <sha>`
+// on a missing object and surfaces as a 502 via IsCorruptionError (issue #75).
+//
+// The per-mirror mutex MUST already be held by the caller (this helper is
+// unlocked); do NOT call ObjectTypes from here — it re-locks m.mu and would
+// deadlock. Fail-closed: a non-zero git exit, a cat-file line-count mismatch, or
+// a malformed line returns an error so no haves are dropped silently.
+func (m *Mirror) filterPresentHaves(ctx context.Context, haves []string) ([]string, error) {
+	if len(haves) == 0 {
+		return nil, nil
+	}
+	cmd := exec.CommandContext(ctx, "git", fullArgs(m.dir, "cat-file", "--batch-check")...)
+	var stdin strings.Builder
+	for _, oid := range haves {
+		stdin.WriteString(oid)
+		stdin.WriteByte('\n')
+	}
+	cmd.Stdin = strings.NewReader(stdin.String())
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("gitx: filter present haves: %w: %s", err, redactCreds(strings.TrimSpace(stderr.String())))
+	}
+	lines := splitCleanLines(stdout.Bytes())
+	if len(lines) != len(haves) {
+		return nil, fmt.Errorf("gitx: filter present haves: cat-file output line count %d != input %d", len(lines), len(haves))
+	}
+	presentSet := make(map[string]bool, len(haves))
+	for _, line := range lines {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			return nil, fmt.Errorf("gitx: filter present haves: malformed cat-file line %q", line)
+		}
+		if f[1] == "missing" {
+			continue
+		}
+		presentSet[f[0]] = true
+	}
+	present := make([]string, 0, len(haves))
+	for _, oid := range haves {
+		if presentSet[oid] {
+			present = append(present, oid)
+		}
+	}
+	return present, nil
+}
+
 // WantedObjects returns the objects reachable from wants excluding haves, with
 // paths for blobs/trees as `git rev-list --objects <wants> --not <haves>` prints
 // them: each output line is `<oid>` (commits and the root tree, no path) or
 // `<oid> <path>` (blobs and non-root trees, with the path they are reachable at).
-// The per-mirror mutex is held so the rev-list does not race a concurrent
+// Haves absent from the mirror are treated as non-common ground: they are dropped
+// before `--not` is built (a client advertising a stale/unknown commit must not
+// turn the rev-list into `fatal: bad object <sha>` / a 502, mirroring a real git
+// upload-pack). The probe is fail-closed — any cat-file error is returned. The
+// per-mirror mutex is held so the rev-list does not race a concurrent
 // Refresh/IngestPackfile. A nil/empty wants list yields an empty result.
 func (m *Mirror) WantedObjects(ctx context.Context, wants, haves []string) ([]ObjectPath, error) {
 	if len(wants) == 0 {
 		return nil, nil
 	}
-	args := make([]string, 0, 2+len(wants)+len(haves)+1)
-	args = append(args, "rev-list", "--objects")
-	args = append(args, wants...)
-	if len(haves) > 0 {
-		args = append(args, "--not")
-		args = append(args, haves...)
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	presentHaves, err := m.filterPresentHaves(ctx, haves)
+	if err != nil {
+		return nil, err
+	}
+	args := make([]string, 0, 2+len(wants)+len(presentHaves)+1)
+	args = append(args, "rev-list", "--objects")
+	args = append(args, wants...)
+	if len(presentHaves) > 0 {
+		args = append(args, "--not")
+		args = append(args, presentHaves...)
+	}
 	out, err := runGit(ctx, m.dir, args...)
 	if err != nil {
 		return nil, fmt.Errorf("gitx: wanted objects: %w", err)
@@ -356,26 +416,34 @@ func parseCommitParents(out []byte) []CommitParents {
 // `git rev-list --objects <wants> --not <excludes> --not <haves>`. This is the
 // shallow packfile's object set: commits/trees/blobs within the cut, excluding
 // the depth/exclude boundary commits' objects and objects the client already
-// has. Output is parsed with the existing parseObjectPaths (same `<oid>` /
-// `<oid> <path>` format as WantedObjects). The per-mirror mutex is held for the
-// synchronous rev-list. nil/empty wants yields nil with no error.
+// has. Only HAVES are filtered for presence in the mirror (unknown haves are
+// non-common ground and are dropped); excludes is the server-computed shallow
+// cut and is present in the mirror by construction, so it is passed through
+// unfiltered. The probe is fail-closed — any cat-file error is returned. Output
+// is parsed with the existing parseObjectPaths (same `<oid>` / `<oid> <path>`
+// format as WantedObjects). The per-mirror mutex is held for the synchronous
+// rev-list. nil/empty wants yields nil with no error.
 func (m *Mirror) ShallowObjects(ctx context.Context, wants, excludes, haves []string) ([]ObjectPath, error) {
 	if len(wants) == 0 {
 		return nil, nil
 	}
-	args := make([]string, 0, 4+len(wants)+len(excludes)+len(haves))
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	presentHaves, err := m.filterPresentHaves(ctx, haves)
+	if err != nil {
+		return nil, err
+	}
+	args := make([]string, 0, 4+len(wants)+len(excludes)+len(presentHaves))
 	args = append(args, "rev-list", "--objects")
 	args = append(args, wants...)
 	if len(excludes) > 0 {
 		args = append(args, "--not")
 		args = append(args, excludes...)
 	}
-	if len(haves) > 0 {
+	if len(presentHaves) > 0 {
 		args = append(args, "--not")
-		args = append(args, haves...)
+		args = append(args, presentHaves...)
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	out, err := runGit(ctx, m.dir, args...)
 	if err != nil {
 		return nil, fmt.Errorf("gitx: shallow objects: %w", err)
