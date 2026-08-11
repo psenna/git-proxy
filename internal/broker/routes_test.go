@@ -17,7 +17,7 @@ import (
 // token never leaves the broker's authenticate call).
 type capturingPRSupport struct {
 	stubUpstream
-	ensureHead, ensureBase, ensureTitle string
+	ensureHead, ensureBase, ensureTitle, ensureBody string
 	mergeNumber                         int
 	mergeMethod                         string
 	commentNumber                       int
@@ -33,8 +33,8 @@ type capturingPRSupport struct {
 func (c *capturingPRSupport) BranchProtection(context.Context, string, string) (port.BranchProtection, error) {
 	return port.BranchProtection{}, port.ErrNotImplemented
 }
-func (c *capturingPRSupport) EnsurePR(_ context.Context, _ string, head, base, title string) (port.PR, error) {
-	c.ensureHead, c.ensureBase, c.ensureTitle = head, base, title
+func (c *capturingPRSupport) EnsurePR(_ context.Context, _ string, head, base, title, body string) (port.PR, error) {
+	c.ensureHead, c.ensureBase, c.ensureTitle, c.ensureBody = head, base, title, body
 	return port.PR{Number: 7, URL: "https://gh/pull/7"}, c.prErr
 }
 func (c *capturingPRSupport) GetPR(_ context.Context, _ string, _ int) (port.PRState, error) {
@@ -96,13 +96,16 @@ func do(t *testing.T, srv *httptest.Server, method, path, token string, body []b
 func TestCreatePR_HappyPath(t *testing.T) {
 	up := &capturingPRSupport{}
 	_, srv := newTestBroker(t, up, Config{MergeMethod: "squash"})
-	resp := do(t, srv, http.MethodPost, "/owner%2Frepo.git/prs", "agent-token-1", []byte(`{"head":"feat","base":"main","title":"t"}`))
+	resp := do(t, srv, http.MethodPost, "/owner%2Frepo.git/prs", "agent-token-1", []byte(`{"head":"feat","base":"main","title":"t","body":"## What was done\n\ndesc"}`))
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", resp.StatusCode)
 	}
 	if up.ensureHead != "feat" || up.ensureBase != "main" || up.ensureTitle != "t" {
 		t.Errorf("EnsurePR args = head=%q base=%q title=%q", up.ensureHead, up.ensureBase, up.ensureTitle)
+	}
+	if up.ensureBody != "## What was done\n\ndesc" {
+		t.Errorf("EnsurePR body = %q, want the request body forwarded", up.ensureBody)
 	}
 	b, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(b), `"number":7`) || !strings.Contains(string(b), `"url":"https://gh/pull/7"`) {

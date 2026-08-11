@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/psenna/git-proxy/internal/port"
@@ -91,7 +92,7 @@ func TestPRSupport_BranchProtectionStillStub(t *testing.T) {
 		t.Errorf("BranchProtection err = %v, want ErrNotImplemented", err)
 	}
 	// No token configured → fail closed, never an anonymous REST call.
-	if _, err := prs.EnsurePR(context.Background(), "owner/repo", "feat", "main", "title"); !errors.Is(err, port.ErrUnauthorized) {
+	if _, err := prs.EnsurePR(context.Background(), "owner/repo", "feat", "main", "title", "body"); !errors.Is(err, port.ErrUnauthorized) {
 		t.Errorf("EnsurePR err = %v, want ErrUnauthorized (fail closed, no token)", err)
 	}
 }
@@ -113,11 +114,16 @@ func (f fakeVault) CredentialsFor(repo string) (port.Credentials, bool) {
 // GitHub anonymously.
 func TestPRSupport_RealCallsAttachTokenAndFailClosed(t *testing.T) {
 	const proxyToken = "ghp_test"
-	var gotAuth, gotPath, gotMethod string
+	var gotAuth, gotPath, gotMethod, gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		gotPath = r.URL.Path
 		gotMethod = r.Method
+		if r.Body != nil {
+			if b, err := io.ReadAll(r.Body); err == nil {
+				gotBody = string(b)
+			}
+		}
 		switch r.URL.Path {
 		case "/api/v3/repos/owner/repo/pulls":
 			if r.Method == http.MethodPost {
@@ -155,7 +161,7 @@ func TestPRSupport_RealCallsAttachTokenAndFailClosed(t *testing.T) {
 	var prs port.PRSupport = adapter
 	ctx := context.Background()
 
-	pr, err := prs.EnsurePR(ctx, "owner/repo.git", "feat", "main", "t")
+	pr, err := prs.EnsurePR(ctx, "owner/repo.git", "feat", "main", "t", "desc body")
 	if err != nil {
 		t.Fatalf("EnsurePR: %v", err)
 	}
@@ -167,6 +173,9 @@ func TestPRSupport_RealCallsAttachTokenAndFailClosed(t *testing.T) {
 	}
 	if gotPath != "/api/v3/repos/owner/repo/pulls" {
 		t.Errorf("EnsurePR path = %q, want /api/v3/repos/owner/repo/pulls (no .git)", gotPath)
+	}
+	if !strings.Contains(gotBody, `"body":"desc body"`) {
+		t.Errorf("EnsurePR body = %q, want it to contain the PR description body", gotBody)
 	}
 
 	state, err := prs.GetPR(ctx, "owner/repo.git", 7)
@@ -211,7 +220,7 @@ func TestPRSupport_RealCallsAttachTokenAndFailClosed(t *testing.T) {
 	// anonymously; it returns ErrUnauthorized before any request leaves.
 	noTokenAdapter := New(upstream.UpstreamConfig{Kind: "github", URL: srv.URL, CredentialsStore: emptyVault{}})
 	var unknownPRs port.PRSupport = noTokenAdapter
-	if _, err := unknownPRs.EnsurePR(ctx, "owner/repo.git", "feat", "main", "t"); !errors.Is(err, port.ErrUnauthorized) {
+	if _, err := unknownPRs.EnsurePR(ctx, "owner/repo.git", "feat", "main", "t", "body"); !errors.Is(err, port.ErrUnauthorized) {
 		t.Errorf("EnsurePR with no token err = %v, want ErrUnauthorized", err)
 	}
 }

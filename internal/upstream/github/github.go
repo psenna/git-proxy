@@ -108,12 +108,12 @@ func (a *Adapter) BranchProtection(_ context.Context, _ string, _ string) (port.
 // GitHub REST: POST /repos/{owner}/{repo}/pulls. It is the create-side
 // counterpart of GetPR: it returns the minimal port.PR (Number + URL) the
 // policy layer needs, while GetPR/ListPRs return the richer port.PRState.
-func (a *Adapter) EnsurePR(ctx context.Context, repo, head, base, title string) (port.PR, error) {
+func (a *Adapter) EnsurePR(ctx context.Context, repo, head, base, title, body string) (port.PR, error) {
 	c, err := a.restClient(repo)
 	if err != nil {
 		return port.PR{}, err
 	}
-	pr, err := c.CreatePR(ctx, repo, head, base, title)
+	pr, err := c.CreatePR(ctx, repo, head, base, title, body)
 	if err != nil {
 		return port.PR{}, err
 	}
