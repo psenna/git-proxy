@@ -71,9 +71,13 @@ func newFilteredEngine(mode EvalMode, entries []ruleEntry) *Engine {
 // EvaluatePush evaluates the request against every applicable rule's push
 // path. Fail-closed: a rule returning an error yields a deny. In FirstDeny
 // mode the first deny short-circuits; in CollectAll mode all deny reasons are
-// aggregated.
+// aggregated. Reasons from ALLOW decisions are forwarded on the final Allow
+// decision (rules can annotate a successful evaluation, e.g. a secret_scan
+// placeholder finding); an all-allow evaluation with no reasons is a bare
+// Allow.
 func (e *Engine) EvaluatePush(req port.PushRequest) port.Decision {
 	var reasons []port.Reason
+	var allowReasons []port.Reason
 	denied := false
 	for _, entry := range e.entries {
 		if !entry.applies(req.Agent, req.Repo) {
@@ -94,18 +98,25 @@ func (e *Engine) EvaluatePush(req port.PushRequest) port.Decision {
 			if e.mode == FirstDeny {
 				return port.Decision{Verdict: port.VerdictDeny, Reasons: reasons}
 			}
+		} else {
+			// Allow decision: forward its reasons (if any) so rule-level
+			// annotations (e.g. suppressed secret_scan placeholders) survive to
+			// the audit record. Existing rules return zero-Reason Allows, so this
+			// is additive. A denied evaluation never reaches here in FirstDeny.
+			allowReasons = append(allowReasons, dec.Reasons...)
 		}
 	}
-	if denied || len(reasons) > 0 {
+	if denied {
 		return port.Decision{Verdict: port.VerdictDeny, Reasons: reasons}
 	}
-	return port.Decision{Verdict: port.VerdictAllow}
+	return port.Decision{Verdict: port.VerdictAllow, Reasons: allowReasons}
 }
 
 // EvaluateFetch evaluates the request against every applicable rule's fetch
 // path. Semantics mirror EvaluatePush.
 func (e *Engine) EvaluateFetch(req port.FetchRequest) port.Decision {
 	var reasons []port.Reason
+	var allowReasons []port.Reason
 	denied := false
 	for _, entry := range e.entries {
 		if !entry.applies(req.Agent, req.Repo) {
@@ -126,12 +137,15 @@ func (e *Engine) EvaluateFetch(req port.FetchRequest) port.Decision {
 			if e.mode == FirstDeny {
 				return port.Decision{Verdict: port.VerdictDeny, Reasons: reasons}
 			}
+		} else {
+			// Forward allow reasons (additive; existing rules emit none).
+			allowReasons = append(allowReasons, dec.Reasons...)
 		}
 	}
-	if denied || len(reasons) > 0 {
+	if denied {
 		return port.Decision{Verdict: port.VerdictDeny, Reasons: reasons}
 	}
-	return port.Decision{Verdict: port.VerdictAllow}
+	return port.Decision{Verdict: port.VerdictAllow, Reasons: allowReasons}
 }
 
 func errorMessage(err error) string {
@@ -205,10 +219,10 @@ func LookupRule(name string) (RuleFactory, bool) {
 // verbatim from the YAML params block; a rule's factory decodes the keys it
 // understands (e.g. history_protect's "refs", branch_pattern's "allow").
 type RuleConfig struct {
-	Enabled bool              `yaml:"enabled"`
-	Agents  []string          `yaml:"agents"`
-	Repos   []string          `yaml:"repos"`
-	Params  map[string]any    `yaml:"params"`
+	Enabled bool           `yaml:"enabled"`
+	Agents  []string       `yaml:"agents"`
+	Repos   []string       `yaml:"repos"`
+	Params  map[string]any `yaml:"params"`
 }
 
 // PolicyConfig selects the evaluation mode and which rules are enabled for

@@ -31,10 +31,10 @@ type defaultPattern struct {
 // Scanner is a port.SecretScanner backed by regexes + entropy. The zero value
 // is not usable; build one with New.
 type Scanner struct {
-	defaults []defaultPattern
-	extra    []*regexp.Regexp
+	defaults   []defaultPattern
+	extra      []*regexp.Regexp
 	extraNames []string
-	entropy  *regexp.Regexp
+	entropy    *regexp.Regexp
 }
 
 // builtins are the compiled default patterns. They are conservative to keep
@@ -78,14 +78,21 @@ func New(extra []Pattern) (*Scanner, error) {
 // default and extra patterns plus a high-entropy heuristic. Findings carry the
 // 1-based line number and a REDACTED snippet (the matched secret is masked).
 //
+// allowlist disables suppression for secrets whose RAW matched value exactly
+// matches an entry (compared before redaction): such findings are returned with
+// Suppressed=true and a redacted snippet. nil/empty allowlist disables
+// suppression (today's behavior — every match is a live finding). Entries are
+// trimmed; whitespace-only entries are dropped.
+//
 // Binary content is skipped: a NUL byte is the standard heuristic for a binary
 // file (PNGs, compiled artifacts, etc.), and binary blobs contain long
 // base64-ish runs above the entropy threshold that would yield false-positive
 // high-entropy findings and block legitimate binary pushes.
-func (s *Scanner) Scan(path string, content []byte) []port.SecretFinding {
+func (s *Scanner) Scan(path string, content []byte, allowlist []string) []port.SecretFinding {
 	if bytes.IndexByte(content, 0) >= 0 {
 		return nil
 	}
+	allow := makeAllowSet(allowlist)
 	var findings []port.SecretFinding
 	// Iterate line-by-line so line numbers and snippets are naturally bounded
 	// to the matching line.
@@ -104,11 +111,13 @@ func (s *Scanner) Scan(path string, content []byte) []port.SecretFinding {
 			if loc[0] == loc[1] {
 				continue
 			}
+			raw := line[loc[0]:loc[1]]
 			findings = append(findings, port.SecretFinding{
-				Path:    path,
-				Line:    ln,
-				Rule:    d.name,
-				Snippet: redact(line, line[loc[0]:loc[1]]),
+				Path:       path,
+				Line:       ln,
+				Rule:       d.name,
+				Snippet:    redact(line, raw),
+				Suppressed: containsRaw(raw, allow),
 			})
 		}
 		for j, re := range s.extra {
@@ -119,11 +128,13 @@ func (s *Scanner) Scan(path string, content []byte) []port.SecretFinding {
 			if loc[0] == loc[1] {
 				continue
 			}
+			raw := line[loc[0]:loc[1]]
 			findings = append(findings, port.SecretFinding{
-				Path:    path,
-				Line:    ln,
-				Rule:    s.extraNames[j],
-				Snippet: redact(line, line[loc[0]:loc[1]]),
+				Path:       path,
+				Line:       ln,
+				Rule:       s.extraNames[j],
+				Snippet:    redact(line, raw),
+				Suppressed: containsRaw(raw, allow),
 			})
 		}
 		// High-entropy heuristic: scan the line for long base64/hex runs.
@@ -131,16 +142,44 @@ func (s *Scanner) Scan(path string, content []byte) []port.SecretFinding {
 			run := line[m[0]:m[1]]
 			if shannonEntropy(run) >= entropyThreshold {
 				findings = append(findings, port.SecretFinding{
-					Path:    path,
-					Line:    ln,
-					Rule:    "high-entropy",
-					Snippet: redact(line, run),
+					Path:       path,
+					Line:       ln,
+					Rule:       "high-entropy",
+					Snippet:    redact(line, run),
+					Suppressed: containsRaw(run, allow),
 				})
 				break // one entropy finding per line is enough
 			}
 		}
 	}
 	return findings
+}
+
+// makeAllowSet builds the allowlist lookup set from allowlist. Entries are
+// trimmed; whitespace-only entries are dropped. nil is returned for a nil or
+// empty allowlist so callers can fast-path with today's behavior (nil set and
+// nil map both fail containsRaw).
+func makeAllowSet(allowlist []string) map[string]struct{} {
+	if len(allowlist) == 0 {
+		return nil
+	}
+	allow := make(map[string]struct{}, len(allowlist))
+	for _, s := range allowlist {
+		if t := strings.TrimSpace(s); t != "" {
+			allow[t] = struct{}{}
+		}
+	}
+	return allow
+}
+
+// containsRaw reports whether raw exactly matches an entry in allow. A nil
+// allow (suppression disabled) never matches.
+func containsRaw(raw string, allow map[string]struct{}) bool {
+	if allow == nil {
+		return false
+	}
+	_, ok := allow[raw]
+	return ok
 }
 
 // redact returns a bounded snippet of line with every occurrence of secret

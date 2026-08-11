@@ -11,13 +11,13 @@ import (
 // records that it was evaluated. Real rules live in internal/policy/rules and
 // register via init(); stubs are used here to exercise the engine in isolation.
 type stubRule struct {
-	name        string
-	pushDec     port.Decision
-	pushErr     error
-	fetchDec    port.Decision
-	fetchErr    error
-	pushCalls   int
-	fetchCalls  int
+	name       string
+	pushDec    port.Decision
+	pushErr    error
+	fetchDec   port.Decision
+	fetchErr   error
+	pushCalls  int
+	fetchCalls int
 }
 
 func (s *stubRule) Name() string { return s.name }
@@ -64,6 +64,54 @@ func TestEngine_AllowWhenAllAllow(t *testing.T) {
 	if len(got.Reasons) != 0 {
 		t.Fatalf("reasons = %v, want empty", got.Reasons)
 	}
+}
+
+func TestEngine_AllowReasonsForwarded(t *testing.T) {
+	// A rule that allows but annotates the decision with a reason (e.g. a
+	// suppressed secret_scan placeholder) must have that reason forwarded on the
+	// final Allow decision — it is the audit record for the annotation.
+	t.Run("first deny forwards allow reason", func(t *testing.T) {
+		r := &stubRule{
+			name:    "annotated",
+			pushDec: port.Decision{Verdict: port.VerdictAllow, Reasons: []port.Reason{{Rule: "annotated", Message: "note"}}},
+		}
+		e := NewEngine(FirstDeny, r)
+		got := e.EvaluatePush(port.PushRequest{Agent: "x", Repo: "r"})
+		if got.Verdict != port.VerdictAllow {
+			t.Fatalf("verdict = %v, want Allow", got.Verdict)
+		}
+		if len(got.Reasons) != 1 || got.Reasons[0].Message != "note" {
+			t.Fatalf("reasons = %+v, want the forwarded allow reason", got.Reasons)
+		}
+	})
+	t.Run("collect all forwards allow reason", func(t *testing.T) {
+		r := &stubRule{
+			name:    "annotated",
+			pushDec: port.Decision{Verdict: port.VerdictAllow, Reasons: []port.Reason{{Rule: "annotated", Message: "note"}}},
+		}
+		e := NewEngine(CollectAll, r)
+		got := e.EvaluatePush(port.PushRequest{Agent: "x", Repo: "r"})
+		if got.Verdict != port.VerdictAllow {
+			t.Fatalf("verdict = %v, want Allow", got.Verdict)
+		}
+		if len(got.Reasons) != 1 || got.Reasons[0].Message != "note" {
+			t.Fatalf("reasons = %+v, want the forwarded allow reason", got.Reasons)
+		}
+	})
+	t.Run("fetch path forwards allow reason", func(t *testing.T) {
+		r := &stubRule{
+			name:     "annotated",
+			fetchDec: port.Decision{Verdict: port.VerdictAllow, Reasons: []port.Reason{{Rule: "annotated", Message: "note"}}},
+		}
+		e := NewEngine(FirstDeny, r)
+		got := e.EvaluateFetch(port.FetchRequest{Agent: "x", Repo: "r"})
+		if got.Verdict != port.VerdictAllow {
+			t.Fatalf("verdict = %v, want Allow", got.Verdict)
+		}
+		if len(got.Reasons) != 1 || got.Reasons[0].Message != "note" {
+			t.Fatalf("reasons = %+v, want the forwarded allow reason", got.Reasons)
+		}
+	})
 }
 
 func TestEngine_DenyWinsOverAllow(t *testing.T) {

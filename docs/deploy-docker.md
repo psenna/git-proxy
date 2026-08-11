@@ -220,6 +220,12 @@ git -c "$GIT_PROXY_HEADER" push origin feat/secret
 
 `feat/secret` never reaches Gitea.
 
+To allow a known placeholder value (e.g. a sample key in a config template),
+add `ignore_strings` under `secret_scan.params` — a **global** exact-value
+allowlist. A finding whose raw value exactly matches an entry is allowed and
+recorded in the audit **MASKED** (rule/path/line only, never the raw value). The
+allowlist never disables scanning: any other secret is still denied.
+
 ### Read protection withholds `secrets/**` from a partial clone
 
 `policy.read.deny: ["secrets/**"]` withholds blobs whose path matches from any

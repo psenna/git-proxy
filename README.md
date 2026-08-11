@@ -55,6 +55,7 @@ policy:
       params: { allow: ["refs/heads/main", "refs/heads/feat/*"] }  # only these refs may be pushed
     secret_scan:
       enabled: true                 # redacted reasons; the matched secret never reaches the agent/audit/alert
+      # params: { ignore_strings: ["AKIA_REPLACE_WITH_YOUR_KEY"] }  # global exact-value allowlist; suppressed findings are audit-masked
   read:
     deny: ["secrets/**"]            # withhold secrets/ blobs from fetch (use --filter=blob:none to clone)
   # dry_run: true                   # forward a clean policy-deny instead of blocking; audit records deny + dry_run

@@ -14,9 +14,9 @@ func TestScanner_Defaults(t *testing.T) {
 	}
 
 	cases := []struct {
-		name    string
-		path    string
-		content string
+		name     string
+		path     string
+		content  string
 		wantRule string // expect a finding with this rule name
 	}{
 		{name: "aws access key id", path: "config.yml", content: "aws_access_key_id: AKIAIOSFODNN7EXAMPLE\n", wantRule: "aws-access-key-id"},
@@ -27,7 +27,7 @@ func TestScanner_Defaults(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			findings := sc.Scan(c.path, []byte(c.content))
+			findings := sc.Scan(c.path, []byte(c.content), nil)
 			found := false
 			for _, f := range findings {
 				if f.Rule == c.wantRule {
@@ -51,7 +51,7 @@ func TestScanner_Defaults(t *testing.T) {
 func TestScanner_CleanFileNoFindings(t *testing.T) {
 	sc, _ := regex.New(nil)
 	content := []byte("# README\n\nThis is a normal project.\nNo secrets here.\n")
-	if findings := sc.Scan("README.md", content); len(findings) != 0 {
+	if findings := sc.Scan("README.md", content, nil); len(findings) != 0 {
 		t.Fatalf("clean file got findings: %+v", findings)
 	}
 }
@@ -60,7 +60,7 @@ func TestScanner_Redaction(t *testing.T) {
 	sc, _ := regex.New(nil)
 	secret := "AKIAIOSFODNN7EXAMPLE"
 	content := []byte("key: " + secret + "\n")
-	findings := sc.Scan("config.yml", content)
+	findings := sc.Scan("config.yml", content, nil)
 	if len(findings) == 0 {
 		t.Fatal("expected a finding")
 	}
@@ -79,7 +79,7 @@ func TestScanner_ExtraPattern(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	findings := sc.Scan("app.cfg", []byte("token: company-token-AB12CD34EF56\n"))
+	findings := sc.Scan("app.cfg", []byte("token: company-token-AB12CD34EF56\n"), nil)
 	found := false
 	for _, f := range findings {
 		if f.Rule == "company-token" {
@@ -103,8 +103,8 @@ func TestScanner_BadExtraPatternReturnsError(t *testing.T) {
 func TestScanner_PureDeterministic(t *testing.T) {
 	sc, _ := regex.New(nil)
 	content := []byte("token: ghp_abcdefghijklmnopqrstuvwxyz0123456789\n")
-	first := sc.Scan("a", content)
-	second := sc.Scan("a", content)
+	first := sc.Scan("a", content, nil)
+	second := sc.Scan("a", content, nil)
 	if len(first) != len(second) {
 		t.Fatalf("non-deterministic: %d vs %d", len(first), len(second))
 	}
@@ -112,6 +112,151 @@ func TestScanner_PureDeterministic(t *testing.T) {
 		if first[i] != second[i] {
 			t.Fatalf("non-deterministic finding %d: %+v vs %+v", i, first[i], second[i])
 		}
+	}
+}
+
+// TestScanner_AllowlistSuppressesExactMatch: an AWS access key id whose raw
+// matched value exactly equals an allowlist entry is suppressed (Suppressed=true)
+// and its snippet stays redacted (the raw value must not appear). Path/Line/Rule
+// are still correct.
+func TestScanner_AllowlistSuppressesExactMatch(t *testing.T) {
+	sc, err := regex.New(nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	const secret = "AKIAIOSFODNN7EXAMPLE"
+	findings := sc.Scan("config.yml", []byte("aws_access_key_id: "+secret+"\n"), []string{secret})
+	if len(findings) == 0 {
+		t.Fatal("expected a finding")
+	}
+	for _, f := range findings {
+		if f.Rule != "aws-access-key-id" {
+			continue
+		}
+		if !f.Suppressed {
+			t.Errorf("finding for %q not suppressed; got Suppressed=%v", secret, f.Suppressed)
+		}
+		if f.Path != "config.yml" {
+			t.Errorf("Path = %q, want config.yml", f.Path)
+		}
+		if f.Line != 1 {
+			t.Errorf("Line = %d, want 1", f.Line)
+		}
+		if strings.Contains(f.Snippet, secret) {
+			t.Errorf("snippet leaks raw value %q: %q", secret, f.Snippet)
+		}
+		if !strings.Contains(f.Snippet, "REDACTED") {
+			t.Errorf("snippet does not mark redaction: %q", f.Snippet)
+		}
+	}
+}
+
+// TestScanner_AllowlistSuppressesHighEntropy: a high-entropy run whose raw value
+// exactly matches an allowlist entry is suppressed.
+func TestScanner_AllowlistSuppressesHighEntropy(t *testing.T) {
+	sc, err := regex.New(nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// 60-char base64-ish run: above the {40,} entropy-run threshold and high
+	// enough entropy to trip the heuristic.
+	const run = "Z9hJ4kL2mN7pQ1rS3tU5vW0xY6aB8cD4eF7gH2iJ3kL6mN9oP0qR"
+	findings := sc.Scan("config.txt", []byte("token: "+run+"\n"), []string{run})
+	var sawEntropy bool
+	for _, f := range findings {
+		if f.Rule != "high-entropy" {
+			continue
+		}
+		sawEntropy = true
+		if !f.Suppressed {
+			t.Errorf("high-entropy finding not suppressed; got %+v", f)
+		}
+		if strings.Contains(f.Snippet, run) {
+			t.Errorf("snippet leaks raw run %q: %q", run, f.Snippet)
+		}
+	}
+	if !sawEntropy {
+		t.Fatalf("no high-entropy finding; got %+v", findings)
+	}
+}
+
+// TestScanner_EmptyAllowlistIsTodayBehavior: nil and empty allowlists produce no
+// Suppressed findings — every match is live (today's behavior).
+func TestScanner_EmptyAllowlistIsTodayBehavior(t *testing.T) {
+	sc, _ := regex.New(nil)
+	const secret = "AKIAIOSFODNN7EXAMPLE"
+	content := []byte("key: " + secret + "\n")
+	for _, allow := range [][]string{nil, {}, []string{"", "  "}} {
+		findings := sc.Scan("config.yml", content, allow)
+		if len(findings) == 0 {
+			t.Fatalf("allowlist %v: expected a finding", allow)
+		}
+		for _, f := range findings {
+			if f.Suppressed {
+				t.Errorf("allowlist %v: finding unexpectedly suppressed: %+v", allow, f)
+			}
+		}
+	}
+}
+
+// TestScanner_AllowlistDoesNotPartialMatch: a prefix entry ("AKIA") must not
+// suppress the full key — the comparison is exact-match on the raw value.
+func TestScanner_AllowlistDoesNotPartialMatch(t *testing.T) {
+	sc, _ := regex.New(nil)
+	const secret = "AKIAIOSFODNN7EXAMPLE"
+	findings := sc.Scan("config.yml", []byte("key: "+secret+"\n"), []string{"AKIA"})
+	for _, f := range findings {
+		if f.Suppressed {
+			t.Errorf("prefix allowlist entry suppressed a non-equal value: %+v", f)
+		}
+	}
+}
+
+// TestScanner_AllowlistMixed: an allowlisted secret on one line is suppressed
+// while a different secret on another line stays live.
+func TestScanner_AllowlistMixed(t *testing.T) {
+	sc, _ := regex.New(nil)
+	const aws = "AKIAIOSFODNN7EXAMPLE"
+	content := "aws: " + aws + "\n" + "gl: glpat-abcdefghijklmnopqrstuvwxyz0123\n"
+	findings := sc.Scan("config.yml", []byte(content), []string{aws})
+	var sawSuppressed, sawLive bool
+	for _, f := range findings {
+		if f.Suppressed {
+			sawSuppressed = true
+			if f.Rule != "aws-access-key-id" {
+				t.Errorf("suppressed finding rule = %q, want aws-access-key-id", f.Rule)
+			}
+		} else {
+			sawLive = true
+		}
+	}
+	if !sawSuppressed {
+		t.Errorf("expected a suppressed aws finding; got %+v", findings)
+	}
+	if !sawLive {
+		t.Errorf("expected a live (non-suppressed) gitlab finding; got %+v", findings)
+	}
+}
+
+// TestScanner_AllowlistWhitespaceEntriesDropped: whitespace-only allowlist
+// entries are dropped (they must not match anything), while a real entry still
+// suppresses its exact match.
+func TestScanner_AllowlistWhitespaceEntriesDropped(t *testing.T) {
+	sc, _ := regex.New(nil)
+	const secret = "AKIAIOSFODNN7EXAMPLE"
+	findings := sc.Scan("config.yml", []byte("key: "+secret+"\n"), []string{"", "   ", secret})
+	found := false
+	for _, f := range findings {
+		if f.Rule != "aws-access-key-id" {
+			continue
+		}
+		found = true
+		if !f.Suppressed {
+			t.Errorf("finding not suppressed despite exact allowlist match: %+v", f)
+		}
+	}
+	if !found {
+		t.Fatalf("no aws-access-key-id finding; got %+v", findings)
 	}
 }
 
@@ -124,15 +269,15 @@ func TestScanner_SkipsBinaryBlobs(t *testing.T) {
 	// high-entropy enough to trip the heuristic.
 	run := "Z9hJ4kL2mN7pQ1rS3tU5vW0xY6aB8cD4eF7gH2iJ3kL6mN9oP0qR"
 	binary := append([]byte("header\n"), []byte(run)...)
-	binary = append(binary, 0, '\n')   // NUL byte => binary
+	binary = append(binary, 0, '\n') // NUL byte => binary
 	binary = append(binary, []byte(run)...)
 
-	if got := sc.Scan("artifact.bin", binary); len(got) != 0 {
+	if got := sc.Scan("artifact.bin", binary, nil); len(got) != 0 {
 		t.Fatalf("binary blob got findings: %+v", got)
 	}
 
 	text := []byte("header\n" + run + "\n")
-	got := sc.Scan("config.txt", text)
+	got := sc.Scan("config.txt", text, nil)
 	if len(got) == 0 {
 		t.Fatalf("text with same high-entropy run got no finding; want at least one")
 	}
