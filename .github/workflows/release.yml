@@ -31,6 +31,12 @@ jobs:
         # tagged source, not whatever main points at when the run starts.
         uses: actions/checkout@v4
 
+      - name: set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: set up Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -44,9 +50,11 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          # Build and push both architectures as a multi-arch manifest list.
+          platforms: linux/amd64,linux/arm64
           # The release tag verbatim, as the image tag.
           tags: ghcr.io/${{ github.repository_owner }}/git-proxy:${{ github.event.release.tag_name }}
-          # Keep the manifest a classic single-platform image (no provenance
-          # attestation manifest list) so it matches what `docker build` produces
+          # Keep the manifest a plain multi-arch manifest list (no provenance
+          # or SBOM attestations) so it matches what `docker build` produces
           # locally and what the example compose consumes.
           provenance: false
