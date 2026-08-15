@@ -58,7 +58,7 @@ func TestAudit_PushDeniedRecordsEvent(t *testing.T) {
 	// Enable secret_scan so a push carrying a secret is denied.
 	pol := config.PolicyConfig{
 		Rules: map[string]config.RuleConfig{
-			"secret_scan":  {Enabled: true},
+			"secret_scan":    {Enabled: true},
 			"branch_pattern": {Enabled: true, Params: map[string]any{"allow": []string{"refs/heads/*"}}},
 		},
 	}
@@ -135,6 +135,44 @@ func TestAudit_PushAllowedRecordsEvent(t *testing.T) {
 			len(e.Refs) > 0 && e.Refs[0].Ref == "refs/heads/feat/x"
 	}) {
 		t.Fatalf("no push allow audit event for feat/x; events=%+v", events)
+	}
+}
+
+// TestAudit_SuppressedFindingRecordedMasked: a push carrying a secret whose raw
+// value exactly matches an ignore_strings entry is ALLOWED, and the audit event
+// records a MASKED placeholder reason (rule/path/line only). The audit file
+// MUST NOT contain the raw secret value (no-leak contract).
+func TestAudit_SuppressedFindingRecordedMasked(t *testing.T) {
+	auditPath := auditFile(t)
+	pol := config.PolicyConfig{
+		Rules: map[string]config.RuleConfig{
+			"secret_scan": {Enabled: true, Params: map[string]any{"ignore_strings": []string{"AKIAIOSFODNN7EXAMPLE"}}},
+		},
+	}
+	h := StartWithPolicyAndAudit(t, "test.git", pol, auditPath)
+	dst := cloneForPush(t, h)
+	secret := "AKIAIOSFODNN7EXAMPLE"
+	commitFile(t, dst, "config/aws.yml", "key: "+secret+"\n", "feat: add aws config")
+	h.RunGit(t, dst, "push", "-q", "origin", "main")
+
+	events := readAuditEvents(t, auditPath)
+	if !hasAuditEvent(events, func(e port.AuditEvent) bool {
+		if e.Service != "git-receive-pack" || e.Verdict != "allow" {
+			return false
+		}
+		for _, r := range e.Reasons {
+			if r == "secret_scan: ignored placeholder for rule aws-access-key-id at config/aws.yml:1" {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("no allow audit event with masked placeholder reason; events=%+v", events)
+	}
+	// No-leak: the audit file must NOT contain the raw secret value.
+	b, _ := os.ReadFile(auditPath)
+	if strings.Contains(string(b), secret) {
+		t.Fatalf("audit file leaked raw secret value: %q", b)
 	}
 }
 

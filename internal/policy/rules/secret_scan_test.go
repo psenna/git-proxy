@@ -254,3 +254,140 @@ func TestSecretScan_BadIgnorePatternFailsClosed(t *testing.T) {
 		t.Fatalf("verdict = %v, want Deny on bad ignore_paths pattern", dec.Verdict)
 	}
 }
+
+// TestSecretScan_IgnoreStringsSuppressesPlaceholder: a secret whose raw value
+// exactly matches an ignore_strings entry is allowed, with a masked allow
+// reason naming the rule/path/line (never the raw value).
+func TestSecretScan_IgnoreStringsSuppressesPlaceholder(t *testing.T) {
+	rule := newSecretScan(map[string]any{"ignore_strings": []any{"AKIAIOSFODNN7EXAMPLE"}})
+	e := policy.NewEngine(policy.FirstDeny, rule)
+	dec := e.EvaluatePush(port.PushRequest{ChangedFiles: []port.ChangedFile{
+		{Path: "config.yml", Status: "A", BlobOID: "o1", Content: []byte("key: AKIAIOSFODNN7EXAMPLE\n")},
+	}})
+	if dec.Verdict != port.VerdictAllow {
+		t.Fatalf("verdict = %v, want Allow (placeholder suppressed)", dec.Verdict)
+	}
+	if len(dec.Reasons) != 1 {
+		t.Fatalf("reasons = %+v, want one masked allow reason", dec.Reasons)
+	}
+	if dec.Reasons[0].Rule != "secret_scan" {
+		t.Fatalf("reason rule = %q, want secret_scan", dec.Reasons[0].Rule)
+	}
+	if !strings.Contains(dec.Reasons[0].Message, "ignored placeholder") {
+		t.Fatalf("reason does not mark the placeholder: %q", dec.Reasons[0].Message)
+	}
+}
+
+// TestSecretScan_IgnoreStringsMaskedReasonFormat pins the exact masked reason
+// format: rule/path/line only, no raw value.
+func TestSecretScan_IgnoreStringsMaskedReasonFormat(t *testing.T) {
+	rule := newSecretScan(map[string]any{"ignore_strings": []any{"AKIAIOSFODNN7EXAMPLE"}})
+	e := policy.NewEngine(policy.FirstDeny, rule)
+	dec := e.EvaluatePush(port.PushRequest{ChangedFiles: []port.ChangedFile{
+		{Path: "config.yml", Status: "A", BlobOID: "o1", Content: []byte("key: AKIAIOSFODNN7EXAMPLE\n")},
+	}})
+	if dec.Verdict != port.VerdictAllow {
+		t.Fatalf("verdict = %v, want Allow", dec.Verdict)
+	}
+	want := "secret_scan: ignored placeholder for rule aws-access-key-id at config.yml:1"
+	if len(dec.Reasons) != 1 || dec.Reasons[0].Message != want {
+		t.Fatalf("reasons = %+v, want message %q", dec.Reasons, want)
+	}
+}
+
+// TestSecretScan_IgnoreStringsRealSecretStillDenied: an ignore_strings entry
+// suppresses ONLY its exact match — a different real secret (a ghp_ PAT) is
+// still denied.
+func TestSecretScan_IgnoreStringsRealSecretStillDenied(t *testing.T) {
+	rule := newSecretScan(map[string]any{"ignore_strings": []any{"AKIAIOSFODNN7EXAMPLE"}})
+	ruletest.RunPush(t, rule, []ruletest.PushCase{
+		{
+			Name: "ghp pat not allowlisted denied",
+			Req: port.PushRequest{ChangedFiles: []port.ChangedFile{
+				{Path: "tool.sh", Status: "A", BlobOID: "o2", Content: []byte("export T=ghp_abcdefghijklmnopqrstuvwxyz0123456789\n")},
+			}},
+			Want: port.VerdictDeny,
+		},
+	})
+}
+
+// TestSecretScan_IgnoreStringsMixedPlaceholderAndReal: a push carrying both an
+// allowlisted placeholder and a real secret is denied (first active finding
+// wins — the allowlist never disables scanning).
+func TestSecretScan_IgnoreStringsMixedPlaceholderAndReal(t *testing.T) {
+	rule := newSecretScan(map[string]any{"ignore_strings": []any{"AKIAIOSFODNN7EXAMPLE"}})
+	e := policy.NewEngine(policy.FirstDeny, rule)
+	dec := e.EvaluatePush(port.PushRequest{ChangedFiles: []port.ChangedFile{
+		{Path: "config.yml", Status: "A", BlobOID: "o1", Content: []byte("key: AKIAIOSFODNN7EXAMPLE\n")},
+		{Path: "tool.sh", Status: "A", BlobOID: "o2", Content: []byte("export T=ghp_abcdefghijklmnopqrstuvwxyz0123456789\n")},
+	}})
+	if dec.Verdict != port.VerdictDeny {
+		t.Fatalf("verdict = %v, want Deny (real secret wins)", dec.Verdict)
+	}
+}
+
+// TestSecretScan_IgnoreStringsDropsWhitespaceEntries: whitespace-only
+// ignore_strings entries are dropped silently; a real entry still suppresses
+// its exact match.
+func TestSecretScan_IgnoreStringsDropsWhitespaceEntries(t *testing.T) {
+	rule := newSecretScan(map[string]any{"ignore_strings": []any{"", "   ", "AKIAIOSFODNN7EXAMPLE"}})
+	e := policy.NewEngine(policy.FirstDeny, rule)
+	dec := e.EvaluatePush(port.PushRequest{ChangedFiles: []port.ChangedFile{
+		{Path: "config.yml", Status: "A", BlobOID: "o1", Content: []byte("key: AKIAIOSFODNN7EXAMPLE\n")},
+	}})
+	if dec.Verdict != port.VerdictAllow {
+		t.Fatalf("verdict = %v, want Allow (whitespace entries dropped, real entry works)", dec.Verdict)
+	}
+	if len(dec.Reasons) != 1 {
+		t.Fatalf("reasons = %+v, want one masked reason", dec.Reasons)
+	}
+}
+
+// TestSecretScan_IgnoreStringsEmptyIsTodayBehavior: an empty ignore_strings
+// list is today's behavior — the secret is still denied.
+func TestSecretScan_IgnoreStringsEmptyIsTodayBehavior(t *testing.T) {
+	rule := newSecretScan(map[string]any{"ignore_strings": []any{}})
+	ruletest.RunPush(t, rule, []ruletest.PushCase{
+		{
+			Name: "empty ignore_strings still denies",
+			Req: port.PushRequest{ChangedFiles: []port.ChangedFile{
+				{Path: "config.yml", Status: "A", BlobOID: "o1", Content: []byte("key: AKIAIOSFODNN7EXAMPLE\n")},
+			}},
+			Want: port.VerdictDeny,
+		},
+	})
+}
+
+// TestSecretScan_IgnoreStringsNoLeak: the masked allow reasons never contain the
+// raw secret value (the no-leak contract).
+func TestSecretScan_IgnoreStringsNoLeak(t *testing.T) {
+	rule := newSecretScan(map[string]any{"ignore_strings": []any{"AKIAIOSFODNN7EXAMPLE"}})
+	e := policy.NewEngine(policy.FirstDeny, rule)
+	dec := e.EvaluatePush(port.PushRequest{ChangedFiles: []port.ChangedFile{
+		{Path: "config.yml", Status: "A", BlobOID: "o1", Content: []byte("key: AKIAIOSFODNN7EXAMPLE\n")},
+	}})
+	if dec.Verdict != port.VerdictAllow {
+		t.Fatalf("verdict = %v, want Allow", dec.Verdict)
+	}
+	for _, r := range dec.Reasons {
+		if strings.Contains(r.Message, "AKIAIOSFODNN7EXAMPLE") {
+			t.Errorf("allow reason leaks the raw secret %q: %q", "AKIAIOSFODNN7EXAMPLE", r.Message)
+		}
+	}
+}
+
+// TestSecretScan_IgnoreStringsDoesNotPartialMatch: a prefix entry ("AKIA")
+// does not suppress the full key — the comparison is exact-match, so the push
+// is still denied.
+func TestSecretScan_IgnoreStringsDoesNotPartialMatch(t *testing.T) {
+	rule := newSecretScan(map[string]any{"ignore_strings": []any{"AKIA"}})
+	ruletest.RunPush(t, rule, []ruletest.PushCase{
+		{
+			Name: "prefix entry does not suppress full key",
+			Req: port.PushRequest{ChangedFiles: []port.ChangedFile{
+				{Path: "config.yml", Status: "A", BlobOID: "o1", Content: []byte("key: AKIAIOSFODNN7EXAMPLE\n")},
+			}},
+			Want: port.VerdictDeny,
+		},
+	})
+}

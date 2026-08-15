@@ -297,6 +297,14 @@ constructed explicitly in `main.go`.
 from its rule params. Reference: `internal/secret/regex` (regex + Shannon entropy,
 skips binary blobs, redacts matched secrets in reasons).
 
+`secret_scan.params.ignore_strings` is a **global-only** exact-value allowlist: a
+finding whose raw matched secret exactly equals an entry is suppressed — the push
+is allowed and the audit records a **MASKED** placeholder reason (rule/path/line
+only, never the raw value). nil/empty disables suppression (today's behavior).
+The comparison is exact-match on the raw value before redaction; the raw secret
+is never carried on a finding. Per-repo `ignore_strings` is deferred to a later
+milestone.
+
 ---
 
 ## Credential store

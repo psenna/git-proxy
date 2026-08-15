@@ -2,6 +2,7 @@ package rules
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/psenna/git-proxy/internal/pathmatch"
 	"github.com/psenna/git-proxy/internal/policy"
@@ -74,6 +75,12 @@ func newSecretScanRule(cfg policy.RuleConfig) port.Rule {
 		}
 	}
 	r.ignore = pathmatch.New(append(append([]string{}, builtinIgnorePaths...), ignorePaths...))
+	// ignore_strings is a GLOBAL-only exact-value allowlist: a finding whose raw
+	// matched secret exactly equals an entry is suppressed (push allowed, audit
+	// records a MASKED placeholder reason). nil/empty == today's behavior. Unlike
+	// ignore_paths and extra_patterns there is no compile surface, so a stray
+	// entry is trimmed/dropped silently rather than fail-closed (per the issue).
+	r.allowlist = parseIgnoreStrings(cfg.Params)
 	return r
 }
 
@@ -84,6 +91,7 @@ func newSecretScanRule(cfg policy.RuleConfig) port.Rule {
 type secretScanRule struct {
 	scanner    port.SecretScanner
 	ignore     *pathmatch.Matcher // built-in + ignore_paths; nil only when compileErr is set
+	allowlist  []string           // exact-value ignore_strings (trimmed, empty dropped); nil == today's behavior
 	compileErr error              // set when an extra pattern or ignore_paths pattern failed to compile
 }
 
@@ -96,6 +104,11 @@ func (r *secretScanRule) EvaluatePush(req port.PushRequest) (port.Decision, erro
 	if r.scanner == nil {
 		return policy.Allow(), nil
 	}
+	// Scan every changed blob, partitioning findings: any ACTIVE (non-
+	// suppressed) finding denies immediately (first deny wins — same message
+	// format as before); suppressed findings (exact ignore_strings matches)
+	// are accumulated and reported as MASKED allow reasons after all files.
+	var suppressed []port.SecretFinding
 	for _, f := range req.ChangedFiles {
 		// Skip files in the ignore set (built-in manifests + operator
 		// ignore_paths) BEFORE scanning. go.sum/go.mod/lockfiles carry
@@ -110,24 +123,60 @@ func (r *secretScanRule) EvaluatePush(req port.PushRequest) (port.Decision, erro
 		if f.Status == "D" || len(f.Content) == 0 {
 			continue
 		}
-		findings := r.scanner.Scan(f.Path, f.Content)
+		findings := r.scanner.Scan(f.Path, f.Content, r.allowlist)
 		if len(findings) == 0 {
 			continue
 		}
-		// Report the first finding's path+line+rule (and the redacted snippet,
-		// which the scanner has already masked). Never include the raw secret.
-		f0 := findings[0]
-		msg := fmt.Sprintf("secret found in %q at line %d (rule: %s)", f0.Path, f0.Line, f0.Rule)
-		if f0.Snippet != "" {
-			msg += "; snippet: " + f0.Snippet
+		for _, fnd := range findings {
+			if fnd.Suppressed {
+				suppressed = append(suppressed, fnd)
+				continue
+			}
+			// Report the active finding's path+line+rule (and the redacted
+			// snippet, which the scanner has already masked). Never include the
+			// raw secret.
+			msg := fmt.Sprintf("secret found in %q at line %d (rule: %s)", fnd.Path, fnd.Line, fnd.Rule)
+			if fnd.Snippet != "" {
+				msg += "; snippet: " + fnd.Snippet
+			}
+			return policy.Deny(r.Name(), msg), nil
 		}
-		return policy.Deny(r.Name(), msg), nil
+	}
+	if len(suppressed) > 0 {
+		// MASKED allow reasons: built from Path/Line/Rule only — the raw secret
+		// value is never carried on a finding and never emitted here (the
+		// no-leak contract). The engine forwards allow reasons to the audit.
+		reasons := make([]port.Reason, 0, len(suppressed))
+		for _, f := range suppressed {
+			reasons = append(reasons, port.Reason{
+				Rule:    r.Name(),
+				Message: fmt.Sprintf("secret_scan: ignored placeholder for rule %s at %s:%d", f.Rule, f.Path, f.Line),
+			})
+		}
+		return port.Decision{Verdict: port.VerdictAllow, Reasons: reasons}, nil
 	}
 	return policy.Allow(), nil
 }
 
 func (r *secretScanRule) EvaluateFetch(port.FetchRequest) (port.Decision, error) {
 	return policy.Allow(), nil
+}
+
+// parseIgnoreStrings extracts the ignore_strings exact-value allowlist from
+// params. Entries are trimmed and whitespace-only entries are dropped silently:
+// ignore_strings is a plain string allowlist with no regex compile surface, so
+// a stray entry is ignored rather than fail-closed (per the issue — unlike
+// extra_patterns and ignore_paths, which are fail-closed-validated). A missing
+// or nil key yields nil (today's behavior).
+func parseIgnoreStrings(params map[string]any) []string {
+	raw := parseStringList(params, "ignore_strings")
+	out := make([]string, 0, len(raw))
+	for _, s := range raw {
+		if t := strings.TrimSpace(s); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // parseExtraPatterns extracts a []regex.Pattern from params[key]. YAML decodes

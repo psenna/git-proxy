@@ -58,6 +58,10 @@ policy:
       # pattern with no '/' matches at any depth (nested module go.sum is covered).
       # params:
       #   ignore_paths: ["third-party/**/*.sum"]   # extends the built-ins (fail-closed on a malformed pattern)
+      #   ignore_strings: ["AKIA_REPLACE_WITH_YOUR_KEY"] # GLOBAL exact-value allowlist: a finding whose raw matched
+      #                                            # value exactly equals an entry is suppressed (push allowed;
+      #                                            # the audit records a MASKED placeholder reason — rule/path/line
+      #                                            # only, never the raw value). nil/empty == today's behavior.
   read:
     deny: ["secrets/**"]            # withhold secrets/ blobs from fetch (use --filter=blob:none to clone)
   # dry_run: true                    # forward a clean policy-deny instead of blocking; audit records deny + dry_run

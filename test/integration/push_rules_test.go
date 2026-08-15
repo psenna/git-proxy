@@ -42,6 +42,16 @@ func policySecretScan() config.PolicyConfig {
 	}
 }
 
+// policySecretScanIgnoreStrings enables secret_scan with an ignore_strings
+// exact-value allowlist (global-only).
+func policySecretScanIgnoreStrings(ignore ...string) config.PolicyConfig {
+	return config.PolicyConfig{
+		Rules: map[string]config.RuleConfig{
+			"secret_scan": {Enabled: true, Params: map[string]any{"ignore_strings": ignore}},
+		},
+	}
+}
+
 // cloneForPush clones the upstream through the proxy and configures the working
 // copy for commits, returning the working-copy path.
 func cloneForPush(t *testing.T, h *Harness) string {
@@ -125,6 +135,49 @@ func TestPushRules_SecretBlobBlocked(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("push containing a secret unexpectedly succeeded")
+	}
+	if !strings.Contains(string(out), "secret") {
+		t.Fatalf("rejection output missing secret_scan signal; got:\n%s", out)
+	}
+	if strings.Contains(string(out), secret) {
+		t.Errorf("client output leaks the secret value %q:\n%s", secret, out)
+	}
+	if got := h.UpstreamRef(t, "refs/heads/main"); got != before {
+		t.Fatalf("upstream main changed after denied push: %s, want %s", got, before)
+	}
+}
+
+// TestPushRules_SecretPlaceholderAllowed: a secret whose raw value exactly
+// matches an ignore_strings entry is a placeholder — the push is ALLOWED and
+// reaches upstream (the allowlist suppresses only the exact value).
+func TestPushRules_SecretPlaceholderAllowed(t *testing.T) {
+	h := StartWithPolicy(t, "test.git", policySecretScanIgnoreStrings("AKIAIOSFODNN7EXAMPLE"))
+	dst := cloneForPush(t, h)
+	commitFile(t, dst, "config/aws.yml", "key: AKIAIOSFODNN7EXAMPLE\n", "feat: add aws config")
+
+	h.RunGit(t, dst, "push", "-q", "origin", "main")
+	got := h.UpstreamRef(t, "refs/heads/main")
+	want := revParse(t, dst, "HEAD")
+	if got != want {
+		t.Fatalf("placeholder push did not reach upstream: upstream=%s, pushed=%s", got, want)
+	}
+}
+
+// TestPushRules_SecretPlaceholderDoesNotDisableScan: the ignore_strings
+// allowlist suppresses ONLY its exact match — a different real secret (a ghp_
+// PAT) is still denied, the secret value never reaches the client, and upstream
+// is unchanged.
+func TestPushRules_SecretPlaceholderDoesNotDisableScan(t *testing.T) {
+	h := StartWithPolicy(t, "test.git", policySecretScanIgnoreStrings("AKIAIOSFODNN7EXAMPLE"))
+	dst := cloneForPush(t, h)
+	secret := "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	commitFile(t, dst, "tool.sh", "export T="+secret+"\n", "feat: add tool")
+
+	before := h.UpstreamRef(t, "refs/heads/main")
+	cmd := h.Git(dst, "push", "origin", "main")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("push with non-allowlisted secret unexpectedly succeeded")
 	}
 	if !strings.Contains(string(out), "secret") {
 		t.Fatalf("rejection output missing secret_scan signal; got:\n%s", out)
