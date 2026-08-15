@@ -53,12 +53,29 @@ func redactCreds(s string) string {
 // object store is corrupt or missing objects. IsCorruptionError matches these
 // against the full error chain (runGit wraps git stderr into the error message).
 var corruptionPatterns = []string{
-	"bad object",      // git rev-list/cat-file: "fatal: bad object <sha>"
-	"missing object",  // git: "fatal: missing object <sha>"
+	"missing object",   // git: "fatal: missing object <sha>"
 	"corrupt",          // git fsck/rev-list: "error: corrupt object"
-	"loose object",    // git: "error: loose object <sha> (in ...) is corrupt"
+	"loose object",     // git: "error: loose object <sha> (in ...) is corrupt"
 	"unable to unpack", // git pack-objects: "fatal: unable to unpack <sha> header"
 }
+
+// badObjectRe matches git's "bad [type] object" error family for ANY git object
+// type. git emits type-specific messages when a non-commit object is missing
+// from the object store:
+//
+//	fatal: bad object <sha>          — missing commit (generic, rev-list)
+//	fatal: bad tree object <sha>     — missing tree (rev-list --objects)
+//	fatal: bad blob object <sha>     — missing blob (cat-file, pack-objects)
+//	fatal: bad commit object <sha>   — missing commit (some commands)
+//	fatal: bad tag object <sha>      — missing tag
+//
+// The generic substring "bad object" does NOT match the type-specific forms
+// (e.g. "bad tree object" does not contain "bad object"), so without this regex
+// the self-healing wrapper never triggers on a missing tree/blob and the fetch
+// fails with HTTP 502 — the exact regression reported in issues #69/#71. The
+// regex matches all variants in one pattern so any missing-object corruption
+// triggers the mirror Repair + retry.
+var badObjectRe = regexp.MustCompile(`bad (?:commit|tree|blob|tag)? ?object`)
 
 // IsCorruptionError reports whether err indicates a corrupt or missing object
 // in a git mirror's object store. It matches git error message patterns that
@@ -72,6 +89,9 @@ func IsCorruptionError(err error) bool {
 		return false
 	}
 	msg := err.Error()
+	if badObjectRe.MatchString(msg) {
+		return true
+	}
 	for _, pat := range corruptionPatterns {
 		if strings.Contains(msg, pat) {
 			return true
