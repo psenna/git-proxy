@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "git-proxy.fullname" . }}-test-connection
+  labels:
+    {{- include "git-proxy.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  securityContext:
+    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+  containers:
+    - name: test-connection
+      image: {{ include "git-proxy.imageRef" . }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      securityContext:
+        {{- toYaml .Values.containerSecurityContext | nindent 8 }}
+      command: ["/bin/sh", "-eu", "-c"]
+      args:
+        - |
+          host="{{ include "git-proxy.fullname" . }}"
+          gitPort="{{ .Values.service.git.port }}"
+
+          echo "checking http://$host:$gitPort/ ..."
+          out="$(wget -S -O /dev/null "http://$host:$gitPort/" 2>&1 || true)"
+          echo "$out"
+          echo "$out" | grep -qE 'HTTP/1\.[01] (401|404)' || { echo "FAIL: git frontend did not answer 401/404"; exit 1; }
+          echo "OK: git frontend answered 401/404"
+
+          {{- if .Values.config.broker.enabled }}
+          brokerPort="{{ .Values.service.broker.port }}"
+          echo "checking http://$host:$brokerPort/healthz ..."
+          body="$(wget -q -O - "http://$host:$brokerPort/healthz")"
+          echo "$body"
+          echo "$body" | grep -q '"status":"ok"' || { echo "FAIL: broker /healthz did not return status ok"; exit 1; }
+          echo "OK: broker /healthz returned status ok"
+          {{- end }}
+
+          echo "all checks passed"
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir:
+        sizeLimit: 16Mi

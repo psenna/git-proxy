@@ -1,0 +1,287 @@
+{{- include "git-proxy.validate" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "git-proxy.fullname" . }}
+  labels:
+    {{- include "git-proxy.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: {{ .Values.strategy.type }}
+  selector:
+    matchLabels:
+      {{- include "git-proxy.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "git-proxy.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "git-proxy.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: assemble-config
+          image: {{ include "git-proxy.imageRef" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-eu", "-c"]
+          args:
+            - |
+              umask 077
+              : > {{ include "git-proxy.paths.assembledConfig" . }}
+              for f in {{ include "git-proxy.assembleFileList" . }}; do
+                cat "$f" >> {{ include "git-proxy.paths.assembledConfig" . }}
+                printf '\n' >> {{ include "git-proxy.paths.assembledConfig" . }}
+              done
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: base
+              mountPath: {{ include "git-proxy.paths.baseDir" . }}
+              readOnly: true
+            {{- if .Values.config.auth.existingSecret }}
+            - name: auth
+              mountPath: {{ include "git-proxy.paths.authDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- range $i, $f := .Values.extraConfigFragments }}
+            - name: fragment-{{ $i }}
+              mountPath: /etc/git-proxy/fragments/{{ $i }}
+              readOnly: true
+            {{- end }}
+            - name: rendered-config
+              mountPath: {{ include "git-proxy.paths.assembledDir" . }}
+        {{- with .Values.extraInitContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      containers:
+        - name: git-proxy
+          image: {{ include "git-proxy.imageRef" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["-config", {{ include "git-proxy.paths.assembledConfig" . | quote }}]
+          ports:
+            - name: http-git
+              containerPort: {{ int .Values.ports.git }}
+              protocol: TCP
+            {{- if .Values.config.broker.enabled }}
+            - name: http-broker
+              containerPort: {{ int .Values.ports.broker }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.config.ssh.enabled }}
+            - name: ssh
+              containerPort: {{ int .Values.ports.ssh }}
+              protocol: TCP
+            {{- end }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # Readiness: raw override (.Values.readinessProbe) wins if set; else
+          # tcpSocket on http-git BY DEFAULT (the git frontend has no health
+          # route -- 401/404 on / would fail an httpGet probe when auth is
+          # configured, so a TCP accept is the only universal signal); when
+          # probes.useBrokerHealthz is true (and config.broker.enabled, enforced
+          # by a validation guard), switch READINESS ONLY to httpGet /healthz on
+          # http-broker.
+          {{- if .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          {{- else if .Values.probes.useBrokerHealthz }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http-broker
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            successThreshold: {{ .Values.probes.readiness.successThreshold }}
+          {{- else }}
+          readinessProbe:
+            tcpSocket:
+              port: http-git
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            successThreshold: {{ .Values.probes.readiness.successThreshold }}
+          {{- end }}
+          {{- if .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          {{- else }}
+          livenessProbe:
+            tcpSocket:
+              port: http-git
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml .Values.startupProbe | nindent 12 }}
+          {{- else if .Values.probes.startup.enabled }}
+          startupProbe:
+            tcpSocket:
+              port: http-git
+            initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: rendered-config
+              mountPath: {{ include "git-proxy.paths.assembledDir" . }}
+              readOnly: true
+            - name: mirror
+              mountPath: {{ include "git-proxy.paths.mirrorDir" . }}
+            - name: audit
+              mountPath: {{ include "git-proxy.paths.auditDir" . }}
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.config.upstream.credentials.existingSecret }}
+            - name: credentials
+              mountPath: {{ include "git-proxy.paths.credentialsDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.config.issueUpstream.credentials.existingSecret }}
+            - name: issue-credentials
+              mountPath: {{ include "git-proxy.paths.issueCredentialsDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.config.ssh.hostKey.existingSecret }}
+            - name: ssh-hostkey
+              mountPath: {{ include "git-proxy.paths.sshDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- with .Values.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: base
+          configMap:
+            name: {{ include "git-proxy.fullname" . }}
+            items:
+              - key: config-base.yaml
+                path: config-base.yaml
+        {{- if .Values.config.auth.existingSecret }}
+        - name: auth
+          secret:
+            secretName: {{ include "git-proxy.auth.secretName" . }}
+            defaultMode: 0440
+            items:
+              - key: {{ include "git-proxy.auth.secretKey" . }}
+                path: auth.yaml
+        {{- end }}
+        {{- range $i, $f := .Values.extraConfigFragments }}
+        - name: fragment-{{ $i }}
+          secret:
+            secretName: {{ $f.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ $f.key }}
+                path: fragment.yaml
+        {{- end }}
+        - name: rendered-config
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: mirror
+          {{- if .Values.persistence.mirror.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "git-proxy.mirrorClaimName" . }}
+          {{- else }}
+          emptyDir:
+            {{- with .Values.persistence.mirror.emptyDirSizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+          {{- end }}
+        - name: audit
+          {{- if .Values.persistence.audit.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "git-proxy.auditClaimName" . }}
+          {{- else }}
+          emptyDir:
+            {{- with .Values.persistence.audit.emptyDirSizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.config.upstream.credentials.existingSecret }}
+        - name: credentials
+          secret:
+            secretName: {{ include "git-proxy.credentials.secretName" . }}
+            defaultMode: 0440
+            items:
+              - key: {{ include "git-proxy.credentials.secretKey" . }}
+                path: credentials.yaml
+        {{- end }}
+        {{- if .Values.config.issueUpstream.credentials.existingSecret }}
+        - name: issue-credentials
+          secret:
+            secretName: {{ include "git-proxy.issueCredentials.secretName" . }}
+            defaultMode: 0440
+            items:
+              - key: {{ include "git-proxy.issueCredentials.secretKey" . }}
+                path: credentials.yaml
+        {{- end }}
+        {{- if .Values.config.ssh.hostKey.existingSecret }}
+        - name: ssh-hostkey
+          secret:
+            secretName: {{ include "git-proxy.sshHostKey.secretName" . }}
+            defaultMode: 0440
+            items:
+              - key: {{ include "git-proxy.sshHostKey.secretKey" . }}
+                path: host_key
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}

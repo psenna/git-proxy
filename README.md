@@ -121,6 +121,20 @@ production hardening). A documentation site (this README + the `docs/` pages)
 is published to GitHub Pages from the `/docs` folder — see the deploy guide's
 "Publishing this docs site" section.
 
+### Kubernetes (Helm)
+
+A Helm chart at [`deploy/helm/git-proxy/`](./deploy/helm/git-proxy) installs
+git-proxy on a Kubernetes cluster, with Secrets for auth/credentials and
+support for all three frontends (git-HTTP, broker, SSH):
+
+```sh
+helm install git-proxy oci://ghcr.io/psenna/charts/git-proxy --version <chart-version>
+```
+
+See [`deploy/helm/git-proxy/README.md`](./deploy/helm/git-proxy/README.md) for
+the full chart documentation, or [`docs/deploy-helm.md`](./docs/deploy-helm.md)
+for the narrative walkthrough.
+
 ## Documentation
 
 - [`requirements.md`](./requirements.md) — goals, features, and v1 scope.
@@ -130,6 +144,8 @@ is published to GitHub Pages from the `/docs` folder — see the deploy guide's
   adapters, frontends, auth, secret scanners, credential stores, and sinks.
 - [`docs/deploy-docker.md`](./docs/deploy-docker.md) — run git-proxy in front of
   a local Gitea git server with Docker Compose (fastest way to try it).
+- [`docs/deploy-helm.md`](./docs/deploy-helm.md) — install git-proxy on a
+  Kubernetes cluster with the Helm chart.
 - [`PRINCIPLES.md`](./PRINCIPLES.md) — engineering principles every change must
   follow.
 - [`CONTRIBUTING.md`](./CONTRIBUTING.md) — issue and PR workflow for the agents

@@ -40,6 +40,12 @@ docker compose up -d --build
 # deploy/docker/README.md
 ```
 
+## Deploy on Kubernetes
+
+To run git-proxy on a cluster, see the [Helm Chart](./deploy-helm/) page —
+`helm install` from a published OCI chart, with Secrets for auth/credentials
+and support for all three frontends (git-HTTP, broker, SSH).
+
 ## Build from source
 
 ```sh
@@ -67,5 +73,6 @@ git -c http.extraheader="Authorization: Bearer agent-token-1" \
   auth, secret scanners, credential stores, and sinks.
 - [Docker Compose + Gitea](./deploy-docker/) — run a full policy gateway against
   a local self-hosted git server.
+- [Helm Chart](./deploy-helm/) — install git-proxy on a Kubernetes cluster.
 
 Source and issues: [github.com/psenna/git-proxy](https://github.com/psenna/git-proxy).

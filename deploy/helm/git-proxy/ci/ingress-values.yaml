@@ -1,0 +1,43 @@
+config:
+  upstream:
+    kind: github
+    url: "https://github.com"
+  auth:
+    existingSecret: "git-proxy-auth"
+  broker:
+    enabled: true
+    allowedAgents: ["agent-1"]
+    allowedOps: ["pr.create", "pr.list", "ci.status", "issue.create"]
+    mergeMethod: squash
+probes:
+  useBrokerHealthz: true
+service:
+  type: NodePort
+  git:
+    port: 8080
+    nodePort: 30080
+ingress:
+  git:
+    enabled: true
+    className: nginx
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-body-size: "0"
+      nginx.ingress.kubernetes.io/proxy-buffering: "off"
+      nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    hosts:
+      - host: git.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: git-tls
+        hosts: [git.example.com]
+  broker:
+    enabled: true
+    className: nginx
+    hosts:
+      - host: broker.example.com
+        paths:
+          - path: /
+            pathType: Prefix

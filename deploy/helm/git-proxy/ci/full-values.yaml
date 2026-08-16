@@ -1,0 +1,90 @@
+config:
+  upstream:
+    kind: github
+    url: "https://github.com"
+    credentials:
+      existingSecret: git-proxy-credentials
+  issueUpstream:
+    enabled: true
+    kind: github
+    url: "https://github.com"
+    credentials:
+      existingSecret: git-proxy-issue-credentials
+  repos:
+    "demo/demo.git": "acme/demo.git"
+  publicRepos:
+    - "public/*"
+  auth:
+    existingSecret: "git-proxy-auth"
+  policy:
+    mode: first_deny
+    push:
+      maxPackfileBytes: 268435456
+    read:
+      deny: ["secrets/**"]
+    rules:
+      history_protect:
+        enabled: true
+        params:
+          refs: ["refs/heads/main"]
+      secret_scan:
+        enabled: true
+  ssh:
+    enabled: true
+    hostKey:
+      existingSecret: git-proxy-ssh-hostkey
+    authorizedKeys:
+      agent-1: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ci-fixture"
+  audit:
+    enabled: true
+  broker:
+    enabled: true
+    allowedAgents: ["agent-1"]
+    allowedOps: ["pr.create", "pr.list", "ci.status"]
+    mergeMethod: squash
+extraConfigFragments:
+  - existingSecret: git-proxy-alerts
+    key: alerts.yaml
+resources:
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {cpu: "1", memory: 512Mi}
+extraEnv:
+  - name: GITEA_TOKEN
+    valueFrom:
+      secretKeyRef:
+        name: git-proxy-credentials
+        key: token
+nodeSelector:
+  kubernetes.io/os: linux
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: git-proxy
+    effect: NoSchedule
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: git-proxy
+ingress:
+  git:
+    enabled: true
+    className: nginx
+    hosts:
+      - host: git.example.com
+        paths: [{path: /, pathType: Prefix}]
+  broker:
+    enabled: true
+    className: nginx
+    hosts:
+      - host: broker.example.com
+        paths: [{path: /, pathType: Prefix}]
+persistence:
+  mirror:
+    enabled: true
+    size: 20Gi
+  audit:
+    enabled: true
+    size: 5Gi

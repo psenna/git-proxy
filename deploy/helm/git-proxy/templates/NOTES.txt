@@ -1,0 +1,131 @@
+git-proxy has been installed as "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+--------------------------------------------------------------------------------
+git-HTTP frontend
+--------------------------------------------------------------------------------
+{{- if .Values.ingress.git.enabled }}
+{{- range .Values.ingress.git.hosts }}
+
+  http{{ if $.Values.ingress.git.tls }}s{{ end }}://{{ .host }}/
+{{- end }}
+
+Clone through the ingress host:
+
+  git -c http.extraheader="Authorization: Bearer <token>" \
+    clone http{{ if .Values.ingress.git.tls }}s{{ end }}://{{ (first .Values.ingress.git.hosts).host }}/<repo>.git
+{{- else }}
+No Ingress is configured for the git-HTTP frontend (ingress.git.enabled=false).
+Reach it with a port-forward:
+
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "git-proxy.fullname" . }} 8080:{{ .Values.service.git.port }}
+
+Then, in another shell:
+
+  git -c http.extraheader="Authorization: Bearer <token>" \
+    clone http://127.0.0.1:8080/<repo>.git
+{{- end }}
+
+{{- if .Values.config.broker.enabled }}
+
+--------------------------------------------------------------------------------
+Broker (agent-facing REST API: PRs, CI status, issues)
+--------------------------------------------------------------------------------
+{{- if .Values.ingress.broker.enabled }}
+{{- range .Values.ingress.broker.hosts }}
+
+  curl http{{ if $.Values.ingress.broker.tls }}s{{ end }}://{{ .host }}/healthz
+{{- end }}
+{{- else }}
+No Ingress is configured for the broker (ingress.broker.enabled=false).
+Reach it with a port-forward:
+
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "git-proxy.fullname" . }} 8090:{{ .Values.service.broker.port }}
+
+Then, in another shell:
+
+  curl http://127.0.0.1:8090/healthz
+{{- end }}
+
+Expect: {"status":"ok"}
+{{- end }}
+
+{{- if .Values.config.ssh.enabled }}
+
+--------------------------------------------------------------------------------
+SSH frontend
+--------------------------------------------------------------------------------
+Service: {{ include "git-proxy.fullname" . }}-ssh, port {{ .Values.sshService.port }}
+({{ .Values.sshService.type }}{{ if eq .Values.sshService.type "ClusterIP" }} -- reach it with a port-forward, or a NodePort/LoadBalancer Service{{ end }})
+
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "git-proxy.fullname" . }}-ssh 2222:{{ .Values.sshService.port }}
+
+Then, in another shell:
+
+  GIT_SSH_COMMAND='ssh -p 2222' git clone ssh://git@127.0.0.1/<repo>.git
+{{- end }}
+
+{{- if not .Values.config.auth.existingSecret }}
+
+================================================================================
+WARNING: OPEN RELAY -- no config.auth.existingSecret configured
+================================================================================
+git-proxy itself logs this at startup:
+
+  "git-proxy: WARNING: no auth.tokens configured -- the HTTP frontend is an
+  OPEN relay (any client can reach the upstream with the proxy's upstream
+  credentials). Configure auth.tokens in production."
+
+Any client that can reach this Service can use it as an unauthenticated proxy
+to the configured upstream. Create a Secret holding an `auth:` fragment and
+set config.auth.existingSecret before running this anywhere but a throwaway
+dev/test environment. See the chart README's "Secrets & the fragment-assembly
+mechanism" section.
+{{- end }}
+
+{{- if and .Values.config.ssh.enabled .Values.config.ssh.hostKey.allowEphemeral }}
+
+================================================================================
+WARNING: ephemeral SSH host key
+================================================================================
+config.ssh.hostKey.allowEphemeral=true means a NEW SSH host key is generated
+every time the pod restarts. Every client will see a host-key-changed
+warning (or an outright rejection, depending on their known_hosts policy)
+after each restart. This is fine for dev/test; for anything longer-lived,
+create a stable host-key Secret instead (see the chart README's "SSH host
+key" section) and set config.ssh.hostKey.existingSecret.
+{{- end }}
+
+{{- if and .Values.config.audit.enabled (not .Values.persistence.audit.enabled) }}
+
+================================================================================
+WARNING: audit log has no persistent storage
+================================================================================
+config.audit.enabled=true but persistence.audit.enabled=false, so the audit
+log lives on an emptyDir and is LOST on every pod restart (rescheduling,
+node drain, rollout, OOM-kill, ...). If the audit trail matters for
+compliance, set persistence.audit.enabled=true and provide a PVC. See the
+chart README's "Persistence" section.
+{{- end }}
+
+{{- if .Values.unsafeAllowMultipleReplicas }}
+
+================================================================================
+WARNING: multiple replicas (unsafeAllowMultipleReplicas=true)
+================================================================================
+git-proxy keeps per-pod local state (the inspection-mirror cache and the
+append-only audit file) with a single-writer assumption. With
+replicaCount > 1 each pod maintains an INDEPENDENT mirror cache (wasted disk,
+slower cold starts) and writes its OWN audit file, so the compliance-relevant
+audit trail is SPLIT across pods with no aggregation. See the chart README's
+"Multi-replica" section before relying on this in production.
+{{- end }}
+
+--------------------------------------------------------------------------------
+Verify the install
+--------------------------------------------------------------------------------
+Run the built-in smoke test (checks the git frontend answers 401/404{{ if .Values.config.broker.enabled }}, and
+that the broker's /healthz returns {"status":"ok"}{{ end }}):
+
+  helm test {{ .Release.Name }} --namespace {{ .Release.Namespace }}
+
+Full chart documentation: deploy/helm/git-proxy/README.md

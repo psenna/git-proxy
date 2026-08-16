@@ -1,0 +1,6 @@
+chart-dirs:
+  - deploy/helm
+target-branch: main
+validate-maintainers: false
+check-version-increment: true
+helm-extra-args: --timeout 600s

@@ -1,0 +1,39 @@
+config:
+  upstream:
+    url: "http://gitea.git.svc.cluster.local:3000"
+  auth:
+    existingSecret: "git-proxy-auth"
+  policy:
+    mode: collect_all
+    dryRun: true
+    push:
+      maxPackfileBytes: 268435456
+    read:
+      deny: ["secrets/**"]
+    rules:
+      history_protect:
+        enabled: true
+        params:
+          refs: ["refs/heads/main"]
+      branch_pattern:
+        enabled: true
+        params:
+          allow: ["refs/heads/main", "refs/heads/feat/*"]
+      commit_message:
+        enabled: true
+        params:
+          require_prefix: ["feat:", "fix:"]
+          deny_regex: ["(?i)wip"]
+      path_acl:
+        enabled: true
+        agents: ["agent-1"]
+        params:
+          deny: ["infra/**"]
+      secret_scan:
+        enabled: true
+        params:
+          extra_patterns:
+            - name: acme
+              regex: "ACME_[A-Z0-9]{20}"
+          ignore_paths: ["third-party/**"]
+          ignore_strings: ["AKIA_PLACEHOLDER"]

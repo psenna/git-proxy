@@ -1,0 +1,37 @@
+{{- if .Values.config.ssh.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "git-proxy.fullname" . }}-ssh
+  labels:
+    {{- include "git-proxy.labels" . | nindent 4 }}
+    {{- with .Values.sshService.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.sshService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.sshService.type }}
+  {{- with .Values.sshService.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with .Values.sshService.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.sshService.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+  ports:
+    - name: ssh
+      port: {{ .Values.sshService.port }}
+      targetPort: ssh
+      protocol: TCP
+      {{- if and (ne .Values.sshService.type "ClusterIP") .Values.sshService.nodePort }}
+      nodePort: {{ .Values.sshService.nodePort }}
+      {{- end }}
+  selector:
+    {{- include "git-proxy.selectorLabels" . | nindent 4 }}
+{{- end }}

@@ -1,0 +1,185 @@
+image:
+  repository: ghcr.io/psenna/git-proxy
+  tag: ""          # "" falls back to Chart.AppVersion; there is no :latest tag published, ever
+  digest: ""       # optional sha256:...; wins over tag
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+# git-proxy keeps per-pod local state (the inspection-mirror cache and the
+# append-only audit file) with a single-writer assumption -- see
+# templates/_validations.tpl. Do not flip this without a real RWX/leader
+# election design.
+unsafeAllowMultipleReplicas: false
+strategy:
+  type: Recreate
+
+# The SAME port value renders listen:/broker.listen/ssh.listen in config.yaml
+# AND the containerPort -- not settable as a full host:port; the chart always
+# binds 0.0.0.0 inside the pod.
+ports:
+  git: 8080
+  broker: 8090
+  ssh: 2222
+
+config:
+  upstream:
+    kind: ""                            # "" | plain | github  ("" behaves as plain)
+    # Default is a real, safe upstream -- access is fail-closed without
+    # credentials/public_repos configured, so this alone grants nothing.
+    url: "https://github.com"
+    credentials:
+      existingSecret: ""
+      key: credentials.yaml
+  issueUpstream:
+    enabled: false
+    kind: github
+    url: "https://github.com"
+    credentials:
+      existingSecret: ""                # empty -> reuses the SCM credentials path (single-PAT GitHub case)
+      key: credentials.yaml
+  repos: {}                             # agent-facing repo path -> upstream repo path
+  publicRepos: []                       # no "", no exact "*", no "**" anywhere in any entry
+  # auth.tokens (bearer-token -> agent-name) lives inside config.yaml with no
+  # other injection path. NEVER put it in values.yaml. Create a Secret holding
+  # a verbatim `auth:\n  tokens:\n    "<token>": <agent>` fragment.
+  auth:
+    existingSecret: ""
+    key: auth.yaml
+  policy:
+    mode: ""                            # "" | first_deny | collect_all
+    dryRun: false
+    rules: {}                           # name -> {enabled, agents, repos, params}
+    push:
+      maxPackfileBytes: 0               # <=0 -> binary default 256 MiB
+    read:
+      deny: []
+  ssh:
+    enabled: false
+    hostKey:
+      existingSecret: ""
+      key: host_key
+      allowEphemeral: false             # ephemeral key = new host identity every restart
+    authorizedKeys: {}                  # agent-name -> public key line; STRICTLY parsed at startup
+  audit:
+    enabled: true
+  alerts:
+    webhook: ""                         # if the URL embeds a token, use extraConfigFragments instead
+  broker:
+    enabled: false                      # REQUIRES config.upstream.kind: github
+    allowedAgents: []
+    allowedOps: []                      # e.g. pr.create, pr.list, ci.status, issue.create, ... (16+ values, free-form)
+    mergeMethod: ""                     # "" | merge | squash | rebase
+
+# Generic escape hatch for any other sensitive top-level config.yaml key.
+# Must NOT duplicate a key the ConfigMap already renders, or a key another
+# fragment already supplies (auth) -- duplicate top-level YAML key = parse error.
+extraConfigFragments: []
+# extraConfigFragments:
+#   - existingSecret: git-proxy-alerts
+#     key: alerts.yaml
+
+service:
+  type: ClusterIP
+  annotations: {}
+  labels: {}
+  git: {port: 8080, nodePort: null}
+  broker: {port: 8090, nodePort: null}
+  loadBalancerIP: ""
+  loadBalancerSourceRanges: []
+  externalTrafficPolicy: ""
+  sessionAffinity: ""
+
+sshService:
+  type: ClusterIP
+  annotations: {}
+  labels: {}
+  port: 2222
+  nodePort: null
+  loadBalancerIP: ""
+  loadBalancerSourceRanges: []
+  externalTrafficPolicy: ""
+
+ingress:
+  git:
+    enabled: false
+    className: ""
+    annotations: {}
+    extraLabels: {}
+    hosts: []
+    tls: []
+  broker:
+    enabled: false
+    className: ""
+    annotations: {}
+    extraLabels: {}
+    hosts: []
+    tls: []
+
+persistence:
+  mirror:
+    enabled: false
+    existingClaim: ""
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 10Gi
+    annotations: {}
+    labels: {}
+    selector: {}
+    emptyDirSizeLimit: ""
+  audit:
+    enabled: false
+    existingClaim: ""
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 1Gi
+    annotations: {}
+    labels: {}
+    selector: {}
+    emptyDirSizeLimit: ""
+
+probes:
+  useBrokerHealthz: false      # requires config.broker.enabled
+  readiness: {initialDelaySeconds: 2,  periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3, successThreshold: 1}
+  liveness:  {initialDelaySeconds: 10, periodSeconds: 20, timeoutSeconds: 2, failureThreshold: 3}
+  startup:   {enabled: false, initialDelaySeconds: 0, periodSeconds: 5, failureThreshold: 30}
+livenessProbe: {}      # non-empty REPLACES the default wholesale
+readinessProbe: {}
+startupProbe: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 100
+  fsGroup: 100
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile: {type: RuntimeDefault}
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: {drop: ["ALL"]}
+
+terminationGracePeriodSeconds: 30
+resources: {}
+extraEnv: []
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []
+extraContainers: []
+extraInitContainers: []
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""

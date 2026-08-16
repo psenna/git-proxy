@@ -1,0 +1,10 @@
+{{- include "git-proxy.validate" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "git-proxy.fullname" . }}
+  labels:
+    {{- include "git-proxy.labels" . | nindent 4 }}
+data:
+  config-base.yaml: |
+{{ include "git-proxy.configBase" . | indent 4 }}

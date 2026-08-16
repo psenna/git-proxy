@@ -20,6 +20,7 @@ header_pages:
   - architecture.md
   - extensibility.md
   - deploy-docker.md
+  - deploy-helm.md
 show_excerpts: false
 github:
   repository_url: https://github.com/psenna/git-proxy

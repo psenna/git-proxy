@@ -58,3 +58,47 @@ jobs:
           # or SBOM attestations) so it matches what `docker build` produces
           # locally and what the example compose consumes.
           provenance: false
+
+  helm-publish:
+    name: publish helm chart to GHCR (OCI)
+    runs-on: ubuntu-latest
+    needs: docker-publish
+    if: github.repository == 'psenna/git-proxy' && github.event.release.target_commitish == 'main'
+    steps:
+      - name: checkout release tag
+        uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: assert Chart.yaml appVersion matches the release tag
+        run: |
+          set -eu
+          want="${{ github.event.release.tag_name }}"
+          got="$(helm show chart deploy/helm/git-proxy | awk -F': ' '/^appVersion:/ {print $2}')"
+          if [ "$got" != "$want" ]; then
+            echo "Chart.yaml appVersion ('$got') does not match the release tag ('$want') — bump deploy/helm/git-proxy/Chart.yaml's appVersion before releasing."
+            exit 1
+          fi
+
+      - name: log in to GHCR (helm)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: assert this chart version is not already published
+        run: |
+          set -eu
+          version="$(helm show chart deploy/helm/git-proxy | awk -F': ' '/^version:/ {print $2}')"
+          if helm show chart "oci://ghcr.io/${{ github.repository_owner }}/charts/git-proxy" --version "$version" >/dev/null 2>&1; then
+            echo "chart version $version is already published to oci://ghcr.io/${{ github.repository_owner }}/charts/git-proxy — bump deploy/helm/git-proxy/Chart.yaml's version before releasing."
+            exit 1
+          fi
+
+      - name: package chart
+        run: helm package deploy/helm/git-proxy -d dist
+
+      - name: push chart
+        run: helm push dist/git-proxy-*.tgz "oci://ghcr.io/${{ github.repository_owner }}/charts"
+
+      - name: first-publish notice
+        run: echo "::notice::If this is the first publish, the GHCR package ghcr.io/${{ github.repository_owner }}/charts/git-proxy is created PRIVATE. Flip it to public at https://github.com/users/${{ github.repository_owner }}/packages/container/charts%2Fgit-proxy/settings or consumers cannot install it."

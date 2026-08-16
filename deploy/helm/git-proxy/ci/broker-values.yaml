@@ -1,0 +1,13 @@
+config:
+  upstream:
+    kind: github
+    url: "https://github.com"
+  auth:
+    existingSecret: "git-proxy-auth"
+  broker:
+    enabled: true
+    allowedAgents: ["agent-1"]
+    allowedOps: ["pr.create", "pr.list", "ci.status", "issue.create"]
+    mergeMethod: squash
+probes:
+  useBrokerHealthz: true

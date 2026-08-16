@@ -1,0 +1,177 @@
+name: helm
+
+on:
+  push:
+    branches: [main]
+    paths: ['deploy/helm/**', '.github/workflows/helm.yml']
+  pull_request:
+    paths: ['deploy/helm/**', '.github/workflows/helm.yml']
+
+concurrency:
+  group: helm-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-template:
+    name: helm lint + template + schema validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: helm lint --strict (defaults + every fixture)
+        run: |
+          set -eu
+          helm lint --strict deploy/helm/git-proxy
+          for f in deploy/helm/git-proxy/ci/*.yaml; do
+            echo "=== lint: $f ==="
+            helm lint --strict deploy/helm/git-proxy -f "$f"
+          done
+
+      - name: helm template (defaults + every fixture) -> rendered/
+        run: |
+          set -eu
+          mkdir -p rendered
+          helm template gp deploy/helm/git-proxy > rendered/defaults.yaml
+          for f in deploy/helm/git-proxy/ci/*.yaml; do
+            name="$(basename "$f" .yaml)"
+            echo "=== template: $f ==="
+            helm template gp deploy/helm/git-proxy -f "$f" > "rendered/$name.yaml"
+          done
+
+      - name: kubeconform (strict)
+        run: |
+          set -eu
+          curl -fsSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          ./kubeconform -strict -summary -kubernetes-version 1.29.0 -ignore-missing-schemas rendered/*.yaml
+
+      - name: "assert max_packfile_bytes renders as a plain integer, not scientific notation"
+        run: |
+          set -eu
+          grep -E '^\s+max_packfile_bytes: 268435456$' rendered/policy-values.yaml
+          echo "OK"
+
+      - name: "assert no top-level auth key leaks into the rendered ConfigMap"
+        run: |
+          set -eu
+          for f in rendered/*.yaml; do
+            if awk '/^kind: ConfigMap$/,/^---$/' "$f" | grep -qE '^\s{4}auth:'; then
+              echo "LEAK: $f renders a top-level auth: key inside the ConfigMap"
+              exit 1
+            fi
+          done
+          echo "OK: no fixture leaks auth: into a ConfigMap"
+
+      - name: "assert the -config flag points at the assembled path"
+        run: |
+          set -eu
+          grep -q -- '-config' rendered/full-values.yaml
+          grep -q '/run/git-proxy/config.yaml' rendered/full-values.yaml
+          echo "OK"
+
+      - name: render-time guard matrix (each must fail with the stated message)
+        run: |
+          set -eu
+          assert_fails() {
+            desc="$1"; shift
+            want="$1"; shift
+            if out="$(helm template gp deploy/helm/git-proxy "$@" 2>&1)"; then
+              echo "EXPECTED FAILURE DID NOT HAPPEN: $desc"
+              echo "$out"
+              exit 1
+            fi
+            if ! echo "$out" | grep -qF "$want"; then
+              echo "FAILURE MESSAGE MISMATCH for: $desc"
+              echo "expected to contain: $want"
+              echo "got:"
+              echo "$out"
+              exit 1
+            fi
+            echo "OK: $desc"
+          }
+
+          assert_fails "empty upstream.url" \
+            "String length must be greater than or equal to 1" \
+            --set config.upstream.url=
+
+          assert_fails "replicaCount without unsafeAllowMultipleReplicas" \
+            "replicaCount=2 is not supported" \
+            --set replicaCount=2
+
+          assert_fails "ssh enabled without authorizedKeys" \
+            "requires a non-empty config.ssh.authorizedKeys" \
+            --set config.ssh.enabled=true
+
+          assert_fails "ssh enabled without host key secret or ephemeral opt-in" \
+            "requires config.ssh.hostKey.existingSecret" \
+            --set config.ssh.enabled=true \
+            --set-string 'config.ssh.authorizedKeys.agent-1=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA k'
+
+          assert_fails "broker enabled without github upstream kind" \
+            'requires config.upstream.kind="github"' \
+            --set config.broker.enabled=true
+
+          assert_fails "broker port collides with git port" \
+            "must differ from ports.git" \
+            --set config.broker.enabled=true --set config.upstream.kind=github --set ports.broker=8080
+
+          assert_fails "ssh port collides with git port" \
+            "collides with ports.git" \
+            --set config.ssh.enabled=true --set ports.ssh=8080 \
+            --set config.ssh.hostKey.allowEphemeral=true \
+            --set-string 'config.ssh.authorizedKeys.agent-1=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA k'
+
+          assert_fails "public_repos bare star" \
+            'bare "*" catch-all' \
+            --set-string 'config.publicRepos[0]=*'
+
+          assert_fails "public_repos double star" \
+            'contains "**"' \
+            --set-string 'config.publicRepos[0]=a/**'
+
+          assert_fails "alerts.webhook bad scheme" \
+            "must start with http:// or https://" \
+            --set-string config.alerts.webhook=file:///x
+
+          assert_fails "image.repository empty" \
+            "image.repository: String length must be greater than or equal to 1" \
+            --set image.repository=
+
+          assert_fails "useBrokerHealthz without broker enabled" \
+            "requires config.broker.enabled=true" \
+            --set probes.useBrokerHealthz=true
+
+          assert_fails "issueUpstream enabled without kind" \
+            "requires config.issueUpstream.kind" \
+            --set config.issueUpstream.enabled=true --set config.issueUpstream.kind=
+
+          assert_fails "issueUpstream enabled without url" \
+            "requires config.issueUpstream.url" \
+            --set config.issueUpstream.enabled=true --set config.issueUpstream.url=
+
+          assert_fails "extraConfigFragments entry missing key" \
+            "extraConfigFragments[0].key is required" \
+            --set 'extraConfigFragments[0].existingSecret=s'
+
+          assert_fails "persistence.audit enabled with no size" \
+            "requires persistence.audit.size" \
+            --set persistence.audit.enabled=true --set persistence.audit.size=
+
+  ct-lint:
+    name: chart-testing lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+      - uses: helm/chart-testing-action@v2
+      - name: ct lint
+        run: ct lint --config deploy/helm/ct.yaml

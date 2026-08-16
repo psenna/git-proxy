@@ -1,0 +1,11 @@
+apiVersion: v2
+name: git-proxy
+description: Policy-enforcing gateway between AI coding agents and upstream Git repositories
+type: application
+version: 0.1.0
+appVersion: "v0.0.8"
+home: https://github.com/psenna/git-proxy
+sources: [https://github.com/psenna/git-proxy]
+keywords: [git, proxy, policy, security, ai-agents]
+maintainers: [{name: psenna, url: https://github.com/psenna}]
+kubeVersion: ">=1.23.0-0"

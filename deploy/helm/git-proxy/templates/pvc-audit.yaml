@@ -1,0 +1,29 @@
+{{- if and .Values.persistence.audit.enabled (not .Values.persistence.audit.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "git-proxy.fullname" . }}-audit
+  labels:
+    {{- include "git-proxy.labels" . | nindent 4 }}
+  {{- with .Values.persistence.audit.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.audit.accessModes | nindent 4 }}
+  {{- if .Values.persistence.audit.storageClass }}
+  {{- if eq .Values.persistence.audit.storageClass "-" }}
+  storageClassName: ""
+  {{- else }}
+  storageClassName: {{ .Values.persistence.audit.storageClass }}
+  {{- end }}
+  {{- end }}
+  {{- with .Values.persistence.audit.selector }}
+  selector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.audit.size }}
+{{- end }}

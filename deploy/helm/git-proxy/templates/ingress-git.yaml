@@ -1,0 +1,38 @@
+{{- if .Values.ingress.git.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "git-proxy.fullname" . }}-git
+  labels:
+    {{- include "git-proxy.labels" . | nindent 4 }}
+    {{- with .Values.ingress.git.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.ingress.git.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.git.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.git.tls }}
+  tls:
+    {{- toYaml .Values.ingress.git.tls | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.git.hosts }}
+    - host: {{ .host }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "git-proxy.fullname" $ }}
+                port:
+                  name: http-git
+          {{- end }}
+    {{- end }}
+{{- end }}
