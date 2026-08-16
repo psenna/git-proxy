@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "git-proxy.fullname" . }}
+  labels:
+    {{- include "git-proxy.labels" . | nindent 4 }}
+    {{- with .Values.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- with .Values.service.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- with .Values.service.sessionAffinity }}
+  sessionAffinity: {{ . }}
+  {{- end }}
+  ports:
+    - name: http-git
+      port: {{ .Values.service.git.port }}
+      targetPort: http-git
+      protocol: TCP
+      {{- if and (ne .Values.service.type "ClusterIP") .Values.service.git.nodePort }}
+      nodePort: {{ .Values.service.git.nodePort }}
+      {{- end }}
+    {{- if .Values.config.broker.enabled }}
+    - name: http-broker
+      port: {{ .Values.service.broker.port }}
+      targetPort: http-broker
+      protocol: TCP
+      {{- if and (ne .Values.service.type "ClusterIP") .Values.service.broker.nodePort }}
+      nodePort: {{ .Values.service.broker.nodePort }}
+      {{- end }}
+    {{- end }}
+  selector:
+    {{- include "git-proxy.selectorLabels" . | nindent 4 }}

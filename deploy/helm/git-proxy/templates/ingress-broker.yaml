@@ -1,0 +1,38 @@
+{{- if .Values.ingress.broker.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "git-proxy.fullname" . }}-broker
+  labels:
+    {{- include "git-proxy.labels" . | nindent 4 }}
+    {{- with .Values.ingress.broker.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.ingress.broker.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.broker.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.broker.tls }}
+  tls:
+    {{- toYaml .Values.ingress.broker.tls | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.broker.hosts }}
+    - host: {{ .host }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "git-proxy.fullname" $ }}
+                port:
+                  name: http-broker
+          {{- end }}
+    {{- end }}
+{{- end }}

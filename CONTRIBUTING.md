@@ -66,3 +66,12 @@ See the per-issue file lists. In short: `cmd/git-proxy` for the binary,
 | An auth method | implement `Authenticator`, register. |
 | A secret scanner | implement `SecretScanner`, register. |
 | A credential store | implement `CredentialStore`, register. |
+
+## Cutting a release
+
+Cutting a git-proxy release (tagging a new version) must also bump
+[`deploy/helm/git-proxy/Chart.yaml`](./deploy/helm/git-proxy/Chart.yaml)'s
+`appVersion` to match the release tag, and bump its `version` (chart SemVer)
+alongside it, in the same PR or immediately before tagging. The `helm-publish`
+CI job asserts that `Chart.yaml`'s `appVersion` matches the release tag and
+fails the publish if they've drifted.

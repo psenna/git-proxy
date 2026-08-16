@@ -1,0 +1,5 @@
+config:
+  upstream:
+    url: "http://gitea.git.svc.cluster.local:3000"
+  auth:
+    existingSecret: "git-proxy-auth"

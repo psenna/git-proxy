@@ -1,0 +1,13 @@
+config:
+  upstream:
+    url: "http://gitea.git.svc.cluster.local:3000"
+  auth:
+    existingSecret: "git-proxy-auth"
+persistence:
+  mirror:
+    enabled: true
+    size: 20Gi
+    storageClass: fast-ssd
+  audit:
+    enabled: true
+    existingClaim: my-audit-pvc

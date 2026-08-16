@@ -19,6 +19,9 @@ deploy/docker/data/
 docs/
 *.md
 
+# Helm chart source is not part of the image build context
+deploy/helm/
+
 # Editor/IDE
 .idea/
 .vscode/

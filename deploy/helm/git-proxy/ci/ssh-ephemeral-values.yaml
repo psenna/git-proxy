@@ -1,0 +1,15 @@
+config:
+  upstream:
+    url: "http://gitea.git.svc.cluster.local:3000"
+  auth:
+    existingSecret: "git-proxy-auth"
+  ssh:
+    enabled: true
+    hostKey:
+      existingSecret: ""
+      allowEphemeral: true
+    authorizedKeys:
+      agent-1: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ci-fixture"
+sshService:
+  type: LoadBalancer
+  loadBalancerSourceRanges: ["10.0.0.0/8"]
