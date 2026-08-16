@@ -143,9 +143,9 @@ persistence:
 
 probes:
   useBrokerHealthz: false      # requires config.broker.enabled
-  readiness: {initialDelaySeconds: 2,  periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3, successThreshold: 1}
-  liveness:  {initialDelaySeconds: 10, periodSeconds: 20, timeoutSeconds: 2, failureThreshold: 3}
-  startup:   {enabled: false, initialDelaySeconds: 0, periodSeconds: 5, failureThreshold: 30}
+  readiness: {initialDelaySeconds: 2, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3, successThreshold: 1}
+  liveness: {initialDelaySeconds: 10, periodSeconds: 20, timeoutSeconds: 2, failureThreshold: 3}
+  startup: {enabled: false, initialDelaySeconds: 0, periodSeconds: 5, failureThreshold: 30}
 livenessProbe: {}      # non-empty REPLACES the default wholesale
 readinessProbe: {}
 startupProbe: {}
