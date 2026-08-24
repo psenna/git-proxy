@@ -135,7 +135,7 @@ func TestEnforceReceivePack_ForcePushDenied(t *testing.T) {
 	})
 
 	req, _ := buildReceivePackRequest(t, [][3]string{{B, C, "refs/heads/main"}}, pack)
-	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git")
+	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git", "")
 	if err != nil {
 		t.Fatalf("EnforceReceivePack: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestEnforceReceivePack_MalformedOIDDenied(t *testing.T) {
 		"refs/heads/feat/evil",
 	}}, nil)
 
-	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git")
+	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git", "")
 	if err == nil {
 		t.Fatal("EnforceReceivePack: want a non-nil inspection error for a malformed New OID, got nil " +
 			"(a nil error here would let dry-run mode forward this push — see EnforceReceivePack's dry-run comment)")
@@ -213,7 +213,7 @@ func TestEnforceReceivePack_MalformedOIDDenied_OldField(t *testing.T) {
 
 	req, _ := buildReceivePackRequest(t, [][3]string{{malicious, A, "refs/heads/main"}}, pack)
 
-	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git")
+	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git", "")
 	if err == nil {
 		t.Fatal("EnforceReceivePack: want a non-nil inspection error for a malformed Old OID, got nil")
 	}
@@ -222,6 +222,121 @@ func TestEnforceReceivePack_MalformedOIDDenied_OldField(t *testing.T) {
 	}
 	if _, statErr := os.Stat(target); statErr == nil {
 		t.Fatalf("option-injection succeeded: %s was created by the malicious Old field", target)
+	}
+}
+
+// packObjectsWithExtra is packObjects plus one or more extra object OIDs
+// appended to the rev-list input, so the resulting pack contains objects NOT
+// reachable from tip. Used to simulate a client smuggling a stray object
+// alongside a legitimate push (security review finding H6).
+func packObjectsWithExtra(t *testing.T, dir, tip string, extraOIDs ...string) []byte {
+	t.Helper()
+	revList := exec.Command("git", "-C", dir, "rev-list", "--objects", tip)
+	var revOut bytes.Buffer
+	revList.Stdout = &revOut
+	if err := revList.Run(); err != nil {
+		t.Fatalf("rev-list --objects: %v", err)
+	}
+	for _, oid := range extraOIDs {
+		revOut.WriteString(oid + "\n")
+	}
+	cmd := exec.Command("git", "-C", dir, "pack-objects", "--stdout")
+	cmd.Stdin = &revOut
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("pack-objects: %v", err)
+	}
+	if out.Len() == 0 {
+		t.Fatalf("pack-objects produced no bytes for tip %s + extras", tip)
+	}
+	return out.Bytes()
+}
+
+// TestEnforceReceivePack_StrayObjectDenied is the security review H6
+// regression guard: a packfile containing an object NOT reachable from any
+// declared ref update must be denied, even though the declared update itself
+// is perfectly legitimate. Before this fix, nothing checked the pack's
+// contents against the declared updates — an authorized agent could smuggle
+// an extra, never-scanned blob into the upstream's object store (forwarded
+// verbatim on allow), retrievable later by anyone who knows its exact SHA,
+// without ever passing through secret_scan/path_acl/commit_message.
+func TestEnforceReceivePack_StrayObjectDenied(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, tips := enforceSourceRepo(t, 1)
+	tip := tips[0]
+	m := enforceMirror(t, source, nil)
+
+	// An orphan blob unrelated to tip's history — never reachable from any
+	// commit, tree, or the ref being created.
+	orphan := exec.Command("git", "-C", source, "hash-object", "-w", "--stdin")
+	orphan.Stdin = strings.NewReader("smuggled-content-not-part-of-any-commit\n")
+	orphanOut, err := orphan.Output()
+	if err != nil {
+		t.Fatalf("hash-object -w: %v", err)
+	}
+	orphanOID := strings.TrimSpace(string(orphanOut))
+
+	pack := packObjectsWithExtra(t, source, tip, orphanOID)
+	packID, err := m.IngestPackfile(ctx, bytes.NewReader(pack))
+	if err != nil {
+		t.Fatalf("IngestPackfile: %v", err)
+	}
+
+	eng := enforceEngine(t, map[string]map[string]any{
+		"branch_pattern": {"allow": []string{"refs/heads/**"}},
+	})
+	req, _ := buildReceivePackRequest(t, [][3]string{{
+		"0000000000000000000000000000000000000000", // create
+		tip,
+		"refs/heads/feat/x",
+	}}, nil)
+
+	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git", packID)
+	if err == nil {
+		t.Fatal("EnforceReceivePack: want a non-nil inspection error for a stray object, got nil " +
+			"(a nil error here would let dry-run mode forward this push)")
+	}
+	if dec.Verdict != port.VerdictDeny {
+		t.Fatalf("verdict = %v, want Deny", dec.Verdict)
+	}
+	if !reasonMentions(dec, "not reachable from the declared ref updates") {
+		t.Fatalf("deny reasons = %v, want a not-reachable reason", dec.Reasons)
+	}
+}
+
+// TestEnforceReceivePack_NormalPushWithPackIDAllowed is the false-positive
+// regression guard for H6: an entirely ordinary push (a fresh create,
+// packed as the full object closure reachable from its tip — no stray
+// content) must still be ALLOWED when packID is wired in, proving the
+// pack-contents check does not spuriously deny legitimate pushes.
+func TestEnforceReceivePack_NormalPushWithPackIDAllowed(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, tips := enforceSourceRepo(t, 2) // A -> B
+	A, B := tips[0], tips[1]
+	m := enforceMirror(t, source, nil)
+
+	pack := packObjects(t, source, B)
+	packID, err := m.IngestPackfile(ctx, bytes.NewReader(pack))
+	if err != nil {
+		t.Fatalf("IngestPackfile: %v", err)
+	}
+
+	eng := enforceEngine(t, map[string]map[string]any{
+		"branch_pattern": {"allow": []string{"refs/heads/feat/*"}},
+	})
+	req, _ := buildReceivePackRequest(t, [][3]string{{A, B, "refs/heads/feat/x"}}, nil)
+
+	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git", packID)
+	if err != nil {
+		t.Fatalf("EnforceReceivePack: %v", err)
+	}
+	if dec.Verdict != port.VerdictAllow {
+		t.Fatalf("verdict = %v, want Allow (ordinary push, no stray objects): reasons=%v", dec.Verdict, dec.Reasons)
 	}
 }
 
@@ -242,7 +357,7 @@ func TestEnforceReceivePack_FastForwardAllowed(t *testing.T) {
 	})
 
 	req, _ := buildReceivePackRequest(t, [][3]string{{A, B, "refs/heads/feat/x"}}, pack)
-	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git")
+	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git", "")
 	if err != nil {
 		t.Fatalf("EnforceReceivePack: %v", err)
 	}
@@ -269,7 +384,7 @@ func TestEnforceReceivePack_CreateNotForce(t *testing.T) {
 
 	zero := strings.Repeat("0", 40)
 	req, _ := buildReceivePackRequest(t, [][3]string{{zero, A, "refs/heads/feat/new"}}, pack)
-	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git")
+	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git", "")
 	if err != nil {
 		t.Fatalf("EnforceReceivePack: %v", err)
 	}
@@ -296,7 +411,7 @@ func TestEnforceReceivePack_DeleteNormalized(t *testing.T) {
 
 	zero := strings.Repeat("0", 40)
 	req, _ := buildReceivePackRequest(t, [][3]string{{A, zero, "refs/heads/main"}}, nil)
-	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git")
+	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git", "")
 	if err != nil {
 		t.Fatalf("EnforceReceivePack: %v", err)
 	}
@@ -326,7 +441,7 @@ func TestEnforceReceivePack_AncestryErrorFailsClosed(t *testing.T) {
 	})
 
 	req, _ := buildReceivePackRequest(t, [][3]string{{A, bogus, "refs/heads/main"}}, nil)
-	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git")
+	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git", "")
 	// Fail-closed: verdict must be Deny regardless of whether err is set.
 	if dec.Verdict != port.VerdictDeny {
 		t.Fatalf("verdict = %v, want Deny (fail-closed on ancestry error); err=%v", dec.Verdict, err)

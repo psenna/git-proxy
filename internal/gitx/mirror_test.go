@@ -333,6 +333,172 @@ func TestRemovePack_MissingIsNotError(t *testing.T) {
 	}
 }
 
+// TestPackObjectIDs_ListsIngestedObjects verifies PackObjectIDs enumerates
+// exactly the objects show-index reports for the pack IngestPackfile just
+// wrote: the commit, its tree, and its blob, no more and no fewer.
+func TestPackObjectIDs_ListsIngestedObjects(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	tips := makeSourceRepo(t, source, 1)
+	tip := tips[0]
+
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+
+	root := t.TempDir()
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", root, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	diverge := t.TempDir()
+	mustGit(t, "", "clone", "-q", "file://"+bare, diverge)
+	mustGit(t, diverge, "config", "user.email", "test@example.com")
+	mustGit(t, diverge, "config", "user.name", "Test")
+	mustGit(t, diverge, "checkout", "-q", "-b", "topic", tip)
+	if err := os.WriteFile(filepath.Join(diverge, "topic.txt"), []byte("topic\n"), 0o644); err != nil {
+		t.Fatalf("write topic.txt: %v", err)
+	}
+	mustGit(t, diverge, "add", "topic.txt")
+	mustGit(t, diverge, "commit", "-q", "-m", "topic commit")
+	topicTip := revParseHead(t, diverge)
+
+	// The pack for topicTip --not tip contains exactly topicTip's own commit,
+	// tree, and the new blob (three objects) — tip's objects are excluded, so
+	// the expected set is small and precisely known.
+	cmd := exec.Command("git", "-C", diverge, "pack-objects", "--stdout", "--revs")
+	cmd.Stdin = strings.NewReader(topicTip + "\n--" + "\n^" + tip + "\n")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil || out.Len() == 0 {
+		// Fallback: some git versions want the negative rev on its own line
+		// without the "--" separator; retry with the simpler form.
+		cmd = exec.Command("git", "-C", diverge, "pack-objects", "--stdout", "--revs")
+		cmd.Stdin = strings.NewReader(topicTip + "\n^" + tip + "\n")
+		out.Reset()
+		cmd.Stdout = &out
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("pack-objects --revs: %v", err)
+		}
+	}
+	pack := out.Bytes()
+
+	packID, err := m.IngestPackfile(ctx, bytes.NewReader(pack))
+	if err != nil {
+		t.Fatalf("IngestPackfile: %v", err)
+	}
+
+	oids, err := m.PackObjectIDs(ctx, packID)
+	if err != nil {
+		t.Fatalf("PackObjectIDs: %v", err)
+	}
+	if len(oids) != 3 {
+		t.Fatalf("PackObjectIDs returned %d objects %v, want exactly 3 (commit, tree, blob)", len(oids), oids)
+	}
+	found := false
+	for _, oid := range oids {
+		if oid == topicTip {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("PackObjectIDs = %v, want it to include the commit %s", oids, topicTip)
+	}
+}
+
+// TestPackObjectIDs_EmptyPackID verifies the no-packfile case (a delete-only
+// push never calls IngestPackfile, so the caller has no packID) is a no-op.
+func TestPackObjectIDs_EmptyPackID(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+	source := t.TempDir()
+	makeSourceRepo(t, source, 1)
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	oids, err := m.PackObjectIDs(ctx, "")
+	if err != nil {
+		t.Fatalf("PackObjectIDs(\"\"): %v", err)
+	}
+	if len(oids) != 0 {
+		t.Errorf("PackObjectIDs(\"\") = %v, want empty", oids)
+	}
+}
+
+// TestReachableObjects_FullClosureIncludesSharedBase is the security review
+// H6 design-correctness guard: ReachableObjects(tips) must be the FULL
+// closure (no --not exclusion) — an ancestor commit's tree/blob objects (here
+// A, reachable from child commit B) must be included even though they are
+// also reachable from an EXISTING ref. This is deliberately the opposite of
+// NewCommits'/ChangedFiles' `--not --all` (incremental) semantics: those
+// exist to report only what's NEW for content inspection, but a thin-pack
+// completion legitimately copies in already-known ancestor objects as delta
+// bases, and the H6 pack-content check must not flag those as suspicious —
+// using `--not --all` there would false-positive-deny completely ordinary
+// pushes.
+func TestReachableObjects_FullClosureIncludesSharedBase(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	tips := makeSourceRepo(t, source, 2) // A(0) -> B(1)
+	A, B := tips[0], tips[1]
+	aTree := strings.TrimSpace(mustOutputRevParse(t, source, A+"^{tree}"))
+	aBlob := strings.TrimSpace(mustOutputRevParse(t, source, A+":file0.txt"))
+
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	set, err := m.ReachableObjects(ctx, []string{B})
+	if err != nil {
+		t.Fatalf("ReachableObjects: %v", err)
+	}
+	for name, oid := range map[string]string{"commit A": A, "A's tree": aTree, "A's blob": aBlob} {
+		if _, ok := set[oid]; !ok {
+			t.Errorf("ReachableObjects([B]) missing %s (%s) — full closure must include B's ancestors, not just objects new since some baseline", name, oid)
+		}
+	}
+	if _, ok := set[B]; !ok {
+		t.Errorf("ReachableObjects([B]) missing B itself")
+	}
+}
+
+// TestReachableObjects_EmptyTips verifies a nil/empty tips list yields an
+// empty, non-nil set with no error (mirrors WantedObjects/NewCommits' nil-in
+// convention).
+func TestReachableObjects_EmptyTips(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+	source := t.TempDir()
+	makeSourceRepo(t, source, 1)
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	set, err := m.ReachableObjects(ctx, nil)
+	if err != nil {
+		t.Fatalf("ReachableObjects(nil): %v", err)
+	}
+	if set == nil || len(set) != 0 {
+		t.Errorf("ReachableObjects(nil) = %v, want empty non-nil set", set)
+	}
+}
+
 // TestMirrorOpenCachedReopen verifies Open is idempotent: reopening an existing
 // mirror directory does not re-clone and still yields a usable mirror.
 func TestMirrorOpenCachedReopen(t *testing.T) {

@@ -378,7 +378,7 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 	}
 
 	agent := agentName(ctx)
-	dec, enErr := EnforceReceivePack(ctx, req, mirror, p.engine, agent, repo)
+	dec, enErr := EnforceReceivePack(ctx, req, mirror, p.engine, agent, repo, ingestedPackID)
 	if enErr != nil {
 		log.Printf("gitproto: receive-pack enforcement error for repo %q: %v", repo, enErr)
 	}

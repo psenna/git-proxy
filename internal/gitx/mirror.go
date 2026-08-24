@@ -693,6 +693,83 @@ func (m *Mirror) Dir() string { return m.dir }
 // for a ref creation (Old == "").
 const emptyTreeOID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
+// PackObjectIDs lists every object id physically stored in the pack
+// identified by packID (as returned by IngestPackfile), via
+// `git show-index < pack-<packID>.idx`. show-index prints one "<offset>
+// <sha1>[ <crc32>]" line per object with no summary/footer line to filter,
+// unlike `git verify-pack -v` — a cleaner source for "which OIDs does this
+// exact pack file contain" than parsing verify-pack's delta-aware format.
+// Used by the push-enforcement path to verify every object the client
+// actually sent is reachable from the ref updates it declared (security
+// review finding H6). The per-mirror mutex is held for serialization.
+func (m *Mirror) PackObjectIDs(ctx context.Context, packID string) ([]string, error) {
+	if packID == "" {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	idxPath := filepath.Join(m.dir, "objects", "pack", "pack-"+packID+".idx")
+	f, err := os.Open(idxPath)
+	if err != nil {
+		return nil, fmt.Errorf("gitx: pack object ids: open %s: %w", idxPath, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	cmd := exec.CommandContext(ctx, "git", "-C", m.dir, "show-index")
+	cmd.Stdin = f
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("gitx: show-index: %w: %s", err, redactCreds(strings.TrimSpace(stderr.String())))
+	}
+	lines := splitCleanLines(stdout.Bytes())
+	oids := make([]string, 0, len(lines))
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue // malformed line (should not happen for show-index output)
+		}
+		oids = append(oids, fields[1]) // fields[0] is the pack offset, fields[1] the OID
+	}
+	return oids, nil
+}
+
+// ReachableObjects returns the FULL set of object ids reachable from tips —
+// deliberately with NO `--not` exclusion, unlike NewCommits/ChangedFiles'
+// `--not --all` (which only wants the INCREMENTAL delta for content
+// inspection). This is the closure used to validate a pack's contents
+// (finding H6): a thin-pack completion legitimately copies in objects
+// reachable from an EXISTING ref (e.g. a prior version of a file the new
+// commit's parent already had) as delta bases, and those are NOT "new" by
+// the `--not --all` definition, yet ARE part of the resulting ref's full
+// history and must not be flagged as suspicious. Excluding already-known
+// objects here would produce false-positive denials on completely ordinary
+// pushes. A nil/empty tips list yields an empty (non-nil) set with no error.
+// The per-mirror mutex is held for serialization.
+func (m *Mirror) ReachableObjects(ctx context.Context, tips []string) (map[string]struct{}, error) {
+	set := make(map[string]struct{})
+	if len(tips) == 0 {
+		return set, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	args := append([]string{"rev-list", "--objects"}, tips...)
+	out, err := runGit(ctx, m.dir, args...)
+	if err != nil {
+		return nil, fmt.Errorf("gitx: reachable objects: %w", err)
+	}
+	for _, line := range splitCleanLines(out) {
+		sp := strings.IndexByte(line, ' ')
+		oid := line
+		if sp >= 0 {
+			oid = line[:sp]
+		}
+		set[oid] = struct{}{}
+	}
+	return set, nil
+}
+
 // NewCommits returns the SHAs of commits introduced by the push across the
 // given ref updates (old..new per update; create → all commits reachable from
 // new that are new to the mirror). Delete updates (New == "") contribute no
