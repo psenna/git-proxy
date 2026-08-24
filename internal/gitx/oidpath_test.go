@@ -218,6 +218,75 @@ func TestOidpath_Resolve_NoPath_OrphanBlob(t *testing.T) {
 	}
 }
 
+// TestOidpath_ResolveMany verifies the bulk resolver used to fix security
+// review finding H4: `ResolveMany` must answer for every requested OID from a
+// SINGLE tree walk, with results identical to calling Resolve once per OID
+// (including the multi-path and orphan-blob edge cases), and must not include
+// entries for OIDs not asked for.
+func TestOidpath_ResolveMany(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	mustGit(t, "", "init", "-q", "-b", "main", source)
+	mustGit(t, source, "config", "user.email", "test@example.com")
+	mustGit(t, source, "config", "user.name", "Test")
+	const shared = "shared-content-line\n"
+	writeFile(t, source, "a.txt", shared)
+	writeFile(t, source, "b.txt", shared) // same content as a.txt -> shared OID
+	writeFile(t, source, "solo.txt", "solo\n")
+	mustGit(t, source, "add", "a.txt", "b.txt", "solo.txt")
+	mustGit(t, source, "commit", "-q", "-m", "add shared and solo content")
+
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+
+	root := t.TempDir()
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", root, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := m.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	sharedOID := strings.TrimSpace(mustOutputRevParse(t, source, "HEAD:a.txt"))
+	soloOID := strings.TrimSpace(mustOutputRevParse(t, source, "HEAD:solo.txt"))
+	unknownOID := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+	got, err := gitx.ResolveMany(ctx, m, []string{sharedOID, soloOID, unknownOID})
+	if err != nil {
+		t.Fatalf("ResolveMany: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("ResolveMany returned %d entries %v, want exactly 3 (one per requested OID)", len(got), got)
+	}
+	for _, want := range []string{"a.txt", "b.txt"} {
+		if !contains(got[sharedOID], want) {
+			t.Errorf("ResolveMany[sharedOID] = %v, want to include %q", got[sharedOID], want)
+		}
+	}
+	if len(got[sharedOID]) != 2 {
+		t.Errorf("ResolveMany[sharedOID] = %v, want exactly 2 paths (a.txt, b.txt)", got[sharedOID])
+	}
+	if !contains(got[soloOID], "solo.txt") {
+		t.Errorf("ResolveMany[soloOID] = %v, want to include solo.txt", got[soloOID])
+	}
+	if len(got[unknownOID]) != 0 {
+		t.Errorf("ResolveMany[unknownOID] = %v, want empty", got[unknownOID])
+	}
+
+	// Empty/nil input yields nil with no error (matches Resolve's oid=="" case).
+	got, err = gitx.ResolveMany(ctx, m, nil)
+	if err != nil {
+		t.Fatalf("ResolveMany(nil): %v", err)
+	}
+	if got != nil {
+		t.Errorf("ResolveMany(nil) = %v, want nil", got)
+	}
+}
+
 // mustOutputRevParse runs `git -C dir rev-parse ref` and returns trimmed stdout.
 func mustOutputRevParse(t *testing.T, dir string, ref string) string {
 	t.Helper()

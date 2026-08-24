@@ -134,6 +134,35 @@ func serveUploadPackEnforcedInner(ctx context.Context, w io.Writer, req *UploadP
 		return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: refresh mirror: %w", err)
 	}
 
+	// Security review findings C2/C3: every `want` MUST be a well-formed
+	// 40-hex object id before it is used for anything. A compliant client
+	// NEVER sends anything else in a want line (abbreviated OIDs and rev
+	// expressions like "HEAD:path" are not part of the wire protocol) — this
+	// is pure hostile-input rejection, zero functional impact on a real
+	// client. Two concrete bypasses this closes:
+	//   - An abbreviated or rev-expression want previously slipped past the
+	//     on-demand blob classifier below: `ObjectTypes`/cat-file --batch-check
+	//     keys its result by the RESOLVED 40-hex oid, but the classifier
+	//     looked the type up by the raw (possibly abbreviated) want string, so
+	//     the lookup missed, the want was treated as "not a blob", and the
+	//     on-demand deny check was skipped entirely for it.
+	//   - The same values, unvalidated, are spliced as literal argv into
+	//     `git rev-list`/`git cat-file` calls elsewhere in gitx — the same
+	//     class of option-injection risk closed for receive-pack in C1.
+	// isHexSHA is shared with EnforceReceivePack (receivepack_enforce.go).
+	for _, want := range req.Wants {
+		if !isHexSHA(want) {
+			// The malformed want VALUE is deliberately never logged or echoed
+			// back (no-leak): it is untrusted wire content that, by definition
+			// of having failed this check, did not need to be a real object id
+			// at all.
+			reason := "malformed want: object id must be 40 hex characters"
+			log.Printf("gitproto: upload-pack enforce: refusing malformed want for repo %q", repo)
+			err := writeUploadPackErr(w, reason)
+			return UploadPackEnforceResult{DeniedReason: reason}, err
+		}
+	}
+
 	// --- Task 10: on-demand blob fetch classification (M7b) ---
 	//
 	// An on-demand fetch's want is a BLOB oid (the agent's git, after a
@@ -156,8 +185,11 @@ func serveUploadPackEnforcedInner(ctx context.Context, w io.Writer, req *UploadP
 	//     blob is not a denied blob, so it DENIES it (the safer choice for a
 	//     security filter). This is the documented fail-closed decision; it is
 	//     stricter than fail-open and may over-deny, but never under-deny.
-	//   - Commit/tag/tree wants and allowed blob wants fall through to the
-	//     existing withholding path, which serves the (allowed) blob.
+	//   - A TREE want is ALWAYS refused (security review C3) — no real client
+	//     wants a tree directly, and rev-list's tree-relative paths for one
+	//     would defeat root-anchored deny patterns.
+	//   - Commit/tag wants and allowed blob wants fall through to the existing
+	//     withholding path, which serves the (allowed) blob.
 	if reason, deniedOID, deny := onDemandBlobDenyReason(ctx, mirror, req.Wants, readDenyMatcher, repo); deny {
 		log.Printf("gitproto: upload-pack enforce: refusing on-demand fetch for repo %q: %s", repo, reason)
 		err := writeUploadPackErr(w, reason)
@@ -264,23 +296,47 @@ func serveUploadPackEnforcedInner(ctx context.Context, w io.Writer, req *UploadP
 		return UploadPackEnforceResult{}, nil
 	}
 
-	// Collect unique OIDs (in first-seen order) and their resolving paths. Only
-	// non-empty paths are matcher candidates; commits and the root tree have an
-	// empty path and are never withheld.
+	// Collect unique OIDs (in first-seen order). `objs`' per-OID Path (from
+	// `git rev-list --objects`) is NOT used for the deny decision below — see
+	// the blobPaths comment — only to know which OIDs are in the wanted set at
+	// all.
 	oidOrder := make([]string, 0, len(objs))
-	oidPaths := make(map[string][]string, len(objs))
+	seenOID := make(map[string]struct{}, len(objs))
 	for _, op := range objs {
-		if _, ok := oidPaths[op.OID]; !ok {
-			oidOrder = append(oidOrder, op.OID)
+		if _, ok := seenOID[op.OID]; ok {
+			continue
 		}
-		if op.Path != "" {
-			oidPaths[op.OID] = append(oidPaths[op.OID], op.Path)
-		}
+		seenOID[op.OID] = struct{}{}
+		oidOrder = append(oidOrder, op.OID)
 	}
 
 	types, err := mirror.ObjectTypes(ctx, oidOrder)
 	if err != nil {
 		return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: object types: %w", err)
+	}
+
+	// Security review finding H4: `git rev-list --objects` (the source of
+	// `objs` above) dedupes by OID and prints only the FIRST path per object.
+	// That under-reports a blob reachable at both a denied path and an
+	// allowed path (identical content in two files, or a rename across
+	// history) — whichever path rev-list happens to print first decides
+	// whether the blob is withheld, which is wrong for a security filter.
+	// gitx.ResolveMany walks the mirror's full tree history ONCE (not once per
+	// blob — see its doc comment) and returns EVERY path for every wanted
+	// blob, so a blob is withheld if ANY of its paths, anywhere in history, is
+	// denied. Only computed when there is a matcher to check against.
+	var blobPaths map[string][]string
+	if readDenyMatcher != nil {
+		blobOIDs := make([]string, 0, len(oidOrder))
+		for _, oid := range oidOrder {
+			if types[oid] == "blob" {
+				blobOIDs = append(blobOIDs, oid)
+			}
+		}
+		blobPaths, err = gitx.ResolveMany(ctx, mirror, blobOIDs)
+		if err != nil {
+			return UploadPackEnforceResult{}, fmt.Errorf("gitproto: upload-pack enforce: resolve blob paths: %w", err)
+		}
 	}
 
 	// Build the allowed OID list: keep commits and trees unconditionally; for
@@ -294,7 +350,7 @@ func serveUploadPackEnforcedInner(ctx context.Context, w io.Writer, req *UploadP
 			allowed = append(allowed, oid)
 			continue
 		}
-		paths := oidPaths[oid]
+		paths := blobPaths[oid]
 		if readDenyMatcher != nil {
 			denied := false
 			for _, p := range paths {
@@ -589,8 +645,23 @@ func onDemandBlobDenyReason(ctx context.Context, mirror *gitx.Mirror, wants []st
 		return fmt.Sprintf("access to object %s denied by read policy", oid), oid, true
 	}
 	for _, oid := range wants {
+		// Security review finding C3: a want that resolves to a TREE is never
+		// legitimate — a real client only wants a commit/tag (a normal full
+		// clone/fetch) or a blob (the on-demand partial-clone fetch this
+		// function exists to police). A client that wants a tree directly is
+		// trying to read a subtree without ever naming a blob: `git rev-list
+		// --objects <tree-oid>` prints its contents' paths RELATIVE TO THAT
+		// TREE, not the repo root, so a root-anchored deny pattern like
+		// "secrets/**" silently fails to match "key.pem" instead of
+		// "secrets/key.pem". Deny it outright rather than trying to resolve
+		// tree-relative paths back to repo-root paths — no real client needs
+		// this, so refusing it has zero functional cost.
+		if types[oid] == "tree" {
+			log.Printf("gitproto: upload-pack enforce: refusing on-demand tree want %s in repo %q (trees may not be wanted directly)", oid, repo)
+			return fmt.Sprintf("access to object %s denied by read policy", oid), oid, true
+		}
 		if types[oid] != "blob" {
-			continue // commit/tag/tree want → full-clone path (existing withholding)
+			continue // commit/tag want → full-clone path (existing withholding)
 		}
 		// On-demand blob want: resolve its path(s) and check the deny matcher.
 		paths, rerr := gitx.Resolve(ctx, mirror, oid)

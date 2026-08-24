@@ -980,6 +980,112 @@ func TestServeUploadPackEnforced_OnDemandBlob_MixedWantWithDeniedBlob(t *testing
 	// No packfile: the ERR is the only pkt-line (assertUploadPackErr checks).
 }
 
+// TestServeUploadPackEnforced_MalformedWantDenied is the security review C2
+// regression guard: a want that is not a well-formed 40-hex object id (an
+// abbreviated OID, in this case) must be refused outright, BEFORE it reaches
+// the on-demand blob classifier. Before the fix, `mirror.ObjectTypes` keyed
+// its result by the RESOLVED oid (cat-file --batch-check's output), while the
+// classifier looked the type up by this raw abbreviated string — the lookup
+// missed, the want was treated as "not a blob", and the on-demand deny check
+// (and thus read protection) was skipped entirely for it.
+func TestServeUploadPackEnforced_MalformedWantDenied(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, _ := readRepoForProtection(t)
+	m := readProtectionMirror(t, source)
+
+	secretOID := strings.TrimSpace(mustOutput(t, "git", "-C", h_BarePath(t, m), "rev-parse", "HEAD:secrets/secret.txt"))
+	abbreviated := secretOID[:12] // well short of the required 40 hex chars
+
+	matcher := pathmatch.New([]string{"secrets/**"})
+	req := uploadPackRequestWants(t, true, abbreviated)
+
+	var out bytes.Buffer
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced should return nil after writing ERR, got err=%v", err)
+	}
+	reason := assertUploadPackErr(t, out.Bytes())
+	if !strings.Contains(reason, "40 hex") {
+		t.Errorf("ERR reason = %q, want it to explain the object id format requirement", reason)
+	}
+}
+
+// TestServeUploadPackEnforced_OnDemandBlob_TreeWantDenied is the security
+// review C3 regression guard: wanting a TREE oid directly must be refused,
+// not silently allowed through as "not a blob". Before the fix, a want for
+// the "secrets/" subtree's oid fell through the on-demand classifier (only
+// blobs were checked) and into the full-clone withholding path, whose
+// `git rev-list --objects <tree-oid>` prints paths RELATIVE TO THAT TREE
+// ("secret.txt", not "secrets/secret.txt") — so the root-anchored
+// "secrets/**" deny pattern silently failed to match and the whole denied
+// subtree was served.
+func TestServeUploadPackEnforced_OnDemandBlob_TreeWantDenied(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, _ := readRepoForProtection(t)
+	m := readProtectionMirror(t, source)
+
+	secretsTreeOID := strings.TrimSpace(mustOutput(t, "git", "-C", h_BarePath(t, m), "rev-parse", "HEAD:secrets"))
+
+	matcher := pathmatch.New([]string{"secrets/**"})
+	req := uploadPackRequestWants(t, true, secretsTreeOID) // tree want, not blob
+
+	var out bytes.Buffer
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced should return nil after writing ERR, got err=%v", err)
+	}
+	reason := assertUploadPackErr(t, out.Bytes())
+	if !strings.Contains(reason, "denied") {
+		t.Errorf("ERR reason = %q, want it to mention denial (tree wants are never allowed)", reason)
+	}
+}
+
+// TestServeUploadPackEnforced_MultiPathBlobWithheld is the security review H4
+// regression guard: a blob reachable at BOTH a denied path and an allowed
+// path (identical content in two files) must be withheld from a full clone
+// regardless of which path `git rev-list --objects` happens to print first
+// for that OID (rev-list dedupes by OID and prints only one path — the gap
+// this test pins shut via gitx.ResolveMany).
+func TestServeUploadPackEnforced_MultiPathBlobWithheld(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	mustGit(t, "", "init", "-q", "-b", "main", dir)
+	mustGit(t, dir, "config", "user.email", "test@example.com")
+	mustGit(t, dir, "config", "user.name", "Test")
+	if err := os.MkdirAll(filepath.Join(dir, "secrets"), 0o755); err != nil {
+		t.Fatalf("mkdir secrets: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o755); err != nil {
+		t.Fatalf("mkdir docs: %v", err)
+	}
+	const shared = "duplicated across an allowed and a denied path\n"
+	writeFile(t, dir, "secrets/leaked.txt", shared) // denied path
+	writeFile(t, dir, "docs/example.txt", shared)   // allowed path, SAME content/OID
+	mustGit(t, dir, "add", "secrets/leaked.txt", "docs/example.txt")
+	mustGit(t, dir, "commit", "-q", "-m", "same blob at a denied and an allowed path")
+	tip := revParseHead(t, dir)
+
+	m := readProtectionMirror(t, dir)
+	sharedOID := strings.TrimSpace(mustOutput(t, "git", "-C", h_BarePath(t, m), "rev-parse", "HEAD:docs/example.txt"))
+	if got := strings.TrimSpace(mustOutput(t, "git", "-C", h_BarePath(t, m), "rev-parse", "HEAD:secrets/leaked.txt")); got != sharedOID {
+		t.Fatalf("setup: secrets/leaked.txt and docs/example.txt must share an OID; got %s vs %s", got, sharedOID)
+	}
+
+	matcher := pathmatch.New([]string{"secrets/**"})
+	req := uploadPackRequestFilter(t, tip, true) // full clone (commit want), partial-clone capable
+
+	var out bytes.Buffer
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced: %v", err)
+	}
+	pack := demuxSidebandPack(t, out.Bytes())
+	assertPackHasBlobOIDs(t, m.Dir(), pack, nil, []string{sharedOID})
+}
+
 // TestServeUploadPackEnforced_PlainCloneDeniedWithError verifies the fix: a
 // read-protected fetch whose reachable set contains a denied-path blob, made
 // WITHOUT the `filter` capability (a plain clone), is REFUSED with an
