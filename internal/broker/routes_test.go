@@ -391,6 +391,31 @@ func TestOpAllowlist_403(t *testing.T) {
 	}
 }
 
+// TestAgentRepoAllowlist_403 is the security review H2 regression guard at
+// the HTTP layer: an agent scoped via AllowedAgentRepos to one repo gets a
+// normal 200 for that repo but a 403 for a DIFFERENT repo, even though
+// AllowedAgents/AllowedOps would otherwise permit the op. Before this fix,
+// there was no way to express "these two agents share a broker but are
+// scoped to different repos" — any agent allowlisted for an op could reach
+// it against every repo any credential profile covers.
+func TestAgentRepoAllowlist_403(t *testing.T) {
+	up := &capturingPRSupport{}
+	agentRepos := map[string]port.RepoMatcher{"alice": stubRepoMatcher{"owner/allowed.git": true}}
+	_, srv := newTestBroker(t, up, Config{AllowedAgentRepos: agentRepos})
+
+	okResp := do(t, srv, http.MethodGet, "/owner%2Fallowed.git/prs/7", "agent-token-1", nil)
+	defer func() { _ = okResp.Body.Close() }()
+	if okResp.StatusCode != http.StatusOK {
+		t.Errorf("status for scoped repo = %d, want 200", okResp.StatusCode)
+	}
+
+	forbiddenResp := do(t, srv, http.MethodGet, "/owner%2Fother.git/prs/7", "agent-token-1", nil)
+	defer func() { _ = forbiddenResp.Body.Close() }()
+	if forbiddenResp.StatusCode != http.StatusForbidden {
+		t.Errorf("status for out-of-scope repo = %d, want 403", forbiddenResp.StatusCode)
+	}
+}
+
 func TestSentinelToStatus(t *testing.T) {
 	cases := []struct {
 		name   string

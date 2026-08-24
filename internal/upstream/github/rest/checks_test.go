@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/psenna/git-proxy/internal/port"
@@ -44,6 +45,62 @@ func TestListCheckRuns_NotFound(t *testing.T) {
 	c := New(s.URL, "tok")
 	if _, err := c.ListCheckRuns(context.Background(), "o/r.git", "abc"); !errors.Is(err, port.ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestListCheckRuns_RefEscaped is the security review H1 regression guard: a
+// ref containing "/" must stay inside ONE escaped path segment, never split
+// into extra path segments GitHub's router would see as a different resource
+// (or, before this fix, a "../"-style traversal to a repo outside the one the
+// agent was scoped to).
+func TestListCheckRuns_RefEscaped(t *testing.T) {
+	var gotEscapedPath string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		gotEscapedPath = r.URL.EscapedPath()
+		_, _ = w.Write([]byte(`{"check_runs":[]}`))
+	})
+	s := httptest.NewServer(mux)
+	defer s.Close()
+	c := New(s.URL, "tok")
+
+	if _, err := c.ListCheckRuns(context.Background(), "o/r.git", "x/y"); err != nil {
+		t.Fatalf("ListCheckRuns: %v", err)
+	}
+	const want = "/repos/o/r/commits/x%2Fy/check-runs"
+	if gotEscapedPath != want {
+		t.Errorf("request path = %q, want %q (ref must stay a single escaped path segment)", gotEscapedPath, want)
+	}
+}
+
+// TestListWorkflowRuns_RefEscaped is the security review H1 regression guard
+// for the query-string call site: a ref containing "&"/"=" must not be able
+// to inject an additional query parameter or otherwise take control of the
+// outbound request GitHub receives with the proxy's own credential.
+func TestListWorkflowRuns_RefEscaped(t *testing.T) {
+	var gotRawQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		gotRawQuery = r.URL.RawQuery
+		_, _ = w.Write([]byte(`{"workflow_runs":[]}`))
+	})
+	s := httptest.NewServer(mux)
+	defer s.Close()
+	c := New(s.URL, "tok")
+
+	const malicious = "a&evil=1"
+	if _, err := c.ListWorkflowRuns(context.Background(), "o/r.git", malicious); err != nil {
+		t.Fatalf("ListWorkflowRuns: %v", err)
+	}
+	q, err := url.ParseQuery(gotRawQuery)
+	if err != nil {
+		t.Fatalf("parse raw query %q: %v", gotRawQuery, err)
+	}
+	if q.Get("evil") == "1" {
+		t.Fatalf("query injection: server parsed a separate evil=1 parameter from raw query %q", gotRawQuery)
+	}
+	if q.Get("head_sha") != malicious {
+		t.Errorf("head_sha = %q, want the literal ref value %q preserved as one value (not split)", q.Get("head_sha"), malicious)
 	}
 }
 

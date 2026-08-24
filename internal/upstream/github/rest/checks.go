@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 )
 
 // Overall check-state roll-up values returned by Summary.
@@ -12,7 +13,7 @@ const (
 	StatePending = "pending" // at least one run is queued/in_progress or has no conclusion yet
 	StateFailure = "failure" // at least one run failed (failure, cancelled, timed_out, ...)
 	StateSuccess = "success" // all runs completed with a passing conclusion
-	StateUnknown = "unknown"  // a run is in a state the roll-up cannot classify
+	StateUnknown = "unknown" // a run is in a state the roll-up cannot classify
 )
 
 // CheckSummary is the rest-internal roll-up of CI state for a ref. The github
@@ -27,12 +28,22 @@ type CheckSummary struct {
 // name). GitHub REST: GET /repos/{owner}/{repo}/commits/{ref}/check-runs,
 // following the Link header for pagination (max maxPages). The response is the
 // GitHub envelope {"check_runs":[...]}; the slice is extracted page by page.
+//
+// ref is agent-controlled (it comes straight from the ci.status/ci.log broker
+// routes) and MUST be escaped before it is spliced into the request path —
+// security review finding H1. Verified without escaping: a percent-encoded
+// dot-segment in ref (e.g. "%2e%2e") survives the broker's own routing
+// unmolested and, with no escaping here, would reach GitHub as a literal
+// "../" in the outbound path — a repo the agent isn't scoped to, read with
+// the proxy's own credential. url.PathEscape neutralizes this: it escapes the
+// "/" a traversal needs to move between path segments, so whatever ref
+// contains stays inside this single path segment.
 func (c *Client) ListCheckRuns(ctx context.Context, repo, ref string) ([]CheckRun, error) {
 	p, err := repoPath(repo)
 	if err != nil {
 		return nil, err
 	}
-	path := fmt.Sprintf("%s/commits/%s/check-runs?per_page=100", p, ref)
+	path := fmt.Sprintf("%s/commits/%s/check-runs?per_page=100", p, url.PathEscape(ref))
 	var out []CheckRun
 	for i := 0; i < maxPages; i++ {
 		var page checkRunsResponse
@@ -56,12 +67,19 @@ func (c *Client) ListCheckRuns(ctx context.Context, repo, ref string) ([]CheckRu
 // page by page. Callers that want branch-scoped runs can pass a branch name;
 // the adapter chooses head_sha= for SHA refs (the gate-on-green case, where the
 // agent has a concrete commit) and reserves branch= for a future follow-up.
+//
+// ref is agent-controlled and MUST be escaped before it is spliced into the
+// query string — security review finding H1. Unescaped, an agent could
+// inject additional query parameters (e.g. a "&" in ref) or truncate the
+// fixed "&per_page=100" suffix (e.g. via "#"), taking control of the request
+// GitHub receives with the proxy's own credential. url.QueryEscape is the
+// correct escaper here (this is a query value, not a path segment).
 func (c *Client) ListWorkflowRuns(ctx context.Context, repo, ref string) ([]WorkflowRun, error) {
 	p, err := repoPath(repo)
 	if err != nil {
 		return nil, err
 	}
-	path := fmt.Sprintf("%s/actions/runs?head_sha=%s&per_page=100", p, ref)
+	path := fmt.Sprintf("%s/actions/runs?head_sha=%s&per_page=100", p, url.QueryEscape(ref))
 	var out []WorkflowRun
 	for i := 0; i < maxPages; i++ {
 		var page workflowRunsResponse
