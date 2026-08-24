@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -165,6 +167,68 @@ func TestProxyReceivePack_DenyWritesReportStatusNoForward(t *testing.T) {
 	}
 	if !bytes.HasSuffix(out.Bytes(), []byte("0000")) {
 		t.Fatalf("deny response not flush-terminated; got %x", out.Bytes())
+	}
+}
+
+// TestProxyReceivePack_DenyRemovesIngestedPack is the security review H10
+// regression guard: after a push is truly denied, the packfile ingested into
+// the mirror's object store for inspection must be removed — every mirror is
+// opened with gc.auto=0, so nothing else would ever reclaim that disk space,
+// and an authorized-but-malicious agent looping large denied pushes would
+// otherwise fill the proxy's disk with objects nothing collects.
+func TestProxyReceivePack_DenyRemovesIngestedPack(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	ref := "refs/heads/main"
+	dir, tips := enforceSourceRepo(t, 1)
+	tip := tips[0]
+	bareRoot := t.TempDir()
+	bare := bareRoot + "/repo.git"
+	mustGit(t, "", "init", "--bare", "-q", "-b", "main", bare)
+	mustGit(t, dir, "push", "-q", "file://"+bare, "main")
+	testBareRoot = bareRoot
+
+	pack := packObjects(t, dir, tip)
+	body := buildPushRequestWithNew(t, ref, tip, pack)
+
+	up := &fakeUpstream{resp: cannedReceivePackResponse(t, ref)}
+	eng := enforceEngine(t, map[string]map[string]any{
+		"branch_pattern": {"allow": nil}, // empty allow list denies all
+	})
+	proxy := gitproto.New(up)
+
+	// Capture the specific *gitx.Mirror the proxy opens so the test can
+	// inspect its object store after the call (testMirrorOpener's closure
+	// would otherwise discard it).
+	var mirror *gitx.Mirror
+	opener := func(ctx context.Context, repo string) (*gitx.Mirror, error) {
+		m, err := gitx.Open(ctx, "file://"+testBareRoot, repo, t.TempDir(), nil)
+		mirror = m
+		return m, err
+	}
+	proxy.SetEnforcement(eng, opener, 1<<28)
+
+	var out bytes.Buffer
+	if err := proxy.ReceivePack(ctx, "repo.git", bytes.NewReader(body), &out); err != nil {
+		t.Fatalf("ReceivePack: %v", err)
+	}
+	if len(up.forwarded) != 0 {
+		t.Fatalf("upstream received %d bytes on a denied push; want 0", len(up.forwarded))
+	}
+	if mirror == nil {
+		t.Fatal("mirror opener was never called")
+	}
+
+	packDir := filepath.Join(mirror.Dir(), "objects", "pack")
+	entries, err := os.ReadDir(packDir)
+	if err != nil {
+		t.Fatalf("read pack dir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".pack") || strings.HasSuffix(e.Name(), ".idx") {
+			t.Errorf("pack file %s still present after a denied push; the ingested pack must be removed", e.Name())
+		}
 	}
 }
 

@@ -47,7 +47,7 @@ func makeSourceRepo(t *testing.T, dir string, n int) []string {
 }
 
 func itoa(i int) string {
-	return strings.TrimSpace(string(rune('0'+i)))
+	return strings.TrimSpace(string(rune('0' + i)))
 }
 
 func mustGit(t *testing.T, dir string, args ...string) {
@@ -182,7 +182,7 @@ func TestMirrorOpenRefreshIngestIsAncestor(t *testing.T) {
 	E := revParseHead(t, diverge)
 
 	pack := makePackfile(t, diverge, E)
-	if err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
+	if _, err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
 		t.Fatalf("IngestPackfile: %v", err)
 	}
 	// After ingest, E's objects are in the mirror. B is an ancestor of E
@@ -192,6 +192,310 @@ func TestMirrorOpenRefreshIngestIsAncestor(t *testing.T) {
 	}
 	if ok, err := m.IsAncestor(ctx, D, E); err != nil || ok {
 		t.Fatalf("after Ingest IsAncestor(D,E) = (%v, %v), want (false, nil)", ok, err)
+	}
+}
+
+// TestIngestPackfile_ReturnsPackID verifies IngestPackfile returns the
+// checksum of the pack it just wrote, and that a real pack-<id>.pack/.idx
+// pair exists under the mirror's objects/pack directory under that name —
+// the identifier RemovePack (finding H10) needs to delete exactly that pack
+// later.
+func TestIngestPackfile_ReturnsPackID(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	tips := makeSourceRepo(t, source, 1)
+	tip := tips[0]
+
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+
+	root := t.TempDir()
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", root, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	diverge := t.TempDir()
+	mustGit(t, "", "clone", "-q", "file://"+bare, diverge)
+	mustGit(t, diverge, "config", "user.email", "test@example.com")
+	mustGit(t, diverge, "config", "user.name", "Test")
+	mustGit(t, diverge, "checkout", "-q", "-b", "topic", tip)
+	if err := os.WriteFile(filepath.Join(diverge, "topic.txt"), []byte("topic\n"), 0o644); err != nil {
+		t.Fatalf("write topic.txt: %v", err)
+	}
+	mustGit(t, diverge, "add", "topic.txt")
+	mustGit(t, diverge, "commit", "-q", "-m", "topic commit")
+	topicTip := revParseHead(t, diverge)
+
+	pack := makePackfile(t, diverge, topicTip)
+	packID, err := m.IngestPackfile(ctx, bytes.NewReader(pack))
+	if err != nil {
+		t.Fatalf("IngestPackfile: %v", err)
+	}
+	if len(packID) != 40 {
+		t.Fatalf("packID = %q, want a 40-hex checksum", packID)
+	}
+	for _, ext := range []string{".pack", ".idx"} {
+		p := filepath.Join(m.Dir(), "objects", "pack", "pack-"+packID+ext)
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("expected %s to exist after IngestPackfile: %v", p, err)
+		}
+	}
+}
+
+// TestRemovePack_DeletesPackFiles is the security review H10 regression
+// guard: RemovePack must delete the pack/idx files IngestPackfile just wrote,
+// so a denied push's objects do not accumulate on disk forever (every mirror
+// has gc.auto=0, so nothing else would ever reclaim them). After removal, the
+// pack's objects must be gone from the store (IsAncestor over them fails).
+func TestRemovePack_DeletesPackFiles(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	tips := makeSourceRepo(t, source, 1)
+	tip := tips[0]
+
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+
+	root := t.TempDir()
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", root, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	diverge := t.TempDir()
+	mustGit(t, "", "clone", "-q", "file://"+bare, diverge)
+	mustGit(t, diverge, "config", "user.email", "test@example.com")
+	mustGit(t, diverge, "config", "user.name", "Test")
+	mustGit(t, diverge, "checkout", "-q", "-b", "topic", tip)
+	if err := os.WriteFile(filepath.Join(diverge, "topic.txt"), []byte("topic\n"), 0o644); err != nil {
+		t.Fatalf("write topic.txt: %v", err)
+	}
+	mustGit(t, diverge, "add", "topic.txt")
+	mustGit(t, diverge, "commit", "-q", "-m", "topic commit (denied push simulation)")
+	topicTip := revParseHead(t, diverge)
+
+	pack := makePackfile(t, diverge, topicTip)
+	packID, err := m.IngestPackfile(ctx, bytes.NewReader(pack))
+	if err != nil {
+		t.Fatalf("IngestPackfile: %v", err)
+	}
+	// Sanity: the objects are reachable before removal (topic's tip is its
+	// own ancestor via a trivial self-check would be degenerate; instead
+	// confirm the pack files exist, then confirm they don't after RemovePack).
+	packFile := filepath.Join(m.Dir(), "objects", "pack", "pack-"+packID+".pack")
+	idxFile := filepath.Join(m.Dir(), "objects", "pack", "pack-"+packID+".idx")
+	if _, err := os.Stat(packFile); err != nil {
+		t.Fatalf("setup: pack file missing before RemovePack: %v", err)
+	}
+
+	if err := m.RemovePack(ctx, packID); err != nil {
+		t.Fatalf("RemovePack: %v", err)
+	}
+	if _, err := os.Stat(packFile); !os.IsNotExist(err) {
+		t.Errorf("pack file still present after RemovePack: stat err = %v", err)
+	}
+	if _, err := os.Stat(idxFile); !os.IsNotExist(err) {
+		t.Errorf("idx file still present after RemovePack: stat err = %v", err)
+	}
+}
+
+// TestRemovePack_MissingIsNotError verifies RemovePack is a best-effort,
+// idempotent delete: an already-removed (or never-existent) packID is not an
+// error, and an empty packID (the "no packfile was ingested" case, e.g. a
+// delete-only push) is a no-op.
+func TestRemovePack_MissingIsNotError(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	makeSourceRepo(t, source, 1)
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+	root := t.TempDir()
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", root, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if err := m.RemovePack(ctx, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"); err != nil {
+		t.Errorf("RemovePack(nonexistent) = %v, want nil (best-effort)", err)
+	}
+	if err := m.RemovePack(ctx, ""); err != nil {
+		t.Errorf("RemovePack(\"\") = %v, want nil (no-op)", err)
+	}
+}
+
+// TestPackObjectIDs_ListsIngestedObjects verifies PackObjectIDs enumerates
+// exactly the objects show-index reports for the pack IngestPackfile just
+// wrote: the commit, its tree, and its blob, no more and no fewer.
+func TestPackObjectIDs_ListsIngestedObjects(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	tips := makeSourceRepo(t, source, 1)
+	tip := tips[0]
+
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+
+	root := t.TempDir()
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", root, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	diverge := t.TempDir()
+	mustGit(t, "", "clone", "-q", "file://"+bare, diverge)
+	mustGit(t, diverge, "config", "user.email", "test@example.com")
+	mustGit(t, diverge, "config", "user.name", "Test")
+	mustGit(t, diverge, "checkout", "-q", "-b", "topic", tip)
+	if err := os.WriteFile(filepath.Join(diverge, "topic.txt"), []byte("topic\n"), 0o644); err != nil {
+		t.Fatalf("write topic.txt: %v", err)
+	}
+	mustGit(t, diverge, "add", "topic.txt")
+	mustGit(t, diverge, "commit", "-q", "-m", "topic commit")
+	topicTip := revParseHead(t, diverge)
+
+	// The pack for topicTip --not tip contains exactly topicTip's own commit,
+	// tree, and the new blob (three objects) — tip's objects are excluded, so
+	// the expected set is small and precisely known.
+	cmd := exec.Command("git", "-C", diverge, "pack-objects", "--stdout", "--revs")
+	cmd.Stdin = strings.NewReader(topicTip + "\n--" + "\n^" + tip + "\n")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil || out.Len() == 0 {
+		// Fallback: some git versions want the negative rev on its own line
+		// without the "--" separator; retry with the simpler form.
+		cmd = exec.Command("git", "-C", diverge, "pack-objects", "--stdout", "--revs")
+		cmd.Stdin = strings.NewReader(topicTip + "\n^" + tip + "\n")
+		out.Reset()
+		cmd.Stdout = &out
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("pack-objects --revs: %v", err)
+		}
+	}
+	pack := out.Bytes()
+
+	packID, err := m.IngestPackfile(ctx, bytes.NewReader(pack))
+	if err != nil {
+		t.Fatalf("IngestPackfile: %v", err)
+	}
+
+	oids, err := m.PackObjectIDs(ctx, packID)
+	if err != nil {
+		t.Fatalf("PackObjectIDs: %v", err)
+	}
+	if len(oids) != 3 {
+		t.Fatalf("PackObjectIDs returned %d objects %v, want exactly 3 (commit, tree, blob)", len(oids), oids)
+	}
+	found := false
+	for _, oid := range oids {
+		if oid == topicTip {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("PackObjectIDs = %v, want it to include the commit %s", oids, topicTip)
+	}
+}
+
+// TestPackObjectIDs_EmptyPackID verifies the no-packfile case (a delete-only
+// push never calls IngestPackfile, so the caller has no packID) is a no-op.
+func TestPackObjectIDs_EmptyPackID(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+	source := t.TempDir()
+	makeSourceRepo(t, source, 1)
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	oids, err := m.PackObjectIDs(ctx, "")
+	if err != nil {
+		t.Fatalf("PackObjectIDs(\"\"): %v", err)
+	}
+	if len(oids) != 0 {
+		t.Errorf("PackObjectIDs(\"\") = %v, want empty", oids)
+	}
+}
+
+// TestReachableObjects_FullClosureIncludesSharedBase is the security review
+// H6 design-correctness guard: ReachableObjects(tips) must be the FULL
+// closure (no --not exclusion) — an ancestor commit's tree/blob objects (here
+// A, reachable from child commit B) must be included even though they are
+// also reachable from an EXISTING ref. This is deliberately the opposite of
+// NewCommits'/ChangedFiles' `--not --all` (incremental) semantics: those
+// exist to report only what's NEW for content inspection, but a thin-pack
+// completion legitimately copies in already-known ancestor objects as delta
+// bases, and the H6 pack-content check must not flag those as suspicious —
+// using `--not --all` there would false-positive-deny completely ordinary
+// pushes.
+func TestReachableObjects_FullClosureIncludesSharedBase(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	tips := makeSourceRepo(t, source, 2) // A(0) -> B(1)
+	A, B := tips[0], tips[1]
+	aTree := strings.TrimSpace(mustOutputRevParse(t, source, A+"^{tree}"))
+	aBlob := strings.TrimSpace(mustOutputRevParse(t, source, A+":file0.txt"))
+
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	set, err := m.ReachableObjects(ctx, []string{B})
+	if err != nil {
+		t.Fatalf("ReachableObjects: %v", err)
+	}
+	for name, oid := range map[string]string{"commit A": A, "A's tree": aTree, "A's blob": aBlob} {
+		if _, ok := set[oid]; !ok {
+			t.Errorf("ReachableObjects([B]) missing %s (%s) — full closure must include B's ancestors, not just objects new since some baseline", name, oid)
+		}
+	}
+	if _, ok := set[B]; !ok {
+		t.Errorf("ReachableObjects([B]) missing B itself")
+	}
+}
+
+// TestReachableObjects_EmptyTips verifies a nil/empty tips list yields an
+// empty, non-nil set with no error (mirrors WantedObjects/NewCommits' nil-in
+// convention).
+func TestReachableObjects_EmptyTips(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+	source := t.TempDir()
+	makeSourceRepo(t, source, 1)
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	set, err := m.ReachableObjects(ctx, nil)
+	if err != nil {
+		t.Fatalf("ReachableObjects(nil): %v", err)
+	}
+	if set == nil || len(set) != 0 {
+		t.Errorf("ReachableObjects(nil) = %v, want empty non-nil set", set)
 	}
 }
 
@@ -288,7 +592,7 @@ func TestMirror_ConcurrentRefreshIngestIsAncestorNoLockError(t *testing.T) {
 				errs[i] = fmt.Errorf("Refresh: %w", err)
 				return
 			}
-			if err := m.IngestPackfile(ctx, bytes.NewReader(preps[i].pack)); err != nil {
+			if _, err := m.IngestPackfile(ctx, bytes.NewReader(preps[i].pack)); err != nil {
 				errs[i] = fmt.Errorf("IngestPackfile: %w", err)
 				return
 			}
@@ -317,6 +621,7 @@ func TestMirror_ConcurrentRefreshIngestIsAncestorNoLockError(t *testing.T) {
 		}
 	}
 }
+
 // makeThinPackfile builds a THIN packfile: objects reachable from `want` but
 // NOT from `not`, with deltas allowed against the excluded `not` objects (which
 // the receiver is assumed to already have). This is what `git push` over HTTP
@@ -404,7 +709,7 @@ func TestMirrorIngestThinPack(t *testing.T) {
 	}
 
 	// Without --fix-thin this returned "fatal: pack has N unresolved deltas".
-	if err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
+	if _, err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
 		t.Fatalf("IngestPackfile(thin pack) = %v; index-pack must run with --fix-thin", err)
 	}
 	if ok, err := m.IsAncestor(ctx, B, T); err != nil || !ok {

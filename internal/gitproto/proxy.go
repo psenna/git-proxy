@@ -44,14 +44,14 @@ type MirrorOpener func(ctx context.Context, repo string) (*gitx.Mirror, error)
 // response and the upstream is left unchanged.
 type Proxy struct {
 	up               port.Upstream
-	engine           *policy.Engine    // nil → passthrough (policy off)
-	mirrorOpener     MirrorOpener      // nil → passthrough
-	maxPackfileBytes int64             // cap when enforcement is on; 0 → default
+	engine           *policy.Engine     // nil → passthrough (policy off)
+	mirrorOpener     MirrorOpener       // nil → passthrough
+	maxPackfileBytes int64              // cap when enforcement is on; 0 → default
 	readDenyMatcher  *pathmatch.Matcher // nil → passthrough (read protection off)
-	audit            port.AuditSink    // nil → no audit (preserves existing behavior)
-	alerts           port.AlertSink    // nil → no alerts (preserves existing behavior)
-	transport        string            // "http" | "ssh" — which frontend carried the op
-	dryRun           bool              // dry-run: forward on clean engine Deny (policy denies only, NOT inspection errors)
+	audit            port.AuditSink     // nil → no audit (preserves existing behavior)
+	alerts           port.AlertSink     // nil → no alerts (preserves existing behavior)
+	transport        string             // "http" | "ssh" — which frontend carried the op
+	dryRun           bool               // dry-run: forward on clean engine Deny (policy denies only, NOT inspection errors)
 }
 
 // New returns a Proxy that forwards through up in passthrough mode (no policy).
@@ -350,9 +350,20 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 		p.recordPushAudit(ctx, repo, req, dec, false)
 		return nil
 	}
+	// ingestedPackID identifies the pack IngestPackfile below writes into the
+	// mirror's object store (empty when there was no packfile, e.g. a
+	// delete-only push). Security review finding H10: if this push is
+	// ultimately denied, that pack is removed via mirror.RemovePack — see the
+	// final deny branch below. gc.auto is disabled on every mirror
+	// specifically because background gc must never touch it, so nothing else
+	// would ever reclaim this disk space; an authorized-but-malicious agent
+	// looping large denied pushes would otherwise fill the proxy's disk with
+	// objects nothing collects.
+	var ingestedPackID string
 	if req.PackfileOffset >= 0 && int64(len(buf)) > req.PackfileOffset {
 		pack := buf[req.PackfileOffset:]
-		if err := mirror.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
+		packID, err := mirror.IngestPackfile(ctx, bytes.NewReader(pack))
+		if err != nil {
 			dec := port.Decision{
 				Verdict: port.VerdictDeny,
 				Reasons: []port.Reason{{Rule: "enforcement",
@@ -363,10 +374,11 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 			p.recordPushAudit(ctx, repo, req, dec, false)
 			return nil
 		}
+		ingestedPackID = packID
 	}
 
 	agent := agentName(ctx)
-	dec, enErr := EnforceReceivePack(ctx, req, mirror, p.engine, agent, repo)
+	dec, enErr := EnforceReceivePack(ctx, req, mirror, p.engine, agent, repo, ingestedPackID)
 	if enErr != nil {
 		log.Printf("gitproto: receive-pack enforcement error for repo %q: %v", repo, enErr)
 	}
@@ -394,6 +406,17 @@ func (p *Proxy) ReceivePack(ctx context.Context, repo string, body io.Reader, w 
 	log.Printf("gitproto: receive-pack deny for repo %q agent %q: %v", repo, agent, dec.Reasons)
 	p.writeDenyResponse(w, req, dec)
 	p.recordPushAudit(ctx, repo, req, dec, false)
+	// This push is truly denied (not forwarded, dry-run or otherwise) and its
+	// objects were never referenced by any ref this mirror keeps — remove the
+	// ingested pack rather than leaving it on disk forever (finding H10).
+	// Best-effort: a removal failure just leaves the pack for the next
+	// successful cleanup or a manual gc; it must never affect the deny outcome
+	// already written to the client.
+	if ingestedPackID != "" {
+		if rmErr := mirror.RemovePack(ctx, ingestedPackID); rmErr != nil {
+			log.Printf("gitproto: receive-pack: remove denied pack %s for repo %q: %v", ingestedPackID, repo, rmErr)
+		}
+	}
 	return nil
 }
 

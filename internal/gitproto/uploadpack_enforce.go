@@ -520,6 +520,17 @@ func writeV0UploadPackResponse(w io.Writer, pack io.Reader, packWait func() erro
 	// MaxPackedSize64k (or MaxPackedSize) frames internally, so memory stays
 	// bounded by io.Copy's 32 KiB buffer + one muxer frame.
 	if err := e.EncodeString("NAK\n"); err != nil {
+		// Security review finding H8: every OTHER error return in this
+		// function calls packWait() before returning; this one did not.
+		// packWait() closes the pack-objects producer's pipe reader, which is
+		// what unblocks the producer goroutine — that goroutine holds the
+		// mirror's per-repo mutex until it returns. Without this call, an
+		// agent that opens a read-protected fetch and then simply drops the
+		// connection right after the NAK-encode write fails (e.g. mid-write
+		// TCP reset) leaves the producer blocked forever, the mutex held
+		// forever, and every subsequent fetch/push to that repo deadlocks
+		// permanently — recoverable only by restarting the proxy.
+		_ = packWait()
 		return fmt.Errorf("gitproto: encode NAK: %w", err)
 	}
 	switch uploadPackSidebandType(caps) {
@@ -607,8 +618,10 @@ func WriteUploadPackErr(w io.Writer, reason string) error {
 
 // onDemandBlobDenyReason classifies the want OIDs by git object type and, for
 // each BLOB want (an on-demand blob fetch), resolves the OID back to its
-// path(s) via oidpath.Resolve and checks the read deny matcher. It returns
-// (reason, true) when the fetch MUST be refused with an ERR pkt-line:
+// path(s) — via ONE batched gitx.ResolveMany call over every blob want, not
+// one gitx.Resolve call per blob (finding H7) — and checks the read deny
+// matcher. It returns (reason, true) when the fetch MUST be refused with an
+// ERR pkt-line:
 //
 //   - ANY on-demand blob whose resolved path matches the deny matcher (a blob
 //     at multiple paths is denied if ANY path is denied);
@@ -644,6 +657,30 @@ func onDemandBlobDenyReason(ctx context.Context, mirror *gitx.Mirror, wants []st
 		oid := firstNonEmpty(wants)
 		return fmt.Sprintf("access to object %s denied by read policy", oid), oid, true
 	}
+	// Security review finding H7: resolving each blob want's path(s) via a
+	// separate gitx.Resolve call re-walks every root tree in the mirror once
+	// PER blob want. A single upload-pack request can carry thousands of want
+	// lines (the request size cap fits roughly 24,000 40-hex want lines),
+	// which without batching turns one HTTP request into a combinatorial
+	// number of `git ls-tree` process spawns, serialized under the mirror's
+	// single mutex — the repo becomes unusable, for every agent, for the
+	// duration. Collect every blob-type want up front and resolve them ALL in
+	// ONE tree walk via gitx.ResolveMany (the same batching already applied
+	// to the full-clone withholding path for finding H4), rather than resolving
+	// as the loop below encounters each one.
+	var blobWants []string
+	for _, oid := range wants {
+		if types[oid] == "blob" {
+			blobWants = append(blobWants, oid)
+		}
+	}
+	blobPaths, err := gitx.ResolveMany(ctx, mirror, blobWants)
+	if err != nil {
+		oid := firstNonEmpty(blobWants)
+		log.Printf("gitproto: upload-pack enforce: on-demand resolve error in repo %q: %v (denying fail-closed)", repo, err)
+		return fmt.Sprintf("access to object %s denied by read policy", oid), oid, true
+	}
+
 	for _, oid := range wants {
 		// Security review finding C3: a want that resolves to a TREE is never
 		// legitimate — a real client only wants a commit/tag (a normal full
@@ -663,13 +700,9 @@ func onDemandBlobDenyReason(ctx context.Context, mirror *gitx.Mirror, wants []st
 		if types[oid] != "blob" {
 			continue // commit/tag want → full-clone path (existing withholding)
 		}
-		// On-demand blob want: resolve its path(s) and check the deny matcher.
-		paths, rerr := gitx.Resolve(ctx, mirror, oid)
-		if rerr != nil {
-			reason := fmt.Sprintf("access to object %s denied by read policy", oid)
-			log.Printf("gitproto: upload-pack enforce: on-demand resolve error for blob %s in repo %q: %v (denying fail-closed)", oid, repo, rerr)
-			return reason, oid, true
-		}
+		// On-demand blob want: check its already-resolved path(s) against the
+		// deny matcher.
+		paths := blobPaths[oid]
 		if len(paths) == 0 {
 			// Fail-closed: an unresolvable blob (no tree references it) cannot
 			// be proven to be non-denied. Deny with a uniform reason.

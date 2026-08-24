@@ -889,6 +889,41 @@ func TestServeUploadPackEnforced_OnDemandBlob_Allow(t *testing.T) {
 	assertPackHasBlobOIDs(t, m.Dir(), pack, []string{readmeOID}, nil)
 }
 
+// TestServeUploadPackEnforced_OnDemandBlob_MultipleWantsBatched is the
+// security review H7 regression guard: a request wanting SEVERAL blobs in
+// one round trip must still classify and resolve every one of them
+// correctly, now that resolution happens via one batched gitx.ResolveMany
+// call instead of one gitx.Resolve call per blob. Mixes an allowed blob with
+// a denied one so a batching bug that mixed up per-OID results (e.g. wrong
+// paths attributed to the wrong OID) would surface as a wrong-blob deny/allow
+// rather than just a slower correct answer.
+func TestServeUploadPackEnforced_OnDemandBlob_MultipleWantsBatched(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, _ := readRepoForProtection(t)
+	m := readProtectionMirror(t, source)
+
+	readmeOID := strings.TrimSpace(mustOutput(t, "git", "-C", h_BarePath(t, m), "rev-parse", "HEAD:README.md"))
+	guideOID := strings.TrimSpace(mustOutput(t, "git", "-C", h_BarePath(t, m), "rev-parse", "HEAD:docs/guide.md"))
+	secretOID := strings.TrimSpace(mustOutput(t, "git", "-C", h_BarePath(t, m), "rev-parse", "HEAD:secrets/secret.txt"))
+
+	matcher := pathmatch.New([]string{"secrets/**"})
+	// Two allowed blobs + one denied blob in a single request.
+	req := uploadPackRequestWants(t, true, readmeOID, guideOID, secretOID)
+
+	var out bytes.Buffer
+	if _, err := gitproto.ServeUploadPackEnforced(ctx, &out, req, m, matcher, "repo.git"); err != nil {
+		t.Fatalf("ServeUploadPackEnforced should return nil after writing ERR, got err=%v", err)
+	}
+	// The mixed request is refused whole (matches the existing mixed-want
+	// contract) — the important assertion is WHICH object triggered it.
+	reason := assertUploadPackErr(t, out.Bytes())
+	if !strings.Contains(reason, secretOID) {
+		t.Errorf("ERR reason = %q, want it to name the denied blob %s (not one of the allowed ones)", reason, secretOID)
+	}
+}
+
 // TestServeUploadPackEnforced_OnDemandBlob_DenyByPath verifies an on-demand
 // blob fetch for a DENIED blob is REFUSED with an ERR pkt-line: the blob's
 // path matches the deny matcher, so the proxy writes `ERR <reason>\n` and

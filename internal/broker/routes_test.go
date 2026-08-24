@@ -416,6 +416,33 @@ func TestAgentRepoAllowlist_403(t *testing.T) {
 	}
 }
 
+// TestDecodeJSON_OversizeBodyRejected is the security review H3 regression
+// guard: a request body larger than maxRequestBodyBytes must be rejected,
+// not buffered in full. Before this fix, decodeJSON read the body via a bare
+// io.ReadAll with no cap — an authenticated agent could stream an arbitrarily
+// large body and have it buffered entirely on-heap.
+func TestDecodeJSON_OversizeBodyRejected(t *testing.T) {
+	up := &capturingPRSupport{}
+	_, srv := newTestBroker(t, up, Config{})
+	oversize := make([]byte, maxRequestBodyBytes+1024)
+	for i := range oversize {
+		oversize[i] = 'a'
+	}
+	body := []byte(`{"head":"feat","base":"main","title":"t","body":"`)
+	body = append(body, oversize...)
+	body = append(body, []byte(`"}`)...)
+
+	resp := do(t, srv, http.MethodPost, "/owner%2Frepo.git/prs", "agent-token-1", body)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusCreated {
+		t.Fatalf("status = %d, want a rejection (not 201) for an oversize body", resp.StatusCode)
+	}
+	// The oversize body must never have reached PRSupport.
+	if up.ensureHead != "" {
+		t.Errorf("EnsurePR was called with an oversize body: head=%q", up.ensureHead)
+	}
+}
+
 func TestSentinelToStatus(t *testing.T) {
 	cases := []struct {
 		name   string

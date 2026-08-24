@@ -55,13 +55,15 @@ func isHexSHA(s string) bool {
 // descendant of old), builds a port.PushRequest, and evaluates it against the
 // engine. The mirror must already have been Refreshed and, when a packfile is
 // present, have ingested it via IngestPackfile so both old and new objects are
-// available for the ancestry walk.
+// available for the ancestry walk. packID is IngestPackfile's return value
+// (empty for a delete-only push with no packfile) — see the pack-contents
+// check below (security review finding H6).
 //
 // Fail-closed: an ancestry error (e.g. a missing object) yields a Deny
 // decision carrying the error as a reason — the push is never allowed when its
 // topology could not be verified.
 func EnforceReceivePack(ctx context.Context, req *ReceivePackRequest, mirror *gitx.Mirror,
-	eng *policy.Engine, agent, repo string) (port.Decision, error) {
+	eng *policy.Engine, agent, repo, packID string) (port.Decision, error) {
 
 	updates := make([]port.RefUpdate, 0, len(req.Commands))
 	for _, cmd := range req.Commands {
@@ -109,6 +111,67 @@ func EnforceReceivePack(ctx context.Context, req *ReceivePackRequest, mirror *gi
 			u.Force = !ok // non-fast-forward when old is not an ancestor of new
 		}
 		updates = append(updates, u)
+	}
+
+	// Security review finding H6: content-based rules (secret_scan,
+	// path_acl, commit_message) only ever see objects reachable from the
+	// DECLARED new ref tips (via NewCommitMessages/ChangedFiles below). A
+	// packfile is a self-contained blob of objects the client controls, and
+	// nothing before this point verifies it doesn't ALSO contain extra
+	// objects that aren't part of any ref update's resulting history —
+	// content that would land in the upstream's object store on allow
+	// (forwardReceivePack forwards the original bytes verbatim) while never
+	// having been scanned by any rule, retrievable later by anyone who knows
+	// its exact SHA. Fail-closed: any packed object not reachable from the
+	// full closure of every declared new tip is denied.
+	//
+	// ReachableObjects computes the FULL closure (no --not exclusion) —
+	// deliberately more expensive than NewCommits' incremental walk, and
+	// deliberately so: a thin-pack completion legitimately copies
+	// already-known ancestor objects into the resulting pack as delta bases,
+	// and those must not be flagged just because they aren't "new" by the
+	// --not --all definition (see ReachableObjects' doc comment).
+	if packID != "" {
+		newTips := make([]string, 0, len(updates))
+		for _, u := range updates {
+			if u.New != "" {
+				newTips = append(newTips, u.New)
+			}
+		}
+		if len(newTips) > 0 {
+			packObjs, err := mirror.PackObjectIDs(ctx, packID)
+			if err != nil {
+				return port.Decision{
+					Verdict: port.VerdictDeny,
+					Reasons: []port.Reason{{
+						Rule:    "enforcement",
+						Message: "push rejected: inspection failed",
+					}},
+				}, err
+			}
+			reachable, err := mirror.ReachableObjects(ctx, newTips)
+			if err != nil {
+				return port.Decision{
+					Verdict: port.VerdictDeny,
+					Reasons: []port.Reason{{
+						Rule:    "enforcement",
+						Message: "push rejected: inspection failed",
+					}},
+				}, err
+			}
+			for _, oid := range packObjs {
+				if _, ok := reachable[oid]; !ok {
+					err := fmt.Errorf("packfile contains object %s not reachable from any declared ref update", oid)
+					return port.Decision{
+						Verdict: port.VerdictDeny,
+						Reasons: []port.Reason{{
+							Rule:    "enforcement",
+							Message: "push rejected: packfile contains an object not reachable from the declared ref updates",
+						}},
+					}, err
+				}
+			}
+		}
 	}
 
 	pushReq := port.PushRequest{

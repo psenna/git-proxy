@@ -69,7 +69,7 @@ func (b *Broker) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req createPRReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		b.opFail(w, r, agent.Name, repo, op, err)
 		return
 	}
@@ -143,7 +143,7 @@ func (b *Broker) handleMerge(w http.ResponseWriter, r *http.Request) {
 	// 400 — never silently fall back to the default merge method on a bad body,
 	// since a truncated {"method":"squash" would otherwise merge with the wrong
 	// (hard-to-reverse) method.
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		b.opFail(w, r, agent.Name, repo, op, err)
 		return
 	}
@@ -176,7 +176,7 @@ func (b *Broker) handleComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req commentReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		b.opFail(w, r, agent.Name, repo, op, err)
 		return
 	}
@@ -202,7 +202,7 @@ func (b *Broker) handleReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req reviewReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		b.opFail(w, r, agent.Name, repo, op, err)
 		return
 	}
@@ -274,7 +274,7 @@ func (b *Broker) handleCreateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req createIssueReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		b.opFail(w, r, agent.Name, repo, op, err)
 		return
 	}
@@ -343,7 +343,7 @@ func (b *Broker) handleCommentIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req commentReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		b.opFail(w, r, agent.Name, repo, op, err)
 		return
 	}
@@ -414,7 +414,7 @@ func (b *Broker) handleEditIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req editIssueReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		b.opFail(w, r, agent.Name, repo, op, err)
 		return
 	}
@@ -442,7 +442,7 @@ func (b *Broker) handleAddLabels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req addLabelsReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		b.opFail(w, r, agent.Name, repo, op, err)
 		return
 	}
@@ -472,7 +472,7 @@ func (b *Broker) handleRemoveLabel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req removeLabelReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		b.opFail(w, r, agent.Name, repo, op, err)
 		return
 	}
@@ -553,10 +553,27 @@ func writeError(w http.ResponseWriter, err error) (int, string) {
 	return status, reason
 }
 
-// decodeJSON decodes the request body into dst. An empty body is allowed (dst
-// stays zero) so handlers like merge can be called with no body; a malformed
-// body is an error the handler surfaces as 400.
-func decodeJSON(r *http.Request, dst any) error {
+// maxRequestBodyBytes bounds every broker POST body (security review finding
+// H3). None of the JSON payloads this route set accepts — PR/issue titles,
+// bodies, comments, review text, label lists — have any legitimate reason to
+// approach this size; GitHub's own limits are far smaller. Before this fix,
+// decodeJSON read the body via a bare io.ReadAll with no cap and no
+// Content-Length check: an authenticated agent (or, on a deployment with no
+// auth.tokens configured, anything that can reach the port at all) could
+// stream a multi-gigabyte body and have it buffered entirely on-heap, and do
+// so on many connections concurrently — this process also serves the
+// git-protocol leg, so the blast radius is the whole proxy, not just the
+// broker.
+const maxRequestBodyBytes = 1 << 20 // 1 MiB
+
+// decodeJSON decodes the request body into dst, capped at maxRequestBodyBytes
+// via http.MaxBytesReader (which also arranges for the connection to be
+// closed rather than reused if the client tries to keep writing past the
+// cap). An empty body is allowed (dst stays zero) so handlers like merge can
+// be called with no body; a malformed or oversize body is an error the
+// handler surfaces as 400.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return fmt.Errorf("read body: %w", err)
