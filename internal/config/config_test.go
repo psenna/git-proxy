@@ -132,6 +132,53 @@ broker:
 	}
 }
 
+func TestParseBrokerCheckLogsConfig(t *testing.T) {
+	c, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+broker:
+  listen: "127.0.0.1:8090"
+  allow_check_logs: true
+  max_check_log_bytes: 131072
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !c.Broker.AllowCheckLogs {
+		t.Error("Broker.AllowCheckLogs = false, want true")
+	}
+	if c.Broker.MaxCheckLogBytes != 131072 {
+		t.Errorf("Broker.MaxCheckLogBytes = %d, want 131072", c.Broker.MaxCheckLogBytes)
+	}
+
+	// Absent: disabled, zero (broker.go defaults it at runtime).
+	c2, err := Parse([]byte(validYAML))
+	if err != nil {
+		t.Fatalf("Parse (no broker): %v", err)
+	}
+	if c2.Broker.AllowCheckLogs {
+		t.Error("Broker.AllowCheckLogs = true, want false (default)")
+	}
+	if c2.Broker.MaxCheckLogBytes != 0 {
+		t.Errorf("Broker.MaxCheckLogBytes = %d, want 0 (default)", c2.Broker.MaxCheckLogBytes)
+	}
+}
+
+func TestParseBrokerMaxCheckLogBytesNegativeRejected(t *testing.T) {
+	_, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+broker:
+  listen: "127.0.0.1:8090"
+  max_check_log_bytes: -1
+`))
+	if err == nil || !strings.Contains(err.Error(), "max_check_log_bytes") {
+		t.Fatalf("expected max_check_log_bytes error, got %v", err)
+	}
+}
+
 func TestParseBrokerListenCollisionRejected(t *testing.T) {
 	_, err := Parse([]byte(`
 listen: "127.0.0.1:8080"

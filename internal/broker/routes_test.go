@@ -18,16 +18,24 @@ import (
 type capturingPRSupport struct {
 	stubUpstream
 	ensureHead, ensureBase, ensureTitle, ensureBody string
-	mergeNumber                         int
-	mergeMethod                         string
-	commentNumber                       int
-	commentBody                         string
-	reviewNumber                        int
-	reviewEvent, reviewBody             string
-	checksRef                           string
-	prErr                               error
-	mergeErr                            error
-	summary                             port.CheckSummary
+	mergeNumber                                     int
+	mergeMethod                                     string
+	commentNumber                                   int
+	commentBody                                     string
+	reviewNumber                                    int
+	reviewEvent, reviewBody                         string
+	checksRef                                       string
+	prErr                                           error
+	mergeErr                                        error
+	summary                                         port.CheckSummary
+
+	// CheckLogSupport capture fields. CheckLogSupport is type-asserted off the
+	// SAME scmUp as PRSupport (unlike IssueSupport, sourced from a separate
+	// upstream), so the fake lives on this struct rather than a dedicated one.
+	checkLogRepo, checkLogRef, checkLogName string
+	checkLogMaxBytes                        int64
+	checkLog                                port.CheckLog
+	checkLogErr                             error
 }
 
 func (c *capturingPRSupport) BranchProtection(context.Context, string, string) (port.BranchProtection, error) {
@@ -58,6 +66,10 @@ func (c *capturingPRSupport) ReviewPR(_ context.Context, _ string, n int, event,
 func (c *capturingPRSupport) Checks(_ context.Context, _ string, ref string) (port.CheckSummary, error) {
 	c.checksRef = ref
 	return c.summary, c.prErr
+}
+func (c *capturingPRSupport) CheckLog(_ context.Context, repo, ref, checkName string, maxBytes int64) (port.CheckLog, error) {
+	c.checkLogRepo, c.checkLogRef, c.checkLogName, c.checkLogMaxBytes = repo, ref, checkName, maxBytes
+	return c.checkLog, c.checkLogErr
 }
 
 // newTestBroker boots a broker over a capturingPRSupport with a fixed agent
@@ -231,6 +243,111 @@ func TestChecks_HappyPath(t *testing.T) {
 	}
 }
 
+func TestCheckLog_HappyPath(t *testing.T) {
+	up := &capturingPRSupport{checkLog: port.CheckLog{Log: "line1\nline2\n", Truncated: true}}
+	_, srv := newTestBroker(t, up, Config{AllowCheckLogs: true, MaxCheckLogBytes: 4096})
+	resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/checks/log?ref=abc%2Fdef&check_name=kind+e2e", "agent-token-1", nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if up.checkLogRepo != "owner/repo.git" {
+		t.Errorf("checkLogRepo = %q, want owner/repo.git", up.checkLogRepo)
+	}
+	if up.checkLogRef != "abc/def" {
+		t.Errorf("checkLogRef = %q, want abc/def", up.checkLogRef)
+	}
+	if up.checkLogName != "kind e2e" {
+		t.Errorf("checkLogName = %q, want %q", up.checkLogName, "kind e2e")
+	}
+	if up.checkLogMaxBytes != 4096 {
+		t.Errorf("checkLogMaxBytes = %d, want 4096", up.checkLogMaxBytes)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), `"log":"line1\nline2\n"`) || !strings.Contains(string(b), `"truncated":true`) {
+		t.Errorf("body = %s", b)
+	}
+}
+
+func TestCheckLog_501WhenDisabled(t *testing.T) {
+	// AllowCheckLogs: false (default) → b.checkLogs stays nil even though the
+	// fake implements CheckLogSupport, so the route 501s.
+	up := &capturingPRSupport{}
+	_, srv := newTestBroker(t, up, Config{})
+
+	// No Bearer → 401 (auth gate runs first, never leaks "check-logs exist").
+	resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/checks/log?ref=abc&check_name=ci", "", nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("no bearer: status = %d, want 401", resp.StatusCode)
+	}
+
+	// Valid bearer, AllowCheckLogs false → 501.
+	resp2 := do(t, srv, http.MethodGet, "/owner%2Frepo.git/checks/log?ref=abc&check_name=ci", "agent-token-1", nil)
+	defer func() { _ = resp2.Body.Close() }()
+	if resp2.StatusCode != http.StatusNotImplemented {
+		t.Errorf("disabled: status = %d, want 501", resp2.StatusCode)
+	}
+	b, _ := io.ReadAll(resp2.Body)
+	if !strings.Contains(string(b), "not implemented") {
+		t.Errorf("body = %s, want 'not implemented' reason", b)
+	}
+}
+
+func TestCheckLog_400MissingParams(t *testing.T) {
+	up := &capturingPRSupport{}
+	_, srv := newTestBroker(t, up, Config{AllowCheckLogs: true})
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"missing ref", "/owner%2Frepo.git/checks/log?check_name=ci"},
+		{"missing check_name", "/owner%2Frepo.git/checks/log?ref=abc"},
+		{"missing both", "/owner%2Frepo.git/checks/log"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := do(t, srv, http.MethodGet, tc.path, "agent-token-1", nil)
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400", resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestCheckLog_404NotFound(t *testing.T) {
+	up := &capturingPRSupport{checkLogErr: port.ErrNotFound}
+	_, srv := newTestBroker(t, up, Config{AllowCheckLogs: true})
+	resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/checks/log?ref=abc&check_name=unknown", "agent-token-1", nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestCheckLog_403NotAllowlisted(t *testing.T) {
+	up := &capturingPRSupport{}
+	_, srv := newTestBroker(t, up, Config{AllowCheckLogs: true, AllowedAgents: []string{"bob"}})
+	resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/checks/log?ref=abc&check_name=ci", "agent-token-1", nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (alice not in allowlist [bob])", resp.StatusCode)
+	}
+}
+
+func TestCheckLog_FailedStepsOnlyNotImplemented(t *testing.T) {
+	up := &capturingPRSupport{}
+	_, srv := newTestBroker(t, up, Config{AllowCheckLogs: true})
+	resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/checks/log?ref=abc&check_name=ci&failed_steps_only=true", "agent-token-1", nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 (failed_steps_only not implemented in v1)", resp.StatusCode)
+	}
+	if up.checkLogName != "" {
+		t.Errorf("CheckLog was called (checkLogName=%q) — failed_steps_only=true must fail before reaching the capability", up.checkLogName)
+	}
+}
+
 func TestAuth_401NoAndBadBearer(t *testing.T) {
 	up := &capturingPRSupport{}
 	_, srv := newTestBroker(t, up, Config{})
@@ -276,12 +393,12 @@ func TestOpAllowlist_403(t *testing.T) {
 
 func TestSentinelToStatus(t *testing.T) {
 	cases := []struct {
-		name    string
-		err     error
-		want    int
-		method  string
-		path    string
-		body    []byte
+		name   string
+		err    error
+		want   int
+		method string
+		path   string
+		body   []byte
 	}{
 		{"not found → 404", port.ErrNotFound, http.StatusNotFound, http.MethodGet, "/owner%2Frepo.git/prs/7", nil},
 		{"upstream unauthorized → 502", port.ErrUnauthorized, http.StatusBadGateway, http.MethodGet, "/owner%2Frepo.git/prs/7", nil},

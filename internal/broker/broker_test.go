@@ -16,10 +16,16 @@ import (
 // type-assert fail-closed test. The git-protocol methods are unused here.
 type stubUpstream struct{}
 
-func (stubUpstream) ListRefs(context.Context, string) (port.Refs, error)         { return port.Refs{}, nil }
-func (stubUpstream) ListRefsService(context.Context, string, string) (port.Refs, error) { return port.Refs{}, nil }
-func (stubUpstream) UploadPack(context.Context, string, io.Reader) (io.ReadCloser, error) { return nil, nil }
-func (stubUpstream) ReceivePack(context.Context, string, io.Reader) (io.ReadCloser, error) { return nil, nil }
+func (stubUpstream) ListRefs(context.Context, string) (port.Refs, error) { return port.Refs{}, nil }
+func (stubUpstream) ListRefsService(context.Context, string, string) (port.Refs, error) {
+	return port.Refs{}, nil
+}
+func (stubUpstream) UploadPack(context.Context, string, io.Reader) (io.ReadCloser, error) {
+	return nil, nil
+}
+func (stubUpstream) ReceivePack(context.Context, string, io.Reader) (io.ReadCloser, error) {
+	return nil, nil
+}
 
 // stubPRSupport implements both port.Upstream and port.PRSupport, for the New
 // success path and handler tests (PR9). Its methods return canned values/errs.
@@ -43,8 +49,8 @@ func (s stubPRSupport) GetPR(context.Context, string, int) (port.PRState, error)
 func (s stubPRSupport) ListPRs(context.Context, string, string) ([]port.PRState, error) {
 	return []port.PRState{{Number: s.prNumber}}, s.prErr
 }
-func (s stubPRSupport) MergePR(context.Context, string, int, string) error { return s.mergeErr }
-func (s stubPRSupport) CommentPR(context.Context, string, int, string) error { return s.prErr }
+func (s stubPRSupport) MergePR(context.Context, string, int, string) error          { return s.mergeErr }
+func (s stubPRSupport) CommentPR(context.Context, string, int, string) error        { return s.prErr }
 func (s stubPRSupport) ReviewPR(context.Context, string, int, string, string) error { return s.prErr }
 func (s stubPRSupport) Checks(context.Context, string, string) (port.CheckSummary, error) {
 	return s.summary, s.prErr
@@ -120,6 +126,31 @@ func TestNew_TypeAssertsPRSupport(t *testing.T) {
 	}
 	if b.mergeMethod != "merge" {
 		t.Errorf("mergeMethod = %q, want merge (default)", b.mergeMethod)
+	}
+}
+
+func TestNew_CheckLogsOptionalAndOptIn(t *testing.T) {
+	// AllowCheckLogs true, but stubPRSupport (from this file) does NOT
+	// implement port.CheckLogSupport → checkLogs stays nil, no startup error
+	// (mirrors IssueSupport's non-fatal posture).
+	b := mustNew(t, stubPRSupport{}, fakeAuthenticator{}, nil, Config{AllowCheckLogs: true})
+	if b.checkLogs != nil {
+		t.Fatal("checkLogs = non-nil, want nil when scmUp lacks CheckLogSupport (non-fatal)")
+	}
+	// Default maxLogBytes when unset.
+	if b.maxLogBytes != 256*1024 {
+		t.Errorf("maxLogBytes = %d, want 262144 (default)", b.maxLogBytes)
+	}
+	// Custom MaxCheckLogBytes threads through.
+	b2 := mustNew(t, stubPRSupport{}, fakeAuthenticator{}, nil, Config{MaxCheckLogBytes: 1024})
+	if b2.maxLogBytes != 1024 {
+		t.Errorf("maxLogBytes = %d, want 1024", b2.maxLogBytes)
+	}
+	// AllowCheckLogs false (default) → checkLogs nil regardless of the
+	// upstream's capabilities.
+	b3 := mustNew(t, stubPRSupport{}, fakeAuthenticator{}, nil, Config{})
+	if b3.checkLogs != nil {
+		t.Fatal("checkLogs = non-nil, want nil when AllowCheckLogs is false")
 	}
 }
 

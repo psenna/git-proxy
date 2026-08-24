@@ -31,6 +31,13 @@ func (b *Broker) routes() *http.ServeMux {
 	mux.HandleFunc("POST /{repo}/prs/{number}/comments", b.handleComment)
 	mux.HandleFunc("POST /{repo}/prs/{number}/reviews", b.handleReview)
 	mux.HandleFunc("GET /{repo}/checks/{ref...}", b.handleChecks)
+	// Literal beats the {ref...} wildcard for this exact path (ServeMux
+	// resolves overlapping patterns by specificity), so this coexists with the
+	// route above with no change to it or its tests. ref/check_name travel as
+	// query params (see handleCheckLog) rather than path segments, since
+	// check-run names commonly contain "/" too (e.g. "kind e2e / e2e-test")
+	// and {ref...} can only be the terminal segment of one ServeMux pattern.
+	mux.HandleFunc("GET /{repo}/checks/log", b.handleCheckLog)
 	// Issue routes (opt-in via issue_upstream; 501 per-op when issues==nil).
 	// POST-only mutations, RPC-style for close/reopen/label-remove (matching
 	// the /merge style). /labels (add) and /labels/remove are distinct fixed
@@ -225,6 +232,37 @@ func (b *Broker) handleChecks(w http.ResponseWriter, r *http.Request) {
 	}
 	b.audit(r.Context(), agent.Name, repo, op, "allow", nil)
 	respondJSON(w, http.StatusOK, summary)
+}
+
+// handleCheckLog implements GET /{repo}/checks/log (op ci.log). ref and
+// check_name are query params (see routes' comment for why); both are
+// required (400 if either is missing). failed_steps_only=true is accepted as
+// a query param but not implemented in v1 — it fails honestly with 501 rather
+// than silently ignoring the flag and returning the full log.
+func (b *Broker) handleCheckLog(w http.ResponseWriter, r *http.Request) {
+	const op = "ci.log"
+	repo := b.resolveRepo(r.PathValue("repo"))
+	agent, cls, ok := b.checkLogsOK(w, r, repo, op)
+	if !ok {
+		return
+	}
+	ref := r.URL.Query().Get("ref")
+	checkName := r.URL.Query().Get("check_name")
+	if ref == "" || checkName == "" {
+		b.opFail(w, r, agent.Name, repo, op, fmt.Errorf("ref and check_name query params are required"))
+		return
+	}
+	if r.URL.Query().Get("failed_steps_only") == "true" {
+		b.opFail(w, r, agent.Name, repo, op, fmt.Errorf("%w: failed_steps_only", port.ErrNotImplemented))
+		return
+	}
+	result, err := cls.CheckLog(r.Context(), repo, ref, checkName, b.maxLogBytes)
+	if err != nil {
+		b.opFail(w, r, agent.Name, repo, op, err)
+		return
+	}
+	b.audit(r.Context(), agent.Name, repo, op, "allow", nil)
+	respondJSON(w, http.StatusOK, result)
 }
 
 // handleCreateIssue implements POST /{repo}/issues (op issue.create).

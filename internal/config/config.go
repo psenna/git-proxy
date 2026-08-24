@@ -24,8 +24,8 @@ import (
 
 // Config is the parsed proxy configuration.
 type Config struct {
-	Listen   string            `yaml:"listen"`
-	Upstream UpstreamConfig    `yaml:"upstream"`
+	Listen   string         `yaml:"listen"`
+	Upstream UpstreamConfig `yaml:"upstream"`
 	// IssueUpstream is an OPTIONAL, separately-configured upstream that sources
 	// the issue tracker (the broker's issue routes), distinct from Upstream
 	// (the SCM that backs git protocol + PRSupport). Empty Kind (absent) means
@@ -35,8 +35,8 @@ type Config struct {
 	// the issue source with no core change. v1 sets both to kind: github
 	// (reusing the github adapter, which implements IssueSupport). See
 	// internal/port/issues.go.
-	IssueUpstream UpstreamConfig `yaml:"issue_upstream"`
-	Repos    map[string]string `yaml:"repos"`
+	IssueUpstream UpstreamConfig    `yaml:"issue_upstream"`
+	Repos         map[string]string `yaml:"repos"`
 	// PublicRepos is the optional allowlist of upstream repository patterns
 	// the proxy serves to anonymous (uncredentialed) agents for read-only
 	// access. Patterns match the UPSTREAM (mapped) repo path. Wildcards like
@@ -45,13 +45,13 @@ type Config struct {
 	// validated at startup by repomatch.NewBoolMatcher in main.go (NOT in
 	// Validate) so a malformed pattern fails fast at proxy start, not at
 	// config parse time.
-	PublicRepos []string `yaml:"public_repos"`
-	Auth     AuthConfig        `yaml:"auth"`
-	Policy   PolicyConfig      `yaml:"policy"`
-	SSH      SSHConfig         `yaml:"ssh"`
-	Audit    AuditConfig       `yaml:"audit"`
-	Alerts   AlertConfig       `yaml:"alerts"`
-	Broker   BrokerConfig      `yaml:"broker"`
+	PublicRepos []string     `yaml:"public_repos"`
+	Auth        AuthConfig   `yaml:"auth"`
+	Policy      PolicyConfig `yaml:"policy"`
+	SSH         SSHConfig    `yaml:"ssh"`
+	Audit       AuditConfig  `yaml:"audit"`
+	Alerts      AlertConfig  `yaml:"alerts"`
+	Broker      BrokerConfig `yaml:"broker"`
 }
 
 // BrokerConfig configures the optional agent-facing PR/CI broker HTTP server.
@@ -75,12 +75,23 @@ type BrokerConfig struct {
 	AllowedAgents []string `yaml:"allowed_agents"`
 	// AllowedOps optionally restricts which op kinds are permitted.
 	// Empty/absent means all ops are allowed. Values: "pr.create", "pr.get",
-	// "pr.list", "pr.merge", "pr.comment", "pr.review", "ci.status".
+	// "pr.list", "pr.merge", "pr.comment", "pr.review", "ci.status", "ci.log".
 	AllowedOps []string `yaml:"allowed_ops"`
 	// MergeMethod is the default GitHub merge method when a merge request does
 	// not specify one. One of "merge", "squash", "rebase". Empty defaults to
 	// "merge".
 	MergeMethod string `yaml:"merge_method"`
+	// AllowCheckLogs opts in to the ci.log route (GET /{repo}/checks/log),
+	// which returns raw CI job log text. Default false: even with a GitHub SCM
+	// adapter (which always implements the capability), the route 501s until
+	// explicitly enabled — log text can itself contain sensitive output a
+	// build step echoed, so exposing it is a deliberate operator decision
+	// distinct from exposing pass/fail status (ci.status).
+	AllowCheckLogs bool `yaml:"allow_check_logs"`
+	// MaxCheckLogBytes bounds ci.log's response: the log's TAIL is kept when
+	// it exceeds this many bytes (the response's "truncated" field is set to
+	// true). Zero/absent defaults to 262144 (256 KiB). Must not be negative.
+	MaxCheckLogBytes int64 `yaml:"max_check_log_bytes"`
 }
 
 // AuditConfig configures the optional append-only JSONL audit log. When File
@@ -220,6 +231,12 @@ func (c *Config) validate() error {
 		if c.Broker.Listen == c.Listen {
 			return fmt.Errorf("config: broker.listen must differ from listen (broker runs on a separate port)")
 		}
+	}
+	// ci.log opt-in: a negative byte cap is nonsensical (fail closed rather
+	// than silently clamping to 0, which would make every ci.log response
+	// look truncated with no log content).
+	if c.Broker.MaxCheckLogBytes < 0 {
+		return fmt.Errorf("config: broker.max_check_log_bytes must not be negative")
 	}
 	return nil
 }
