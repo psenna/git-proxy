@@ -151,7 +151,9 @@
             "enabled": { "type": "boolean" },
             "allowedAgents": { "type": "array" },
             "allowedOps": { "type": "array" },
-            "mergeMethod": { "type": "string", "enum": ["", "merge", "squash", "rebase"] }
+            "mergeMethod": { "type": "string", "enum": ["", "merge", "squash", "rebase"] },
+            "allowCheckLogs": { "type": "boolean" },
+            "maxCheckLogBytes": { "type": "integer", "minimum": 0 }
           }
         }
       }

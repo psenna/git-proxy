@@ -71,8 +71,10 @@ config:
   broker:
     enabled: false                      # REQUIRES config.upstream.kind: github
     allowedAgents: []
-    allowedOps: []                      # e.g. pr.create, pr.list, ci.status, issue.create, ... (16+ values, free-form)
+    allowedOps: []                      # e.g. pr.create, pr.list, ci.status, ci.log, issue.create, ... (16+ values, free-form)
     mergeMethod: ""                     # "" | merge | squash | rebase
+    allowCheckLogs: false                # opt-in: exposes GET /<repo>/checks/log (raw CI job log text)
+    maxCheckLogBytes: 0                  # 0 = use the built-in default (262144 / 256 KiB)
 
 # Generic escape hatch for any other sensitive top-level config.yaml key.
 # Must NOT duplicate a key the ConfigMap already renders, or a key another

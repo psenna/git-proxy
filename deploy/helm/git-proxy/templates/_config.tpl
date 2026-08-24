@@ -100,5 +100,11 @@ broker:
   {{- with .Values.config.broker.mergeMethod }}
   merge_method: {{ . | quote }}
   {{- end }}
+  {{- if .Values.config.broker.allowCheckLogs }}
+  allow_check_logs: true
+  {{- end }}
+  {{- with .Values.config.broker.maxCheckLogBytes }}
+  max_check_log_bytes: {{ int64 . }}
+  {{- end }}
 {{- end }}
 {{- end -}}
