@@ -289,7 +289,7 @@ func TestMirrorExtract_ChangedFiles_AddThenDeleteInSamePush(t *testing.T) {
 	Y := revParseHead(t, work)
 
 	pack := makePackfileReachable(t, work, Y)
-	if err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
+	if _, err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
 		t.Fatalf("IngestPackfile: %v", err)
 	}
 
@@ -364,7 +364,7 @@ func TestMirrorExtract_ChangedFiles_RootCommit(t *testing.T) {
 	}
 
 	pack := makePackfileReachable(t, source, root)
-	if err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
+	if _, err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
 		t.Fatalf("IngestPackfile: %v", err)
 	}
 
