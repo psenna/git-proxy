@@ -207,13 +207,61 @@ func (m *Mirror) Repair(ctx context.Context) error {
 // Refresh fetched them from the upstream, and prior IngestPackfile calls
 // wrote the previously-pushed objects. --fix-thin is a no-op on an
 // already-complete (non-thin) pack, so this is backward-compatible.
-func (m *Mirror) IngestPackfile(ctx context.Context, r io.Reader) error {
+//
+// Returns the ingested pack's own checksum so the caller can remove it via
+// RemovePack when the push it belongs to is ultimately denied — see
+// RemovePack's doc comment (security review finding H10). `index-pack
+// --stdin` prints this to stdout on success as "pack\t<checksum>\n" (verified
+// against real git 2.x); the last whitespace-separated field is taken rather
+// than assuming a bare checksum line, since that's the one part of the
+// format actually documented/stable across git versions.
+func (m *Mirror) IngestPackfile(ctx context.Context, r io.Reader) (packID string, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cmd := exec.CommandContext(ctx, "git", "-C", m.dir, "index-pack", "--stdin", "--fix-thin")
 	cmd.Stdin = r
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("gitx: index-pack --stdin --fix-thin: %w: %s", err, redactCreds(strings.TrimSpace(string(out))))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("gitx: index-pack --stdin --fix-thin: %w: %s", err, redactCreds(strings.TrimSpace(stderr.String())))
+	}
+	fields := strings.Fields(stdout.String())
+	if len(fields) == 0 {
+		return "", nil
+	}
+	return fields[len(fields)-1], nil
+}
+
+// RemovePack deletes the pack/idx (and any sibling .bitmap/.rev/.mtimes) files
+// for packID from the mirror's object store. It is best-effort: a missing file
+// is not an error (already removed, or index-pack never produced one), but any
+// other filesystem error is returned. The per-mirror mutex is held so this
+// does not race a concurrent Refresh/IngestPackfile.
+//
+// Security review finding H10: IngestPackfile runs BEFORE the policy decision
+// (the proxy must inspect a push's contents to decide whether to allow it),
+// and every mirror is opened with gc.auto=0 so background gc never touches it.
+// Before this fix, a denied push's objects were never referenced by any kept
+// ref but were also never removed — an authorized-but-malicious agent looping
+// large packs that are rejected every time filled the proxy's disk with
+// objects nothing would ever collect. RemovePack lets the caller delete
+// exactly the pack IngestPackfile just added, by its own checksum, without a
+// full `git gc`/`git prune` sweep (which would also cost real time on every
+// single denied push, an amplification of its own).
+func (m *Mirror) RemovePack(ctx context.Context, packID string) error {
+	if packID == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	packDir := filepath.Join(m.dir, "objects", "pack")
+	base := "pack-" + packID
+	for _, ext := range []string{".pack", ".idx", ".bitmap", ".rev", ".mtimes", ".promisor"} {
+		p := filepath.Join(packDir, base+ext)
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("gitx: remove pack %s: %w", base+ext, err)
+		}
 	}
 	return nil
 }

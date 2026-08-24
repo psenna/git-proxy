@@ -66,7 +66,7 @@ func enforceMirror(t *testing.T, sourceDir string, packBytes []byte) *gitx.Mirro
 		t.Fatalf("gitx.Open: %v", err)
 	}
 	if packBytes != nil {
-		if err := m.IngestPackfile(ctx, bytes.NewReader(packBytes)); err != nil {
+		if _, err := m.IngestPackfile(ctx, bytes.NewReader(packBytes)); err != nil {
 			t.Fatalf("IngestPackfile: %v", err)
 		}
 	}

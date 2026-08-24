@@ -58,7 +58,7 @@ func TestMirrorExtract(t *testing.T) {
 	mustGit(t, work, "commit", "-q", "-m", "feat: update a, add c")
 	C := revParseHead(t, work)
 	pack := makePackfileReachable(t, work, C)
-	if err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
+	if _, err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
 		t.Fatalf("IngestPackfile: %v", err)
 	}
 
@@ -160,7 +160,7 @@ func TestMirrorExtract_CreateRef(t *testing.T) {
 	mustGit(t, work, "commit", "-q", "-m", "feat: topic")
 	T := revParseHead(t, work)
 	pack := makePackfileReachable(t, work, T)
-	if err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
+	if _, err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
 		t.Fatalf("IngestPackfile: %v", err)
 	}
 
@@ -284,7 +284,7 @@ func TestMirrorExtract_NewCommitMessages(t *testing.T) {
 	mustGit(t, work, "commit", "-q", "-m", "fix: add c")
 	C := revParseHead(t, work)
 	pack := makePackfileReachable(t, work, C)
-	if err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
+	if _, err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
 		t.Fatalf("IngestPackfile: %v", err)
 	}
 

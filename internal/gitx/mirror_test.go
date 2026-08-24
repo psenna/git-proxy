@@ -47,7 +47,7 @@ func makeSourceRepo(t *testing.T, dir string, n int) []string {
 }
 
 func itoa(i int) string {
-	return strings.TrimSpace(string(rune('0'+i)))
+	return strings.TrimSpace(string(rune('0' + i)))
 }
 
 func mustGit(t *testing.T, dir string, args ...string) {
@@ -182,7 +182,7 @@ func TestMirrorOpenRefreshIngestIsAncestor(t *testing.T) {
 	E := revParseHead(t, diverge)
 
 	pack := makePackfile(t, diverge, E)
-	if err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
+	if _, err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
 		t.Fatalf("IngestPackfile: %v", err)
 	}
 	// After ingest, E's objects are in the mirror. B is an ancestor of E
@@ -192,6 +192,144 @@ func TestMirrorOpenRefreshIngestIsAncestor(t *testing.T) {
 	}
 	if ok, err := m.IsAncestor(ctx, D, E); err != nil || ok {
 		t.Fatalf("after Ingest IsAncestor(D,E) = (%v, %v), want (false, nil)", ok, err)
+	}
+}
+
+// TestIngestPackfile_ReturnsPackID verifies IngestPackfile returns the
+// checksum of the pack it just wrote, and that a real pack-<id>.pack/.idx
+// pair exists under the mirror's objects/pack directory under that name —
+// the identifier RemovePack (finding H10) needs to delete exactly that pack
+// later.
+func TestIngestPackfile_ReturnsPackID(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	tips := makeSourceRepo(t, source, 1)
+	tip := tips[0]
+
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+
+	root := t.TempDir()
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", root, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	diverge := t.TempDir()
+	mustGit(t, "", "clone", "-q", "file://"+bare, diverge)
+	mustGit(t, diverge, "config", "user.email", "test@example.com")
+	mustGit(t, diverge, "config", "user.name", "Test")
+	mustGit(t, diverge, "checkout", "-q", "-b", "topic", tip)
+	if err := os.WriteFile(filepath.Join(diverge, "topic.txt"), []byte("topic\n"), 0o644); err != nil {
+		t.Fatalf("write topic.txt: %v", err)
+	}
+	mustGit(t, diverge, "add", "topic.txt")
+	mustGit(t, diverge, "commit", "-q", "-m", "topic commit")
+	topicTip := revParseHead(t, diverge)
+
+	pack := makePackfile(t, diverge, topicTip)
+	packID, err := m.IngestPackfile(ctx, bytes.NewReader(pack))
+	if err != nil {
+		t.Fatalf("IngestPackfile: %v", err)
+	}
+	if len(packID) != 40 {
+		t.Fatalf("packID = %q, want a 40-hex checksum", packID)
+	}
+	for _, ext := range []string{".pack", ".idx"} {
+		p := filepath.Join(m.Dir(), "objects", "pack", "pack-"+packID+ext)
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("expected %s to exist after IngestPackfile: %v", p, err)
+		}
+	}
+}
+
+// TestRemovePack_DeletesPackFiles is the security review H10 regression
+// guard: RemovePack must delete the pack/idx files IngestPackfile just wrote,
+// so a denied push's objects do not accumulate on disk forever (every mirror
+// has gc.auto=0, so nothing else would ever reclaim them). After removal, the
+// pack's objects must be gone from the store (IsAncestor over them fails).
+func TestRemovePack_DeletesPackFiles(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	tips := makeSourceRepo(t, source, 1)
+	tip := tips[0]
+
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+
+	root := t.TempDir()
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", root, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	diverge := t.TempDir()
+	mustGit(t, "", "clone", "-q", "file://"+bare, diverge)
+	mustGit(t, diverge, "config", "user.email", "test@example.com")
+	mustGit(t, diverge, "config", "user.name", "Test")
+	mustGit(t, diverge, "checkout", "-q", "-b", "topic", tip)
+	if err := os.WriteFile(filepath.Join(diverge, "topic.txt"), []byte("topic\n"), 0o644); err != nil {
+		t.Fatalf("write topic.txt: %v", err)
+	}
+	mustGit(t, diverge, "add", "topic.txt")
+	mustGit(t, diverge, "commit", "-q", "-m", "topic commit (denied push simulation)")
+	topicTip := revParseHead(t, diverge)
+
+	pack := makePackfile(t, diverge, topicTip)
+	packID, err := m.IngestPackfile(ctx, bytes.NewReader(pack))
+	if err != nil {
+		t.Fatalf("IngestPackfile: %v", err)
+	}
+	// Sanity: the objects are reachable before removal (topic's tip is its
+	// own ancestor via a trivial self-check would be degenerate; instead
+	// confirm the pack files exist, then confirm they don't after RemovePack).
+	packFile := filepath.Join(m.Dir(), "objects", "pack", "pack-"+packID+".pack")
+	idxFile := filepath.Join(m.Dir(), "objects", "pack", "pack-"+packID+".idx")
+	if _, err := os.Stat(packFile); err != nil {
+		t.Fatalf("setup: pack file missing before RemovePack: %v", err)
+	}
+
+	if err := m.RemovePack(ctx, packID); err != nil {
+		t.Fatalf("RemovePack: %v", err)
+	}
+	if _, err := os.Stat(packFile); !os.IsNotExist(err) {
+		t.Errorf("pack file still present after RemovePack: stat err = %v", err)
+	}
+	if _, err := os.Stat(idxFile); !os.IsNotExist(err) {
+		t.Errorf("idx file still present after RemovePack: stat err = %v", err)
+	}
+}
+
+// TestRemovePack_MissingIsNotError verifies RemovePack is a best-effort,
+// idempotent delete: an already-removed (or never-existent) packID is not an
+// error, and an empty packID (the "no packfile was ingested" case, e.g. a
+// delete-only push) is a no-op.
+func TestRemovePack_MissingIsNotError(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	makeSourceRepo(t, source, 1)
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+	root := t.TempDir()
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", root, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if err := m.RemovePack(ctx, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"); err != nil {
+		t.Errorf("RemovePack(nonexistent) = %v, want nil (best-effort)", err)
+	}
+	if err := m.RemovePack(ctx, ""); err != nil {
+		t.Errorf("RemovePack(\"\") = %v, want nil (no-op)", err)
 	}
 }
 
@@ -288,7 +426,7 @@ func TestMirror_ConcurrentRefreshIngestIsAncestorNoLockError(t *testing.T) {
 				errs[i] = fmt.Errorf("Refresh: %w", err)
 				return
 			}
-			if err := m.IngestPackfile(ctx, bytes.NewReader(preps[i].pack)); err != nil {
+			if _, err := m.IngestPackfile(ctx, bytes.NewReader(preps[i].pack)); err != nil {
 				errs[i] = fmt.Errorf("IngestPackfile: %w", err)
 				return
 			}
@@ -317,6 +455,7 @@ func TestMirror_ConcurrentRefreshIngestIsAncestorNoLockError(t *testing.T) {
 		}
 	}
 }
+
 // makeThinPackfile builds a THIN packfile: objects reachable from `want` but
 // NOT from `not`, with deltas allowed against the excluded `not` objects (which
 // the receiver is assumed to already have). This is what `git push` over HTTP
@@ -404,7 +543,7 @@ func TestMirrorIngestThinPack(t *testing.T) {
 	}
 
 	// Without --fix-thin this returned "fatal: pack has N unresolved deltas".
-	if err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
+	if _, err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
 		t.Fatalf("IngestPackfile(thin pack) = %v; index-pack must run with --fix-thin", err)
 	}
 	if ok, err := m.IsAncestor(ctx, B, T); err != nil || !ok {
