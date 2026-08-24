@@ -496,7 +496,7 @@ func (b *Broker) authOK(w http.ResponseWriter, r *http.Request, repo, op string)
 		b.audit(r.Context(), "", repo, op, "deny", []string{"unauthorized"})
 		return auth.AgentIdentity{}, false
 	}
-	if !b.authorize(agent, op) {
+	if !b.authorize(agent, op, repo) {
 		respondError(w, http.StatusForbidden, "forbidden")
 		b.audit(r.Context(), agent.Name, repo, op, "deny", []string{"forbidden"})
 		return agent, false

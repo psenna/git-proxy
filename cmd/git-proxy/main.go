@@ -345,13 +345,32 @@ func run(configPath string) error {
 		if auditSink != nil {
 			brokerAudit = auditSink
 		}
+		// Per-agent repo allowlist (security review finding H2): built here,
+		// once, at startup, exactly like the public_repos matcher above — a
+		// malformed pattern fails proxy startup rather than a request. An
+		// agent whose pattern list is empty gets a matcher that matches
+		// nothing (repomatch.NewBoolMatcher(nil) is valid and always-false),
+		// which is the intended "explicitly locked out" behavior, not an
+		// error.
+		var agentRepos map[string]port.RepoMatcher
+		if len(cfg.Broker.AllowedAgentRepos) > 0 {
+			agentRepos = make(map[string]port.RepoMatcher, len(cfg.Broker.AllowedAgentRepos))
+			for agentName, patterns := range cfg.Broker.AllowedAgentRepos {
+				m, err := repomatch.NewBoolMatcher(patterns)
+				if err != nil {
+					return fmt.Errorf("broker.allowed_agent_repos[%s]: %w", agentName, err)
+				}
+				agentRepos[agentName] = m
+			}
+		}
 		br, err := broker.New(brokerLn, up, issueUp, cfg.Repos, auth, brokerAudit, broker.Config{
-			Listen:           cfg.Broker.Listen,
-			AllowedAgents:    cfg.Broker.AllowedAgents,
-			AllowedOps:       cfg.Broker.AllowedOps,
-			MergeMethod:      cfg.Broker.MergeMethod,
-			AllowCheckLogs:   cfg.Broker.AllowCheckLogs,
-			MaxCheckLogBytes: cfg.Broker.MaxCheckLogBytes,
+			Listen:            cfg.Broker.Listen,
+			AllowedAgents:     cfg.Broker.AllowedAgents,
+			AllowedOps:        cfg.Broker.AllowedOps,
+			MergeMethod:       cfg.Broker.MergeMethod,
+			AllowCheckLogs:    cfg.Broker.AllowCheckLogs,
+			MaxCheckLogBytes:  cfg.Broker.MaxCheckLogBytes,
+			AllowedAgentRepos: agentRepos,
 		})
 		if err != nil {
 			// Fail closed: the broker requires an SCM adapter. Return rather

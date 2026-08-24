@@ -92,6 +92,21 @@ type BrokerConfig struct {
 	// it exceeds this many bytes (the response's "truncated" field is set to
 	// true). Zero/absent defaults to 262144 (256 KiB). Must not be negative.
 	MaxCheckLogBytes int64 `yaml:"max_check_log_bytes"`
+	// AllowedAgentRepos optionally scopes an agent (by name, matching
+	// AllowedAgents) to a repo allowlist: patterns matched against the
+	// UPSTREAM (mapped) repo path, same syntax and precedence as
+	// credentials[].repos / public_repos (internal/credentials/repomatch). An
+	// agent with NO entry in this map is unrestricted by repo (today's
+	// behavior, fully backward compatible) — this is an opt-in, additive
+	// control, not a replacement for AllowedAgents. Security review finding
+	// H2: without this, authorize() only ever checked (agent, op), so any
+	// agent allowlisted for an op could exercise it against every repo any
+	// credential profile happens to cover, which is the ONLY thing standing
+	// between two agents meant to be scoped to different repos behind one
+	// broker. An agent WITH an entry whose list is empty matches nothing
+	// (fail closed, not "unrestricted") — use a wildcard like "org/*"
+	// explicitly instead of an empty list to mean "no restriction".
+	AllowedAgentRepos map[string][]string `yaml:"allowed_agent_repos"`
 }
 
 // AuditConfig configures the optional append-only JSONL audit log. When File

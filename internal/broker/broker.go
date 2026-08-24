@@ -61,6 +61,12 @@ type Config struct {
 	// MaxCheckLogBytes bounds a ci.log response's tail-truncation cap.
 	// Zero/absent defaults to 256 KiB (see New).
 	MaxCheckLogBytes int64
+	// AllowedAgentRepos optionally scopes an agent (by name) to a repo
+	// allowlist, pre-built by main.go (pattern validation happens there, at
+	// startup, mirroring the public_repos wiring). An agent absent from this
+	// map is unrestricted by repo — see the config.BrokerConfig field this
+	// mirrors for the full security rationale (finding H2).
+	AllowedAgentRepos map[string]port.RepoMatcher
 }
 
 // Broker is the agent-facing broker HTTP server. It implements port.Transport
@@ -88,6 +94,12 @@ type Broker struct {
 	mergeMethod   string
 	allowedAgents map[string]bool // empty-set means "all authenticated agents"
 	allowedOps    map[string]bool // empty-set means "all ops"
+	// agentRepos is the optional per-agent repo allowlist (finding H2). An
+	// agent name absent from this map is unrestricted by repo — that is the
+	// default, backward-compatible posture. An agent PRESENT in the map must
+	// have its matcher return true for the resolved (upstream) repo, or the
+	// request is forbidden, same as an allowedAgents/allowedOps miss.
+	agentRepos map[string]port.RepoMatcher
 
 	server *http.Server
 }
@@ -124,6 +136,7 @@ func New(ln net.Listener, scmUp port.Upstream, issueUp port.Upstream, repos map[
 		mergeMethod:   mergeMethod,
 		allowedAgents: toSet(cfg.AllowedAgents),
 		allowedOps:    toSet(cfg.AllowedOps),
+		agentRepos:    cfg.AllowedAgentRepos,
 	}
 	// IssueSupport is optional/additive: a nil issueUp or one that lacks the
 	// capability simply leaves b.issues nil (issue routes → 501). No error —
@@ -233,16 +246,33 @@ func (b *Broker) authenticate(r *http.Request) (auth.AgentIdentity, error) {
 	return b.auth.Authenticate(r.Context(), strings.TrimPrefix(h, prefix))
 }
 
-// authorize reports whether agent is permitted to perform op. An empty
+// authorize reports whether agent is permitted to perform op against repo
+// (the already-resolved upstream repo path — callers pass the post-resolveRepo
+// value, matching how public_repos matches the mapped path). An empty
 // allowedAgents set means "all authenticated agents" (authentication already
-// gated entry); an empty allowedOps set means "all ops". Otherwise both the
-// agent name and the op must be in their respective allowlists.
-func (b *Broker) authorize(agent auth.AgentIdentity, op string) bool {
+// gated entry); an empty allowedOps set means "all ops".
+//
+// Security review finding H2: repo was NOT a parameter here before this fix.
+// The credential vault's wildcard matching was the ONLY thing standing
+// between one agent's Bearer token and every repo any credential profile
+// happened to cover — an agent allowlisted for pr.merge could merge a PR in
+// any repo behind a wildcard profile, not just the one it was provisioned
+// for. agentRepos closes that gap: when the agent has an entry, repo MUST
+// match that agent's matcher (an entry with an empty pattern list matches
+// nothing — see AllowedAgentRepos's doc comment). An agent with NO entry is
+// unrestricted by repo, preserving today's behavior for operators who have
+// not opted in yet.
+func (b *Broker) authorize(agent auth.AgentIdentity, op, repo string) bool {
 	if len(b.allowedAgents) > 0 && !b.allowedAgents[agent.Name] {
 		return false
 	}
 	if len(b.allowedOps) > 0 && !b.allowedOps[op] {
 		return false
+	}
+	if matcher, ok := b.agentRepos[agent.Name]; ok {
+		if matcher == nil || !matcher.Match(repo) {
+			return false
+		}
 	}
 	return true
 }

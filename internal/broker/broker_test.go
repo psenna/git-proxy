@@ -215,21 +215,59 @@ func TestAuthorize(t *testing.T) {
 		allowedOps    []string
 		agent         string
 		op            string
+		repo          string
 		want          bool
 	}{
-		{"empty sets allow all", nil, nil, "alice", "pr.merge", true},
-		{"agent allowlist match", []string{"alice"}, nil, "alice", "pr.merge", true},
-		{"agent allowlist miss", []string{"bob"}, nil, "alice", "pr.merge", false},
-		{"op allowlist match", nil, []string{"pr.get"}, "alice", "pr.get", true},
-		{"op allowlist miss", nil, []string{"pr.get"}, "alice", "pr.merge", false},
-		{"both allowlists match", []string{"alice"}, []string{"pr.merge"}, "alice", "pr.merge", true},
-		{"agent ok op miss", []string{"alice"}, []string{"pr.get"}, "alice", "pr.merge", false},
+		{"empty sets allow all", nil, nil, "alice", "pr.merge", "org/repo.git", true},
+		{"agent allowlist match", []string{"alice"}, nil, "alice", "pr.merge", "org/repo.git", true},
+		{"agent allowlist miss", []string{"bob"}, nil, "alice", "pr.merge", "org/repo.git", false},
+		{"op allowlist match", nil, []string{"pr.get"}, "alice", "pr.get", "org/repo.git", true},
+		{"op allowlist miss", nil, []string{"pr.get"}, "alice", "pr.merge", "org/repo.git", false},
+		{"both allowlists match", []string{"alice"}, []string{"pr.merge"}, "alice", "pr.merge", "org/repo.git", true},
+		{"agent ok op miss", []string{"alice"}, []string{"pr.get"}, "alice", "pr.merge", "org/repo.git", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			b := mustNew(t, stubPRSupport{}, fakeAuthenticator{}, nil, Config{AllowedAgents: tc.allowedAgents, AllowedOps: tc.allowedOps})
-			if got := b.authorize(auth.AgentIdentity{Name: tc.agent}, tc.op); got != tc.want {
-				t.Errorf("authorize(%q,%q) = %v, want %v", tc.agent, tc.op, got, tc.want)
+			if got := b.authorize(auth.AgentIdentity{Name: tc.agent}, tc.op, tc.repo); got != tc.want {
+				t.Errorf("authorize(%q,%q,%q) = %v, want %v", tc.agent, tc.op, tc.repo, got, tc.want)
+			}
+		})
+	}
+}
+
+// stubRepoMatcher is a trivial port.RepoMatcher for TestAuthorize_PerAgentRepo:
+// it matches exactly the repos in its set.
+type stubRepoMatcher map[string]bool
+
+func (m stubRepoMatcher) Match(repo string) bool { return m[repo] }
+
+// TestAuthorize_PerAgentRepo is the security review H2 regression guard: an
+// agent PRESENT in AllowedAgentRepos must be denied for a repo its matcher
+// does not cover, even though allowedAgents/allowedOps would otherwise allow
+// the request — this is the check that was previously entirely missing. An
+// agent ABSENT from the map stays unrestricted by repo (backward compatible).
+func TestAuthorize_PerAgentRepo(t *testing.T) {
+	agentRepos := map[string]port.RepoMatcher{
+		"scoped-agent": stubRepoMatcher{"org/allowed.git": true},
+		"locked-out":   stubRepoMatcher{}, // present, matches nothing -> always deny
+	}
+	cases := []struct {
+		name  string
+		agent string
+		repo  string
+		want  bool
+	}{
+		{"scoped agent, allowed repo", "scoped-agent", "org/allowed.git", true},
+		{"scoped agent, DIFFERENT repo -> forbidden", "scoped-agent", "org/other.git", false},
+		{"agent with empty pattern list is always denied", "locked-out", "org/allowed.git", false},
+		{"agent with no entry is unrestricted", "unscoped-agent", "org/anything.git", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := mustNew(t, stubPRSupport{}, fakeAuthenticator{}, nil, Config{AllowedAgentRepos: agentRepos})
+			if got := b.authorize(auth.AgentIdentity{Name: tc.agent}, "pr.merge", tc.repo); got != tc.want {
+				t.Errorf("authorize(%q, pr.merge, %q) = %v, want %v", tc.agent, tc.repo, got, tc.want)
 			}
 		})
 	}
