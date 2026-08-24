@@ -49,6 +49,11 @@ config:
   auth:
     existingSecret: ""
     key: auth.yaml
+    # unsafeAllowNoAuth explicitly acknowledges running the HTTP frontend
+    # with NO agent authentication (an open relay). REQUIRED to be true when
+    # existingSecret is unset — the binary now refuses to start otherwise
+    # (security review finding H9). Not recommended for production.
+    unsafeAllowNoAuth: false
   policy:
     mode: ""                            # "" | first_deny | collect_all
     dryRun: false

@@ -27,7 +27,12 @@ jobs:
       - name: helm lint --strict (defaults + every fixture)
         run: |
           set -eu
-          helm lint --strict deploy/helm/git-proxy
+          # config.auth.unsafeAllowNoAuth=true is required for the bare stock
+          # chart to render at all (security review finding H9: there is no
+          # safe default auth posture, unlike e.g. config.upstream.url) -- this
+          # is a chart-rendering smoke test, not an endorsement of running
+          # without auth; fixtures below set their own auth posture.
+          helm lint --strict deploy/helm/git-proxy --set config.auth.unsafeAllowNoAuth=true
           for f in deploy/helm/git-proxy/ci/*.yaml; do
             echo "=== lint: $f ==="
             helm lint --strict deploy/helm/git-proxy -f "$f"
@@ -37,7 +42,7 @@ jobs:
         run: |
           set -eu
           mkdir -p rendered
-          helm template gp deploy/helm/git-proxy > rendered/defaults.yaml
+          helm template gp deploy/helm/git-proxy --set config.auth.unsafeAllowNoAuth=true > rendered/defaults.yaml
           for f in deploy/helm/git-proxy/ci/*.yaml; do
             name="$(basename "$f" .yaml)"
             echo "=== template: $f ==="
@@ -56,16 +61,24 @@ jobs:
           grep -E '^\s+max_packfile_bytes: 268435456$' rendered/policy-values.yaml
           echo "OK"
 
-      - name: "assert no top-level auth key leaks into the rendered ConfigMap"
+      - name: "assert no auth.tokens key leaks into the rendered ConfigMap"
         run: |
           set -eu
+          # auth: itself is no longer forbidden in the ConfigMap: security
+          # review finding H9 added config.auth.unsafeAllowNoAuth, a
+          # non-secret boolean rendered as auth.unsafe_allow_no_auth when no
+          # existingSecret is configured (see templates/_config.tpl and
+          # ci/no-auth-values.yaml). What must never appear is the actual
+          # secret-bearing auth.tokens key -- that only ever reaches the
+          # assembled config via the Secret fragment the init container
+          # appends at pod start, never via the ConfigMap.
           for f in rendered/*.yaml; do
-            if awk '/^kind: ConfigMap$/,/^---$/' "$f" | grep -qE '^\s{4}auth:'; then
-              echo "LEAK: $f renders a top-level auth: key inside the ConfigMap"
+            if awk '/^kind: ConfigMap$/,/^---$/' "$f" | grep -qE '^\s+tokens:'; then
+              echo "LEAK: $f renders an auth.tokens key inside the ConfigMap"
               exit 1
             fi
           done
-          echo "OK: no fixture leaks auth: into a ConfigMap"
+          echo "OK: no fixture leaks auth.tokens into a ConfigMap"
 
       - name: "assert the -config flag points at the assembled path"
         run: |
@@ -95,72 +108,81 @@ jobs:
             echo "OK: $desc"
           }
 
+          assert_fails "no auth.existingSecret and no unsafeAllowNoAuth" \
+            "config.auth.existingSecret is unset" \
+            --set config.upstream.url=https://github.com
+
           assert_fails "empty upstream.url" \
             "String length must be greater than or equal to 1" \
-            --set config.upstream.url=
+            --set config.upstream.url= --set config.auth.unsafeAllowNoAuth=true
 
           assert_fails "replicaCount without unsafeAllowMultipleReplicas" \
             "replicaCount=2 is not supported" \
-            --set replicaCount=2
+            --set replicaCount=2 --set config.auth.unsafeAllowNoAuth=true
 
           assert_fails "ssh enabled without authorizedKeys" \
             "requires a non-empty config.ssh.authorizedKeys" \
-            --set config.ssh.enabled=true
+            --set config.ssh.enabled=true --set config.auth.unsafeAllowNoAuth=true
 
           assert_fails "ssh enabled without host key secret or ephemeral opt-in" \
             "requires config.ssh.hostKey.existingSecret" \
-            --set config.ssh.enabled=true \
+            --set config.ssh.enabled=true --set config.auth.unsafeAllowNoAuth=true \
             --set-string 'config.ssh.authorizedKeys.agent-1=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA k'
 
           assert_fails "broker enabled without github upstream kind" \
             'requires config.upstream.kind="github"' \
-            --set config.broker.enabled=true
+            --set config.broker.enabled=true --set config.auth.unsafeAllowNoAuth=true
 
           assert_fails "broker port collides with git port" \
             "must differ from ports.git" \
-            --set config.broker.enabled=true --set config.upstream.kind=github --set ports.broker=8080
+            --set config.broker.enabled=true --set config.upstream.kind=github --set ports.broker=8080 \
+            --set config.auth.unsafeAllowNoAuth=true
 
           assert_fails "ssh port collides with git port" \
             "collides with ports.git" \
             --set config.ssh.enabled=true --set ports.ssh=8080 \
             --set config.ssh.hostKey.allowEphemeral=true \
+            --set config.auth.unsafeAllowNoAuth=true \
             --set-string 'config.ssh.authorizedKeys.agent-1=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA k'
 
           assert_fails "public_repos bare star" \
             'bare "*" catch-all' \
-            --set-string 'config.publicRepos[0]=*'
+            --set-string 'config.publicRepos[0]=*' --set config.auth.unsafeAllowNoAuth=true
 
           assert_fails "public_repos double star" \
             'contains "**"' \
-            --set-string 'config.publicRepos[0]=a/**'
+            --set-string 'config.publicRepos[0]=a/**' --set config.auth.unsafeAllowNoAuth=true
 
           assert_fails "alerts.webhook bad scheme" \
             "must start with http:// or https://" \
-            --set-string config.alerts.webhook=file:///x
+            --set-string config.alerts.webhook=file:///x --set config.auth.unsafeAllowNoAuth=true
 
           assert_fails "image.repository empty" \
             "image.repository: String length must be greater than or equal to 1" \
-            --set image.repository=
+            --set image.repository= --set config.auth.unsafeAllowNoAuth=true
 
           assert_fails "useBrokerHealthz without broker enabled" \
             "requires config.broker.enabled=true" \
-            --set probes.useBrokerHealthz=true
+            --set probes.useBrokerHealthz=true --set config.auth.unsafeAllowNoAuth=true
 
           assert_fails "issueUpstream enabled without kind" \
             "requires config.issueUpstream.kind" \
-            --set config.issueUpstream.enabled=true --set config.issueUpstream.kind=
+            --set config.issueUpstream.enabled=true --set config.issueUpstream.kind= \
+            --set config.auth.unsafeAllowNoAuth=true
 
           assert_fails "issueUpstream enabled without url" \
             "requires config.issueUpstream.url" \
-            --set config.issueUpstream.enabled=true --set config.issueUpstream.url=
+            --set config.issueUpstream.enabled=true --set config.issueUpstream.url= \
+            --set config.auth.unsafeAllowNoAuth=true
 
           assert_fails "extraConfigFragments entry missing key" \
             "extraConfigFragments[0].key is required" \
-            --set 'extraConfigFragments[0].existingSecret=s'
+            --set 'extraConfigFragments[0].existingSecret=s' --set config.auth.unsafeAllowNoAuth=true
 
           assert_fails "persistence.audit enabled with no size" \
             "requires persistence.audit.size" \
-            --set persistence.audit.enabled=true --set persistence.audit.size=
+            --set persistence.audit.enabled=true --set persistence.audit.size= \
+            --set config.auth.unsafeAllowNoAuth=true
 
   ct-lint:
     name: chart-testing lint

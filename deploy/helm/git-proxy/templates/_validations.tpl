@@ -6,6 +6,10 @@
 {{- fail "git-proxy: config.upstream.url is required — the binary refuses to start without it (internal/config/config.go: \"config: upstream.url is required\"). Set config.upstream.url to the upstream git server, e.g. https://github.com or http://gitea.git.svc:3000." -}}
 {{- end -}}
 
+{{- if and (not .Values.config.auth.existingSecret) (not .Values.config.auth.unsafeAllowNoAuth) -}}
+{{- fail "git-proxy: config.auth.existingSecret is unset, so the HTTP frontend would run with no agent authentication (an open relay -- any client that can reach it reads/writes through the proxy using the proxy's own upstream credentials). The binary now fails closed at startup: \"config: auth.tokens is empty\" (security review finding H9). Create a Secret holding a verbatim auth.tokens YAML fragment (bearer-token -> agent-name) and set config.auth.existingSecret, or set config.auth.unsafeAllowNoAuth=true to explicitly acknowledge running with no incoming auth (not recommended for production)." -}}
+{{- end -}}
+
 {{- if and (gt (int .Values.replicaCount) 1) (not .Values.unsafeAllowMultipleReplicas) -}}
 {{- fail (printf "git-proxy: replicaCount=%d is not supported. git-proxy keeps per-pod local state -- the bare inspection-mirror cache (policy.mirror.dir) and the append-only audit file -- with a single-writer assumption and no RWX/leader-election design. Run one replica, or set unsafeAllowMultipleReplicas=true if you have independently guaranteed each replica has its own storage and you accept a split audit log." (int .Values.replicaCount)) -}}
 {{- end -}}

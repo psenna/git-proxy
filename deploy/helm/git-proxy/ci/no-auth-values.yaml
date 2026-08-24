@@ -1,3 +1,9 @@
 config:
   upstream:
     url: "http://gitea.git.svc.cluster.local:3000"
+  auth:
+    # Deliberately testing the "no incoming auth" mode this fixture is named
+    # for. Required since security review finding H9: the binary now fails
+    # closed at startup without either config.auth.existingSecret or this
+    # explicit acknowledgment.
+    unsafeAllowNoAuth: true
