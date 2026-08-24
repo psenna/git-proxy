@@ -1,9 +1,17 @@
 {{- define "git-proxy.configBase" -}}
 # Rendered by the git-proxy Helm chart ({{ include "git-proxy.chart" . }}). Do not edit in-cluster.
-# NOTE: the top-level `auth:` key is DELIBERATELY absent here. Bearer tokens are
-# supplied by a Secret fragment that the assemble-config init container appends
-# to this file at {{ include "git-proxy.paths.assembledConfig" . }}.
+# NOTE: when config.auth.existingSecret is set, the top-level `auth:` key is
+# DELIBERATELY absent here — Bearer tokens are supplied by a Secret fragment
+# that the assemble-config init container appends to this file at
+# {{ include "git-proxy.paths.assembledConfig" . }}. When no secret is
+# configured, config.auth.unsafeAllowNoAuth must be true (enforced by
+# _validations.tpl below) and is rendered here instead — it is a plain
+# boolean, not a secret, so it is safe to render into the ConfigMap.
 listen: "0.0.0.0:{{ int .Values.ports.git }}"
+{{- if not .Values.config.auth.existingSecret }}
+auth:
+  unsafe_allow_no_auth: true
+{{- end }}
 upstream:
   {{- with .Values.config.upstream.kind }}
   kind: {{ . | quote }}

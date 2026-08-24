@@ -94,23 +94,28 @@ func run(configPath string) error {
 		publicRepos = m
 	}
 
-	// Agent authenticator: Bearer tokens. If no tokens are configured the proxy
-	// runs unauthenticated (fail open at the config level); production must
-	// configure at least one token. With tokens configured, every request must
-	// present a valid token or receive 401 (fail closed at the request level).
+	// Agent authenticator: Bearer tokens. An empty auth.tokens map means the
+	// HTTP frontend would run unauthenticated (an open relay: any client that
+	// can reach the listen address reads/writes through the proxy using the
+	// proxy's OWN upstream credentials). Security review finding H9: this was
+	// previously a silent fail-open (a log warning, not a startup failure) —
+	// require an explicit auth.unsafe_allow_no_auth: true acknowledgment
+	// instead, and fail startup otherwise. This check deliberately lives here
+	// (an operational/deployment-readiness check performed at actual startup)
+	// rather than in config.Validate — the same separation the public_repos
+	// pattern validation above already uses, so config.Validate stays a pure
+	// structural check that every config-shape unit test can call via
+	// config.Parse without also having to opt in to an auth posture that has
+	// nothing to do with what each of those tests is exercising.
 	var auth port.Authenticator
-	if len(cfg.Auth.Tokens) > 0 {
+	switch {
+	case len(cfg.Auth.Tokens) > 0:
 		auth = token.New(cfg.Auth.Tokens)
-	} else {
-		// No Bearer tokens configured → the HTTP frontend is unauthenticated
-		// (an open relay): any client can reach the upstream through the proxy
-		// with the proxy's upstream credentials attached. Fail-open at the config
-		// level is the existing default (preserved for backward compatibility /
-		// local tests), but for a security-control gateway that holds upstream
-		// creds this is a risky posture — warn loudly so a production deploy
-		// doesn't silently run open. Configure auth.tokens (or use the SSH
-		// frontend with ssh.authorized_keys) to close it.
-		log.Printf("git-proxy: WARNING: no auth.tokens configured — the HTTP frontend is an OPEN relay (any client can reach the upstream with the proxy's upstream credentials). Configure auth.tokens in production.")
+	case cfg.Auth.RequiresExplicitOptOut():
+		return fmt.Errorf("config: auth.tokens is empty — the HTTP frontend would run as an unauthenticated open relay; " +
+			"configure at least one token, or set auth.unsafe_allow_no_auth: true to acknowledge this explicitly (not recommended for production)")
+	default:
+		log.Printf("git-proxy: WARNING: auth.unsafe_allow_no_auth is true — the HTTP frontend is an OPEN relay (any client can reach the upstream with the proxy's upstream credentials). This was an explicit config choice; do not use it in production.")
 	}
 
 	// Upstream/SCM adapter: built via the upstream registry (v1.md M10), selected

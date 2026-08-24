@@ -87,7 +87,8 @@
           "additionalProperties": true,
           "properties": {
             "existingSecret": { "type": "string" },
-            "key": { "type": "string" }
+            "key": { "type": "string" },
+            "unsafeAllowNoAuth": { "type": "boolean" }
           }
         },
         "policy": {
