@@ -24,6 +24,31 @@ func normalizeOID(oid string) string {
 	return oid
 }
 
+// isHexSHA reports whether s is a well-formed 40-char lowercase-hex SHA-1
+// object id. Every ref-update Old/New value MUST pass this check before it is
+// allowed anywhere near a git subprocess argument (IsAncestor,
+// NewCommitMessages, ChangedFiles all splice these values into "git log"/"git
+// diff"/"git rev-list" argv with no "--" separator). Without this gate, a
+// wire value like "--output=/home/proxy/.gitconfig" is not a revision at all
+// — it is parsed by git as an OPTION, letting a ref-update command write
+// attacker-influenced content (e.g. a reachable commit's message) to an
+// arbitrary path on the proxy host during evaluation, before any allow/deny
+// decision is reached. Strict allowlist validation (not escaping, not a "--"
+// separator alone) is the fix: a value that must be exactly 40 hex digits can
+// never begin with "-" or be misparsed as anything but an object id.
+func isHexSHA(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 // EnforceReceivePack computes the push decision for a parsed receive-pack
 // request. It computes per-command Force flags by walking ancestry in the
 // mirror (create/delete are never force; an update is force when new is NOT a
@@ -42,6 +67,26 @@ func EnforceReceivePack(ctx context.Context, req *ReceivePackRequest, mirror *gi
 	for _, cmd := range req.Commands {
 		old := normalizeOID(cmd.Old)
 		new := normalizeOID(cmd.New)
+
+		// Fail-closed on a malformed object id. This is an INSPECTION failure,
+		// not a policy verdict, so it returns a non-nil error alongside the
+		// Deny decision — the same posture as the ancestry-check failure
+		// below. That distinction matters: the proxy's dry-run mode forwards
+		// a "clean" engine deny (enErr == nil) so operators can observe
+		// policy violations without enforcing them, but it must NEVER forward
+		// a push the proxy could not safely inspect. A malformed old/new is
+		// exactly that case — see isHexSHA's doc comment for why.
+		if (old != "" && !isHexSHA(old)) || (new != "" && !isHexSHA(new)) {
+			err := fmt.Errorf("malformed object id for ref %s", cmd.Ref)
+			return port.Decision{
+				Verdict: port.VerdictDeny,
+				Reasons: []port.Reason{{
+					Rule:    "enforcement",
+					Message: fmt.Sprintf("push rejected: malformed object id for ref %s", cmd.Ref),
+				}},
+			}, err
+		}
+
 		u := port.RefUpdate{Ref: cmd.Ref, Old: old, New: new}
 
 		switch {
