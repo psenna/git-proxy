@@ -155,11 +155,38 @@ type SSHConfig struct {
 }
 type AuthConfig struct {
 	// Tokens maps a bearer token to the agent name it authenticates. A request
-	// is authorized if it presents any token in this map. Empty (the default)
-	// means no tokens are valid; in that case the proxy runs without auth only
-	// if no Authenticator is wired (see cmd/git-proxy). Production deployments
-	// must configure at least one token.
+	// is authorized if it presents any token in this map. Empty means no
+	// tokens are valid — see UnsafeAllowNoAuth: an empty Tokens map with
+	// UnsafeAllowNoAuth unset/false is a config error (fail-closed at startup),
+	// not a silent open relay.
 	Tokens map[string]string `yaml:"tokens"`
+	// UnsafeAllowNoAuth explicitly opts in to running the HTTP git frontend
+	// with NO agent authentication (an open relay: any client that can reach
+	// the listen address can read/write through the proxy using its own
+	// upstream credentials — see requirements.md's fail-closed principle).
+	// Default false. Security review finding H9: an operator who configured
+	// upstream credentials but forgot auth.tokens previously got this same
+	// open-relay posture SILENTLY (a log warning, not a startup failure) —
+	// the broker already fails closed with no equivalent workaround; the git
+	// leg did not. Mirrors the Helm chart's unsafeAllowMultipleReplicas
+	// pattern: a deliberately named, deliberately unsafe-sounding escape
+	// hatch for local dev/testing, not a production default.
+	UnsafeAllowNoAuth bool `yaml:"unsafe_allow_no_auth"`
+}
+
+// RequiresExplicitOptOut reports whether this AuthConfig would leave the HTTP
+// git frontend unauthenticated without an acknowledged opt-in: an empty
+// Tokens map AND UnsafeAllowNoAuth not set. Deliberately a plain predicate on
+// AuthConfig alone, NOT part of Config.validate(): main.go's startup path
+// (not Parse/validate) is where this is enforced, so config-shape unit tests
+// that build a Config via Parse for unrelated sections (SSH, alerts, policy,
+// ...) are not forced to also adopt an auth posture — mirroring how
+// public_repos pattern validation is deliberately deferred to main.go rather
+// than living in validate(). This method exists purely so the decision itself
+// (not the startup wiring around it) is unit-testable independent of
+// cmd/git-proxy, which this package's tests can build and run without it.
+func (a AuthConfig) RequiresExplicitOptOut() bool {
+	return len(a.Tokens) == 0 && !a.UnsafeAllowNoAuth
 }
 
 // Parse decodes configuration from raw YAML bytes.
