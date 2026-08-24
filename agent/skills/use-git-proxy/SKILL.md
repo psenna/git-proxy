@@ -1,6 +1,6 @@
 ---
 name: use-git-proxy
-description: Use when the agent needs to clone/fetch/push a git repository, manipulate pull requests and query CI status, or file/read/comment/close/label issues through a git-proxy instance. Covers Bearer auth, the git-protocol leg (clone/fetch/push with policy awareness and read protection), and the agent-facing broker REST API (PRs, CI status, and issues). Use it any time a remote URL points at a git-proxy or a task mentions pushing through / opening PRs or issues via git-proxy.
+description: Use when the agent needs to clone/fetch/push a git repository, manipulate pull requests and query CI status/logs, or file/read/comment/close/label issues through a git-proxy instance. Covers Bearer auth, the git-protocol leg (clone/fetch/push with policy awareness and read protection), and the agent-facing broker REST API (PRs, CI status and raw job log text, and issues). Use it any time a remote URL points at a git-proxy or a task mentions pushing through / opening PRs or issues via git-proxy.
 ---
 
 # Use git-proxy
@@ -17,7 +17,7 @@ a git-proxy instance.
 | Leg | What it's for | URL |
 |---|---|---|
 | **Git protocol** | `clone` / `fetch` / `push` (smart-HTTP) | the proxy `listen` address, e.g. `http://127.0.0.1:8080` |
-| **Broker REST API** | PRs (create/get/list/merge, comment, review), CI status, and issues (create/get/list, comment, close, reopen, edit, labels) | the `broker.listen` address, e.g. `http://127.0.0.1:8090` |
+| **Broker REST API** | PRs (create/get/list/merge, comment, review), CI status and logs, and issues (create/get/list, comment, close, reopen, edit, labels) | the `broker.listen` address, e.g. `http://127.0.0.1:8090` |
 
 ## 0. Prerequisites — establish these first
 
@@ -185,6 +185,55 @@ least one run failed) | `"success"` (all completed passing) | `"unknown"` (a run
 in a state the roll-up can't classify). Precedence is failure > pending > success
 > unknown.
 
+> **CI logs are opt-in.** `checks/log` is sourced from the SAME upstream as
+> `checks/<ref>`, but is gated behind its own deployment-level toggle
+> (`broker.allow_check_logs`) because log text can itself contain sensitive
+> build output. If the deployment did not enable it, the route returns
+> **501** — see [Error responses](#error-responses). Auth still gates first (a
+> missing/invalid Bearer is 401, not 501).
+
+### CI logs
+
+When `checks/<ref>` shows a failing check, fetch its raw job log text instead of
+asking a human to open the Actions UI:
+
+```sh
+# ref and check_name are QUERY params (not path segments) — check_name commonly
+# contains "/" or spaces (Actions job names like "CI / lint" or "kind e2e"),
+# and is query-encoded here, not %2F-path-encoded like the repo segment.
+curl -s -G "$GIT_PROXY_BROKER_URL/$REPO/checks/log" -H "$AUTH" \
+  --data-urlencode "ref=$SHA_OR_BRANCH" \
+  --data-urlencode "check_name=kind e2e"
+# → 200 {"log": "...", "truncated": false}   (opt-in via broker.allow_check_logs; 501 if not enabled)
+```
+
+`check_name` must match a check-run's `name` from the `checks/<ref>` response
+exactly. A check not backed by a GitHub Actions job (e.g. a third-party check
+app) has no fetchable log and returns 404, same as an unknown `check_name`.
+
+**Do not dump a large log straight into your own conversation/context.** A job
+log can be tens of KB; pasting the whole thing burns context for little value.
+Save it to a file and grep/awk/sed for the lines that matter instead:
+
+```sh
+curl -s -G "$GIT_PROXY_BROKER_URL/$REPO/checks/log" -H "$AUTH" \
+  --data-urlencode "ref=$SHA_OR_BRANCH" \
+  --data-urlencode "check_name=kind e2e" \
+| jq -r .log > /tmp/check.log
+
+grep -n -i -E 'error|fail|panic' /tmp/check.log | tail -50
+awk '/FAIL/{print NR": "$0}' /tmp/check.log
+```
+
+`truncated: true` in the response means the log was already cut server-side to
+`broker.max_check_log_bytes` (a TAIL truncation — the most recent bytes are
+kept), which is separate from any further local filtering you do with
+grep/awk/sed on top of it.
+
+`failed_steps_only=true` is accepted as a query param but returns **501** in
+v1 — step-level log filtering is not implemented; fetch the full log and grep
+it instead.
+
 ### Issue operations
 
 Issue routes are served **only when the deployment configured an `issue_upstream`**.
@@ -286,6 +335,7 @@ POST   $BROKER/$R/prs/N/merge      [-d '{"method":"squash"}']                   
 POST   $BROKER/$R/prs/N/comments   -d '{"body":"..."}'                          # 204
 POST   $BROKER/$R/prs/N/reviews    -d '{"event":"APPROVE","body":"..."}'        # 204
 GET    $BROKER/$R/checks/<ref>                                                   # 200
+GET    $BROKER/$R/checks/log?ref=<ref>&check_name=<name>                        # 200 (opt-in; 501 if disabled)
 # Issues (opt-in: 501 per-op if no issue_upstream is configured)
 POST   $BROKER/$R/issues                       -d '{"title","body"}'            # 201
 GET    $BROKER/$R/issues?state=open                                              # 200 (PRs filtered out)
