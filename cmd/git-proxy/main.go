@@ -346,10 +346,12 @@ func run(configPath string) error {
 			brokerAudit = auditSink
 		}
 		br, err := broker.New(brokerLn, up, issueUp, cfg.Repos, auth, brokerAudit, broker.Config{
-			Listen:        cfg.Broker.Listen,
-			AllowedAgents: cfg.Broker.AllowedAgents,
-			AllowedOps:    cfg.Broker.AllowedOps,
-			MergeMethod:   cfg.Broker.MergeMethod,
+			Listen:           cfg.Broker.Listen,
+			AllowedAgents:    cfg.Broker.AllowedAgents,
+			AllowedOps:       cfg.Broker.AllowedOps,
+			MergeMethod:      cfg.Broker.MergeMethod,
+			AllowCheckLogs:   cfg.Broker.AllowCheckLogs,
+			MaxCheckLogBytes: cfg.Broker.MaxCheckLogBytes,
 		})
 		if err != nil {
 			// Fail closed: the broker requires an SCM adapter. Return rather

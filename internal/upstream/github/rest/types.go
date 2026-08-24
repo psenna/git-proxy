@@ -79,9 +79,15 @@ type commentRequest struct {
 
 // CheckRun is a single GitHub check run (e.g. a CI job from the Checks API).
 type CheckRun struct {
+	ID         int64  `json:"id"`
 	Name       string `json:"name"`
 	Status     string `json:"status"`     // queued | in_progress | completed
 	Conclusion string `json:"conclusion"` // success | failure | neutral | cancelled | skipped | timed_out | "" (when not completed)
+	// DetailsURL is GitHub's "details_url" field. For a GitHub-Actions-backed
+	// check run it is shaped https://<host>/{owner}/{repo}/actions/runs/{run_id}/job/{job_id};
+	// third-party check apps publish their own arbitrary URL here.
+	// parseJobIDFromDetailsURL (checklog.go) extracts run_id/job_id from it.
+	DetailsURL string `json:"details_url"`
 }
 
 // checkRunsResponse is the paginated /commits/{ref}/check-runs envelope.
@@ -146,12 +152,12 @@ type issueLabel struct {
 // PRs (GitHub models every PR as an issue): when present and non-null the entry
 // is a PR, not an issue, so ListIssues filters it out.
 type issuePayload struct {
-	Number      int            `json:"number"`
-	Title       string         `json:"title"`
-	State       string         `json:"state"`
-	Body        string         `json:"body"`
-	HTMLURL     string         `json:"html_url"`
-	Labels      []issueLabel   `json:"labels"`
+	Number      int             `json:"number"`
+	Title       string          `json:"title"`
+	State       string          `json:"state"`
+	Body        string          `json:"body"`
+	HTMLURL     string          `json:"html_url"`
+	Labels      []issueLabel    `json:"labels"`
 	PullRequest json.RawMessage `json:"pull_request"`
 }
 
@@ -159,7 +165,7 @@ type issuePayload struct {
 func (p issuePayload) toIssue() Issue {
 	return Issue{
 		Number: p.Number,
-		URL:   p.HTMLURL,
+		URL:    p.HTMLURL,
 	}
 }
 

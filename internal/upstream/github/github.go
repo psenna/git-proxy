@@ -22,17 +22,22 @@ import (
 	"github.com/psenna/git-proxy/internal/upstream/plain"
 )
 
-// Compile-time checks that the adapter satisfies the core seam and both
+// Compile-time checks that the adapter satisfies the core seam and its
 // optional capability seams. The first is the core seam (port.Upstream); the
-// next two are the optional capability seams (port.PRSupport for PRs / branch
-// protection, port.IssueSupport for the issue tracker) the core never depends
-// on — only type-asserting code does. PRSupport is sourced from the SCM
-// upstream; IssueSupport is the same adapter built separately as the
-// issue_upstream — the broker type-asserts each off its own upstream.
+// rest are optional capability seams (port.PRSupport for PRs / branch
+// protection, port.IssueSupport for the issue tracker, port.CheckLogSupport
+// for CI job log text) the core never depends on — only type-asserting code
+// does. PRSupport and CheckLogSupport are sourced from the SAME SCM upstream
+// (the broker gates CheckLogSupport further behind an explicit opt-in, since
+// the type-assert alone always succeeds for a GitHub adapter — see
+// port.CheckLogSupport's doc comment); IssueSupport is the same adapter built
+// separately as the issue_upstream — the broker type-asserts each off its own
+// upstream.
 var (
-	_ port.Upstream   = (*Adapter)(nil)
-	_ port.PRSupport  = (*Adapter)(nil)
-	_ port.IssueSupport = (*Adapter)(nil)
+	_ port.Upstream        = (*Adapter)(nil)
+	_ port.PRSupport       = (*Adapter)(nil)
+	_ port.IssueSupport    = (*Adapter)(nil)
+	_ port.CheckLogSupport = (*Adapter)(nil)
 )
 
 // Adapter is the GitHub SCM adapter. It embeds a plain HTTP upstream for the
@@ -197,6 +202,25 @@ func (a *Adapter) Checks(ctx context.Context, repo, ref string) (port.CheckSumma
 		return port.CheckSummary{}, err
 	}
 	return toCheckSummary(s), nil
+}
+
+// CheckLog returns the (tail-truncated at maxBytes) raw log text for the
+// Actions job backing checkName on ref. GitHub REST:
+// GET /repos/{owner}/{repo}/commits/{ref}/check-runs (to resolve checkName to
+// a job) followed by GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs.
+// port.ErrNotFound covers both "no check-run named checkName" and "checkName
+// is not backed by a fetchable Actions job log" (e.g. a third-party check
+// app) — see rest.CheckLogForCheck.
+func (a *Adapter) CheckLog(ctx context.Context, repo, ref, checkName string, maxBytes int64) (port.CheckLog, error) {
+	c, err := a.restClient(repo)
+	if err != nil {
+		return port.CheckLog{}, err
+	}
+	text, truncated, err := c.CheckLogForCheck(ctx, repo, ref, checkName, maxBytes)
+	if err != nil {
+		return port.CheckLog{}, err
+	}
+	return port.CheckLog{Log: text, Truncated: truncated}, nil
 }
 
 // restClient builds a REST client for repo's per-repo token. It fails closed

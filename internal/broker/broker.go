@@ -47,28 +47,43 @@ type Config struct {
 	AllowedAgents []string
 	// AllowedOps optionally restricts which op kinds are permitted. Empty
 	// means all ops are allowed. Values: "pr.create", "pr.get", "pr.list",
-	// "pr.merge", "pr.comment", "pr.review", "ci.status", "issue.create",
-	// "issue.get", "issue.list", "issue.comment", "issue.close",
+	// "pr.merge", "pr.comment", "pr.review", "ci.status", "ci.log",
+	// "issue.create", "issue.get", "issue.list", "issue.comment", "issue.close",
 	// "issue.reopen", "issue.edit", "issue.label.add", "issue.label.remove".
 	AllowedOps []string
 	// MergeMethod is the default GitHub merge method when a merge request does
 	// not specify one. Empty defaults to "merge".
 	MergeMethod string
+	// AllowCheckLogs opts in to the ci.log route. Default false: even when the
+	// SCM upstream implements port.CheckLogSupport, the route 501s until this
+	// is explicitly set (log text can contain sensitive build output).
+	AllowCheckLogs bool
+	// MaxCheckLogBytes bounds a ci.log response's tail-truncation cap.
+	// Zero/absent defaults to 256 KiB (see New).
+	MaxCheckLogBytes int64
 }
 
 // Broker is the agent-facing broker HTTP server. It implements port.Transport
 // so main.go's serveTransports fan-out runs it alongside the git frontends.
 type Broker struct {
-	ln   net.Listener
-	prs  port.PRSupport // type-asserted from the SCM upstream at New (fail-closed)
+	ln  net.Listener
+	prs port.PRSupport // type-asserted from the SCM upstream at New (fail-closed)
 	// issues is the optional issue-tracker capability type-asserted from the
 	// SEPARATELY-configured issue upstream at New. nil when no issue upstream
 	// was passed or it does not implement IssueSupport — issue routes then
 	// return 501 per-op (issues are opt-in/additive; PRSupport is unaffected).
-	issues     port.IssueSupport
-	repos map[string]string // agent-facing repo path → upstream repo key
-	auth      port.Authenticator // agent Bearer authenticator; nil → fail closed
-	auditSink port.AuditSink     // best-effort; nil → no audit
+	issues port.IssueSupport
+	// checkLogs is the optional check-log capability type-asserted from the
+	// SAME scmUp as prs (unlike issues, there is no separate upstream — the
+	// log is always sourced from wherever the check run itself came from).
+	// nil unless cfg.AllowCheckLogs AND scmUp implements port.CheckLogSupport
+	// — the ci.log route then returns 501 per-op (opt-in, additive, mirrors
+	// IssueSupport's non-fatal posture).
+	checkLogs   port.CheckLogSupport
+	maxLogBytes int64
+	repos       map[string]string  // agent-facing repo path → upstream repo key
+	auth        port.Authenticator // agent Bearer authenticator; nil → fail closed
+	auditSink   port.AuditSink     // best-effort; nil → no audit
 
 	mergeMethod   string
 	allowedAgents map[string]bool // empty-set means "all authenticated agents"
@@ -105,7 +120,7 @@ func New(ln net.Listener, scmUp port.Upstream, issueUp port.Upstream, repos map[
 		prs:           prs,
 		repos:         repos,
 		auth:          a,
-		auditSink:      audit,
+		auditSink:     audit,
 		mergeMethod:   mergeMethod,
 		allowedAgents: toSet(cfg.AllowedAgents),
 		allowedOps:    toSet(cfg.AllowedOps),
@@ -118,6 +133,20 @@ func New(ln net.Listener, scmUp port.Upstream, issueUp port.Upstream, repos map[
 		if is, ok := issueUp.(port.IssueSupport); ok {
 			b.issues = is
 		}
+	}
+	// CheckLogSupport: opt-in AND type-assert, off the SAME scmUp that backs
+	// PRSupport (unlike IssueSupport, which comes from a separately-configured
+	// upstream). AllowCheckLogs=true with an adapter that lacks the capability
+	// is not a startup failure — the route just 501s (mirrors IssueSupport's
+	// non-fatal posture, not PRSupport's fatal one).
+	if cfg.AllowCheckLogs {
+		if cls, ok := scmUp.(port.CheckLogSupport); ok {
+			b.checkLogs = cls
+		}
+	}
+	b.maxLogBytes = cfg.MaxCheckLogBytes
+	if b.maxLogBytes <= 0 {
+		b.maxLogBytes = 256 * 1024
 	}
 	mux := b.routes()
 	b.server = &http.Server{Handler: mux}
@@ -142,6 +171,24 @@ func (b *Broker) issuesOK(w http.ResponseWriter, r *http.Request, repo, op strin
 		return agent, nil, false
 	}
 	return agent, b.issues, true
+}
+
+// checkLogsOK guards the ci.log handler. It mirrors issuesOK exactly: authOK
+// gates auth/authz first (so 401/403 always win over a 501), then — when
+// check-logs are configured (opt-in via cfg.AllowCheckLogs AND the SCM
+// upstream implements port.CheckLogSupport) — returns the capability and
+// ok=true. When b.checkLogs is nil it writes a 501 via opFail, audits the
+// deny, and returns ok=false so the handler returns immediately.
+func (b *Broker) checkLogsOK(w http.ResponseWriter, r *http.Request, repo, op string) (auth.AgentIdentity, port.CheckLogSupport, bool) {
+	agent, ok := b.authOK(w, r, repo, op)
+	if !ok {
+		return auth.AgentIdentity{}, nil, false
+	}
+	if b.checkLogs == nil {
+		b.opFail(w, r, agent.Name, repo, op, port.ErrNotImplemented)
+		return agent, nil, false
+	}
+	return agent, b.checkLogs, true
 }
 
 // Serve runs the broker until ctx is canceled, then gracefully shuts down. It
@@ -222,13 +269,13 @@ func (b *Broker) audit(ctx context.Context, agent, repo, op, verdict string, rea
 		return
 	}
 	err := b.auditSink.Record(ctx, port.AuditEvent{
-		Time:     time.Now(),
+		Time:      time.Now(),
 		Transport: "broker",
-		Agent:    agent,
-		Repo:     repo,
-		Service:  op,
-		Verdict:  verdict,
-		Reasons:  reasons,
+		Agent:     agent,
+		Repo:      repo,
+		Service:   op,
+		Verdict:   verdict,
+		Reasons:   reasons,
 	})
 	if err != nil {
 		// Best-effort: log and proceed. The op outcome stands regardless.
