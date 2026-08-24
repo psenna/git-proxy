@@ -147,6 +147,84 @@ func TestEnforceReceivePack_ForcePushDenied(t *testing.T) {
 	}
 }
 
+// TestEnforceReceivePack_MalformedOIDDenied proves the option-injection
+// primitive is closed: a ref-update whose New field looks like a git option
+// rather than a 40-hex object id must never reach a git subprocess argument.
+// Before the fix, this exact shape ("--output=<path>" as New, on a create
+// update) caused `git log --format=... --output=<path> --not --all` inside
+// NewCommitMessages to write attacker-influenced content to an arbitrary
+// filesystem path, as the proxy's own process, before any allow/deny decision
+// was reached.
+func TestEnforceReceivePack_MalformedOIDDenied(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, tips := enforceSourceRepo(t, 1)
+	m := enforceMirror(t, source, nil)
+	_ = tips
+
+	eng := enforceEngine(t, map[string]map[string]any{
+		"branch_pattern": {"allow": []string{"refs/heads/**"}},
+	})
+
+	target := filepath.Join(t.TempDir(), "pwned")
+	malicious := "--output=" + target
+
+	req, _ := buildReceivePackRequest(t, [][3]string{{
+		"0000000000000000000000000000000000000000", // create
+		malicious,
+		"refs/heads/feat/evil",
+	}}, nil)
+
+	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git")
+	if err == nil {
+		t.Fatal("EnforceReceivePack: want a non-nil inspection error for a malformed New OID, got nil " +
+			"(a nil error here would let dry-run mode forward this push — see EnforceReceivePack's dry-run comment)")
+	}
+	if dec.Verdict != port.VerdictDeny {
+		t.Fatalf("verdict = %v, want Deny", dec.Verdict)
+	}
+	if !reasonMentions(dec, "malformed object id") {
+		t.Fatalf("deny reasons = %v, want a malformed-object-id reason", dec.Reasons)
+	}
+	if _, statErr := os.Stat(target); statErr == nil {
+		t.Fatalf("option-injection succeeded: %s was created by the malicious New field", target)
+	}
+}
+
+// TestEnforceReceivePack_MalformedOIDDenied_OldField is the same primitive via
+// the Old field of an update (not create/delete), which takes the ancestry-walk
+// path in the old code rather than the create/delete path.
+func TestEnforceReceivePack_MalformedOIDDenied_OldField(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source, tips := enforceSourceRepo(t, 1)
+	A := tips[0]
+	pack := packObjects(t, source, A)
+	m := enforceMirror(t, source, pack)
+
+	eng := enforceEngine(t, map[string]map[string]any{
+		"branch_pattern": {"allow": []string{"refs/heads/**"}},
+	})
+
+	target := filepath.Join(t.TempDir(), "pwned-old")
+	malicious := "--output=" + target
+
+	req, _ := buildReceivePackRequest(t, [][3]string{{malicious, A, "refs/heads/main"}}, pack)
+
+	dec, err := gitproto.EnforceReceivePack(ctx, req, m, eng, "agent-1", "repo.git")
+	if err == nil {
+		t.Fatal("EnforceReceivePack: want a non-nil inspection error for a malformed Old OID, got nil")
+	}
+	if dec.Verdict != port.VerdictDeny {
+		t.Fatalf("verdict = %v, want Deny", dec.Verdict)
+	}
+	if _, statErr := os.Stat(target); statErr == nil {
+		t.Fatalf("option-injection succeeded: %s was created by the malicious Old field", target)
+	}
+}
+
 // TestEnforceReceivePack_FastForwardAllowed sets up a fast-forward update to a
 // feat/* ref and asserts the engine allows it (Force=false).
 func TestEnforceReceivePack_FastForwardAllowed(t *testing.T) {
