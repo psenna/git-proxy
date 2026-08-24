@@ -2,6 +2,8 @@ package gitproto
 
 import (
 	"bytes"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/psenna/git-proxy/internal/gitproto/pktline"
@@ -39,5 +41,51 @@ func TestWriteUploadPackErr_EncodesERRPktLine(t *testing.T) {
 	// Exactly one pkt-line, nothing else (no packfile, no NAK, no flush).
 	if s.Scan() {
 		t.Errorf("unexpected second pkt-line after ERR: marker=%v bytes=%q", s.Marker(), s.Bytes())
+	}
+}
+
+// failFirstWriter fails its first Write call and succeeds thereafter. With a
+// non-empty pack and no shallow lines, the very first byte writeV0UploadPackResponse
+// sends to w is the "NAK\n" pkt-line encode — nothing else precedes it in that
+// path — so failing the first write deterministically exercises the NAK-encode
+// error branch regardless of how the pktline encoder internally chunks its
+// output into underlying Write calls.
+type failFirstWriter struct {
+	failed bool
+}
+
+func (w *failFirstWriter) Write(p []byte) (int, error) {
+	if !w.failed {
+		w.failed = true
+		return 0, errors.New("simulated first-write failure (NAK encode)")
+	}
+	return len(p), nil
+}
+
+// TestWriteV0UploadPackResponse_PackWaitCalledOnNAKEncodeFailure is the
+// security review H8 regression guard: EVERY error return in
+// writeV0UploadPackResponse must call packWait() before returning, because
+// packWait() is what unblocks the pack-objects producer goroutine (which
+// holds the mirror's per-repo mutex until it exits). One return path — the
+// NAK-encode failure in the non-empty-pack branch — was missing this call: a
+// client that opens a read-protected fetch and drops the connection right as
+// the NAK write fails would leave the producer goroutine blocked forever,
+// the mutex held forever, and every subsequent fetch/push to that repo
+// deadlocked permanently.
+func TestWriteV0UploadPackResponse_PackWaitCalledOnNAKEncodeFailure(t *testing.T) {
+	pack := strings.NewReader("fake-pack-bytes-nonempty") // n > 0, shorter than the 4096 head-read
+	waitCalled := 0
+	packWait := func() error {
+		waitCalled++
+		return nil
+	}
+	w := &failFirstWriter{}
+
+	err := writeV0UploadPackResponse(w, pack, packWait, nil, nil)
+	if err == nil {
+		t.Fatal("writeV0UploadPackResponse: want an error from the simulated NAK-encode failure, got nil")
+	}
+	if waitCalled != 1 {
+		t.Errorf("packWait called %d times, want exactly 1 — a missed call here is a permanent per-repo deadlock (finding H8)", waitCalled)
 	}
 }

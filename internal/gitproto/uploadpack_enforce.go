@@ -520,6 +520,17 @@ func writeV0UploadPackResponse(w io.Writer, pack io.Reader, packWait func() erro
 	// MaxPackedSize64k (or MaxPackedSize) frames internally, so memory stays
 	// bounded by io.Copy's 32 KiB buffer + one muxer frame.
 	if err := e.EncodeString("NAK\n"); err != nil {
+		// Security review finding H8: every OTHER error return in this
+		// function calls packWait() before returning; this one did not.
+		// packWait() closes the pack-objects producer's pipe reader, which is
+		// what unblocks the producer goroutine — that goroutine holds the
+		// mirror's per-repo mutex until it returns. Without this call, an
+		// agent that opens a read-protected fetch and then simply drops the
+		// connection right after the NAK-encode write fails (e.g. mid-write
+		// TCP reset) leaves the producer blocked forever, the mutex held
+		// forever, and every subsequent fetch/push to that repo deadlocks
+		// permanently — recoverable only by restarting the proxy.
+		_ = packWait()
 		return fmt.Errorf("gitproto: encode NAK: %w", err)
 	}
 	switch uploadPackSidebandType(caps) {
