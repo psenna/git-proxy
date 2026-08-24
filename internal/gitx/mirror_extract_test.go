@@ -186,15 +186,25 @@ func TestMirrorExtract_CreateRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChangedFiles: %v", err)
 	}
-	// Create diff against empty tree lists every file in T's tree as added:
-	// a.txt, b.txt (from A,B), topic.txt.
+	// Security review finding H5 changed this expectation deliberately:
+	// ChangedFiles now reports only genuinely NEW commits' diffs (same
+	// "--not --all" set NewCommits/NewCommitMessages already compute), not
+	// every file in the created ref's full resulting tree. file0.txt/file1.txt
+	// belong to commits A and B, which are already reachable from the
+	// existing `main` ref (and were already inspected when THEY were
+	// originally pushed) — re-reporting them just because a new ref now also
+	// points at that history would be redundant, not a security gap. Only
+	// topic.txt (T's own diff against its parent B) is new.
 	got := map[string]string{}
 	for _, f := range files {
 		got[f.Path] = f.Status
 	}
-	for _, p := range []string{"file0.txt", "file1.txt", "topic.txt"} {
-		if got[p] != "A" {
-			t.Errorf("ChangedFiles[%q] = %q, want A (got all: %+v)", p, got[p], got)
+	if got["topic.txt"] != "A" {
+		t.Errorf("ChangedFiles[topic.txt] = %q, want A (got all: %+v)", got["topic.txt"], got)
+	}
+	for _, p := range []string{"file0.txt", "file1.txt"} {
+		if _, ok := got[p]; ok {
+			t.Errorf("ChangedFiles unexpectedly includes %q (status %q) — it belongs to an already-known commit, not a new one; got all: %+v", p, got[p], got)
 		}
 	}
 }
@@ -235,6 +245,136 @@ func TestMirrorExtract_DeleteOnlyNoChangedFiles(t *testing.T) {
 	}
 	if len(files) != 0 {
 		t.Fatalf("ChangedFiles on delete = %+v, want empty", files)
+	}
+}
+
+// TestMirrorExtract_ChangedFiles_AddThenDeleteInSamePush is the security
+// review H5 regression guard: a push introducing two commits, one adding a
+// file and the very next deleting it, must report the file via ChangedFiles
+// — the previous "net diff between the push's two endpoints" implementation
+// reported NOTHING here (added-then-removed nets to no change), letting
+// secret_scan and path_acl both silently allow content that a rule would
+// otherwise have caught, permanently in the upstream's object store.
+func TestMirrorExtract_ChangedFiles_AddThenDeleteInSamePush(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	tips := makeSourceRepo(t, source, 1) // existing tip A
+	A := tips[0]
+
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	makeBareUpstream(t, bare, source)
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := m.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	work := t.TempDir()
+	mustGit(t, "", "clone", "-q", "file://"+bare, work)
+	mustGit(t, work, "config", "user.email", "test@example.com")
+	mustGit(t, work, "config", "user.name", "Test")
+	writeFile(t, work, "secret.txt", "TOP-SECRET\n")
+	mustGit(t, work, "add", "secret.txt")
+	mustGit(t, work, "commit", "-q", "-m", "add secret")
+	if err := os.Remove(filepath.Join(work, "secret.txt")); err != nil {
+		t.Fatalf("remove secret.txt: %v", err)
+	}
+	mustGit(t, work, "add", "secret.txt")
+	mustGit(t, work, "commit", "-q", "-m", "remove secret")
+	Y := revParseHead(t, work)
+
+	pack := makePackfileReachable(t, work, Y)
+	if err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
+		t.Fatalf("IngestPackfile: %v", err)
+	}
+
+	updates := []port.RefUpdate{{Ref: "refs/heads/main", Old: A, New: Y}}
+
+	// The net old..new diff is empty (this is what made the old
+	// implementation blind to the add-then-delete): confirm that directly
+	// against real git, so this test documents the exact gap being closed.
+	netDiff := exec.Command("git", "-C", m.Dir(), "diff", "--raw", "--no-renames", A, Y)
+	netOut, err := netDiff.Output()
+	if err != nil {
+		t.Fatalf("git diff --raw %s %s: %v", A, Y, err)
+	}
+	if len(strings.TrimSpace(string(netOut))) != 0 {
+		t.Fatalf("setup: expected an EMPTY net diff %s..%s (that's the point of this test), got: %s", A, Y, netOut)
+	}
+
+	files, err := m.ChangedFiles(ctx, updates)
+	if err != nil {
+		t.Fatalf("ChangedFiles: %v", err)
+	}
+	var sawAdd, sawDelete bool
+	for _, f := range files {
+		if f.Path != "secret.txt" {
+			continue
+		}
+		switch f.Status {
+		case "A":
+			sawAdd = true
+			if f.BlobOID == "" {
+				t.Error("secret.txt add entry has empty BlobOID")
+			}
+		case "D":
+			sawDelete = true
+		}
+	}
+	if !sawAdd {
+		t.Errorf("ChangedFiles = %+v, want an A(dd) entry for secret.txt (from the commit that introduced it)", files)
+	}
+	if !sawDelete {
+		t.Errorf("ChangedFiles = %+v, want a D(elete) entry for secret.txt (from the commit that removed it)", files)
+	}
+}
+
+// TestMirrorExtract_ChangedFiles_RootCommit verifies ChangedFiles handles a
+// brand-new root commit (no parent) correctly via diff-tree's --root flag —
+// its files must be reported as Added, diffed against the empty tree.
+func TestMirrorExtract_ChangedFiles_RootCommit(t *testing.T) {
+	gitBinary(t)
+	ctx := context.Background()
+
+	source := t.TempDir()
+	mustGit(t, "", "init", "-q", "-b", "main", source)
+	mustGit(t, source, "config", "user.email", "test@example.com")
+	mustGit(t, source, "config", "user.name", "Test")
+	writeFile(t, source, "root.txt", "first commit ever\n")
+	mustGit(t, source, "add", "root.txt")
+	mustGit(t, source, "commit", "-q", "-m", "root commit")
+	root := revParseHead(t, source)
+
+	bareRoot := t.TempDir()
+	bare := filepath.Join(bareRoot, "up.git")
+	mustGit(t, "", "init", "--bare", "-q", "-b", "main", bare)
+	// Do NOT push yet — the mirror opens against an EMPTY bare repo, so root
+	// is genuinely new (no pre-existing ref to be an "old" endpoint).
+	m, err := gitx.Open(ctx, "file://"+bareRoot, "up.git", t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := m.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	pack := makePackfileReachable(t, source, root)
+	if err := m.IngestPackfile(ctx, bytes.NewReader(pack)); err != nil {
+		t.Fatalf("IngestPackfile: %v", err)
+	}
+
+	updates := []port.RefUpdate{{Ref: "refs/heads/main", Old: "", New: root}}
+	files, err := m.ChangedFiles(ctx, updates)
+	if err != nil {
+		t.Fatalf("ChangedFiles: %v", err)
+	}
+	if len(files) != 1 || files[0].Path != "root.txt" || files[0].Status != "A" {
+		t.Fatalf("ChangedFiles = %+v, want exactly one Added root.txt entry", files)
 	}
 }
 
