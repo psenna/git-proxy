@@ -72,14 +72,20 @@ jobs:
         with:
           version: v3.16.4
 
-      - name: assert Chart.yaml appVersion matches the release tag
+      # appVersion is NOT asserted against the release tag: it is stamped from the
+      # tag at package time (see "package chart" below), so a mismatch is
+      # impossible and there is nothing to hand-maintain before cutting a
+      # release. A stale value in Chart.yaml still matters for anyone running
+      # helm install straight from a git checkout -- image.tag defaults to
+      # .Chart.AppVersion -- so surface drift as a notice, never as a failure.
+      - name: notice if Chart.yaml appVersion has drifted from the release tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           set -eu
-          want="${{ github.event.release.tag_name }}"
-          got="$(helm show chart deploy/helm/git-proxy | awk -F': ' '/^appVersion:/ {print $2}')"
-          if [ "$got" != "$want" ]; then
-            echo "Chart.yaml appVersion ('$got') does not match the release tag ('$want') — bump deploy/helm/git-proxy/Chart.yaml's appVersion before releasing."
-            exit 1
+          stored="$(helm show chart deploy/helm/git-proxy | awk -F': ' '/^appVersion:/ {print $2}')"
+          if [ "$stored" != "$TAG" ]; then
+            echo "::notice::Chart.yaml appVersion is '$stored' but this release is '$TAG'. The published chart is stamped with '$TAG', so this release is correct. Bump deploy/helm/git-proxy/Chart.yaml's appVersion when convenient so a helm install from a checkout defaults to a current image."
           fi
 
       - name: log in to GHCR (helm)
@@ -94,8 +100,14 @@ jobs:
             exit 1
           fi
 
+      # --app-version stamps the release tag into the packaged chart's appVersion,
+      # overriding whatever Chart.yaml holds. This is what makes the release
+      # self-consistent without a manual bump. The .tgz filename is derived from
+      # the chart version, not appVersion, so the push glob below is unaffected.
       - name: package chart
-        run: helm package deploy/helm/git-proxy -d dist
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: helm package deploy/helm/git-proxy -d dist --app-version "$TAG"
 
       - name: push chart
         run: helm push dist/git-proxy-*.tgz "oci://ghcr.io/${{ github.repository_owner }}/charts"
