@@ -2,8 +2,8 @@ apiVersion: v2
 name: git-proxy
 description: Policy-enforcing gateway between AI coding agents and upstream Git repositories
 type: application
-version: 0.1.2
-appVersion: "v0.0.8"
+version: 0.1.3
+appVersion: "v0.0.10"
 home: https://github.com/psenna/git-proxy
 sources: [https://github.com/psenna/git-proxy]
 keywords: [git, proxy, policy, security, ai-agents]
