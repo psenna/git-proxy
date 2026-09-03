@@ -191,6 +191,18 @@ workflow runs alone — `checks` is then empty and `overall` reflects only the
 `workflows` entries. Treat a `true` here as "check-run detail was withheld, not
 absent": the Actions verdict is still honest, but a non-Actions check (a
 third-party status) would not be counted. It is always present (never omitted).
+This fallback is **transparent** — no flag, same call; the proxy tries the Checks
+API, catches the `403`, and switches to Actions on its own (older git-proxy
+returned a hard `403 upstream denied`). If the credential can read *neither* API
+the route still `403`s. The startup **preflight** (config `preflight.enabled`,
+default on) logs a `WARNING` at boot for any credential profile whose token is
+missing a permission an enabled op needs.
+
+**Pass a real commit SHA, not a branch name or a PR merge-commit, when
+`checks_unavailable` may be `true`.** The Actions fallback keys runs by
+`head_sha`, so a branch ref or the synthetic `refs/pull/N/merge` SHA yields
+`overall: "none"` with an empty `workflows` even when CI ran. Resolve the branch
+tip first — `git rev-parse`, or `git ls-remote "$GIT_PROXY_URL/<owner>/<repo>.git" <branch>`.
 
 > **CI logs are opt-in.** `checks/log` is sourced from the SAME upstream as
 > `checks/<ref>`, but is gated behind its own deployment-level toggle
