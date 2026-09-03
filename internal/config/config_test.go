@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 const validYAML = `
@@ -26,6 +27,89 @@ func TestParseValid(t *testing.T) {
 	}
 	if got := c.Repos["team/repo.git"]; got != "internal/repo.git" {
 		t.Errorf("repo map = %q", got)
+	}
+}
+
+func TestParsePreflightDefaults(t *testing.T) {
+	c, err := Parse([]byte(validYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !c.Preflight.EnabledOrDefault() {
+		t.Error("preflight disabled by default, want enabled")
+	}
+	if c.Preflight.TimeoutOrDefault() != 30*time.Second {
+		t.Errorf("TimeoutOrDefault = %v, want 30s", c.Preflight.TimeoutOrDefault())
+	}
+	if c.Preflight.ProbeTimeoutOrDefault() != 3*time.Second {
+		t.Errorf("ProbeTimeoutOrDefault = %v, want 3s", c.Preflight.ProbeTimeoutOrDefault())
+	}
+	if c.Preflight.MaxReposOrDefault() != 20 {
+		t.Errorf("MaxReposOrDefault = %d, want 20", c.Preflight.MaxReposOrDefault())
+	}
+	if c.Preflight.ConcurrencyOrDefault() != 4 {
+		t.Errorf("ConcurrencyOrDefault = %d, want 4", c.Preflight.ConcurrencyOrDefault())
+	}
+}
+
+func TestParsePreflightDisabled(t *testing.T) {
+	c, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+preflight:
+  enabled: false
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Preflight.EnabledOrDefault() {
+		t.Error("preflight enabled, want disabled")
+	}
+}
+
+func TestParsePreflightExplicitValues(t *testing.T) {
+	c, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+preflight:
+  enabled: true
+  timeout_seconds: 45
+  probe_timeout_seconds: 5
+  max_repos_per_profile: 8
+  concurrency: 2
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !c.Preflight.EnabledOrDefault() {
+		t.Error("want enabled")
+	}
+	if c.Preflight.TimeoutOrDefault() != 45*time.Second {
+		t.Errorf("timeout = %v", c.Preflight.TimeoutOrDefault())
+	}
+	if c.Preflight.ProbeTimeoutOrDefault() != 5*time.Second {
+		t.Errorf("probe timeout = %v", c.Preflight.ProbeTimeoutOrDefault())
+	}
+	if c.Preflight.MaxReposOrDefault() != 8 {
+		t.Errorf("max repos = %d", c.Preflight.MaxReposOrDefault())
+	}
+	if c.Preflight.ConcurrencyOrDefault() != 2 {
+		t.Errorf("concurrency = %d", c.Preflight.ConcurrencyOrDefault())
+	}
+}
+
+func TestParsePreflightNegativeRejected(t *testing.T) {
+	_, err := Parse([]byte(`
+listen: "127.0.0.1:8080"
+upstream:
+  url: "http://git.example.com"
+preflight:
+  concurrency: -1
+`))
+	if err == nil || !strings.Contains(err.Error(), "preflight") {
+		t.Fatalf("expected preflight negative error, got %v", err)
 	}
 }
 
