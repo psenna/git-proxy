@@ -231,6 +231,72 @@ type emptyVault struct{}
 
 func (emptyVault) CredentialsFor(repo string) (port.Credentials, bool) { return port.Credentials{}, false }
 
+// TestChecks_DegradedMapsChecksUnavailable drives Adapter.Checks end-to-end
+// when the Checks API leg 403s: the adapter must fall back to Actions and map
+// rest.CheckSummary.ChecksUnavailable through to port.CheckSummary (issue #95).
+func TestChecks_DegradedMapsChecksUnavailable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v3/repos/owner/repo/commits/abc/check-runs":
+			w.WriteHeader(http.StatusForbidden)
+		case "/api/v3/repos/owner/repo/actions/runs":
+			_, _ = w.Write([]byte(`{"workflow_runs":[{"id":1,"name":"CI","status":"completed","conclusion":"success"}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	adapter := New(upstream.UpstreamConfig{Kind: "github", URL: srv.URL, CredentialsStore: fakeVault{token: "ghp_test"}})
+	var prs port.PRSupport = adapter
+	summary, err := prs.Checks(context.Background(), "owner/repo.git", "abc")
+	if err != nil {
+		t.Fatalf("Checks: %v", err)
+	}
+	if !summary.ChecksUnavailable {
+		t.Error("ChecksUnavailable = false, want true")
+	}
+	if summary.Overall != "success" {
+		t.Errorf("Overall = %q, want success (Actions-only roll-up)", summary.Overall)
+	}
+}
+
+// TestCheckLog_DegradedResolvesViaActions drives Adapter.CheckLog end-to-end
+// when the Checks API leg 403s: the check name is resolved against Actions job
+// names and the job log is returned (issue #95).
+func TestCheckLog_DegradedResolvesViaActions(t *testing.T) {
+	signed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			t.Errorf("signed URL got Authorization %q", r.Header.Get("Authorization"))
+		}
+		_, _ = io.WriteString(w, "degraded log text")
+	}))
+	defer signed.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v3/repos/owner/repo/commits/abc/check-runs":
+			w.WriteHeader(http.StatusForbidden)
+		case "/api/v3/repos/owner/repo/actions/runs":
+			_, _ = w.Write([]byte(`{"workflow_runs":[{"id":7}]}`))
+		case "/api/v3/repos/owner/repo/actions/runs/7/jobs":
+			_, _ = w.Write([]byte(`{"jobs":[{"id":77,"name":"kind e2e"}]}`))
+		case "/api/v3/repos/owner/repo/actions/jobs/77/logs":
+			http.Redirect(w, r, signed.URL, http.StatusFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	adapter := New(upstream.UpstreamConfig{Kind: "github", URL: srv.URL, CredentialsStore: fakeVault{token: "ghp_test"}})
+	var cls port.CheckLogSupport = adapter
+	out, err := cls.CheckLog(context.Background(), "owner/repo.git", "abc", "kind e2e", 4096)
+	if err != nil {
+		t.Fatalf("CheckLog: %v", err)
+	}
+	if out.Log != "degraded log text" {
+		t.Errorf("Log = %q", out.Log)
+	}
+}
+
 // TestBuild_GitHubReturnsIssueSupport asserts Build with Kind "github" returns
 // a port.Upstream that ALSO satisfies port.IssueSupport — proving the GitHub
 // adapter implements the issue seam, so it can be built separately as the

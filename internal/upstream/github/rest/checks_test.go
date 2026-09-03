@@ -173,4 +173,175 @@ func TestSummary_HTTP(t *testing.T) {
 	if len(summary.Checks) != 1 || len(summary.Workflows) != 1 {
 		t.Errorf("bundle = %+v", summary)
 	}
+	if summary.ChecksUnavailable {
+		t.Errorf("ChecksUnavailable = true, want false (Checks leg succeeded)")
+	}
+}
+
+// checksMux builds a test server whose check-runs handler returns checksStatus
+// (with optional headers) and whose actions/runs handler returns actionsBody
+// with actionsStatus. A zero status means 200. It records whether the actions
+// handler was hit.
+type checksScenario struct {
+	checksStatus  int
+	checksHeaders map[string]string
+	actionsStatus int
+	actionsBody   string
+}
+
+func newChecksServer(t *testing.T, sc checksScenario) (*Client, *bool) {
+	t.Helper()
+	actionsHit := new(bool)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/commits/abc/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		for k, v := range sc.checksHeaders {
+			w.Header().Set(k, v)
+		}
+		st := sc.checksStatus
+		if st == 0 {
+			st = http.StatusOK
+		}
+		w.WriteHeader(st)
+		if st == http.StatusOK {
+			_, _ = w.Write([]byte(`{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}`))
+		}
+	})
+	mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, _ *http.Request) {
+		*actionsHit = true
+		st := sc.actionsStatus
+		if st == 0 {
+			st = http.StatusOK
+		}
+		w.WriteHeader(st)
+		body := sc.actionsBody
+		if st == http.StatusOK && body == "" {
+			body = `{"workflow_runs":[]}`
+		}
+		_, _ = w.Write([]byte(body))
+	})
+	s := httptest.NewServer(mux)
+	t.Cleanup(s.Close)
+	return New(s.URL, "tok"), actionsHit
+}
+
+func TestSummary_ChecksForbiddenFallsBackToWorkflows(t *testing.T) {
+	c, actionsHit := newChecksServer(t, checksScenario{
+		checksStatus: http.StatusForbidden,
+		actionsBody:  `{"workflow_runs":[{"name":"build","status":"completed","conclusion":"failure"}]}`,
+	})
+	summary, err := c.Summary(context.Background(), "o/r.git", "abc")
+	if err != nil {
+		t.Fatalf("Summary: %v", err)
+	}
+	if !*actionsHit {
+		t.Error("actions/runs was not hit — fallback did not fire")
+	}
+	if summary.Overall != StateFailure {
+		t.Errorf("Overall = %q, want failure (workflow-only roll-up)", summary.Overall)
+	}
+	if !summary.ChecksUnavailable {
+		t.Error("ChecksUnavailable = false, want true")
+	}
+	if len(summary.Checks) != 0 {
+		t.Errorf("Checks = %+v, want empty", summary.Checks)
+	}
+}
+
+func TestSummary_ChecksForbiddenWorkflowsEmpty(t *testing.T) {
+	c, _ := newChecksServer(t, checksScenario{checksStatus: http.StatusForbidden})
+	summary, err := c.Summary(context.Background(), "o/r.git", "abc")
+	if err != nil {
+		t.Fatalf("Summary: %v", err)
+	}
+	if summary.Overall != StateNone {
+		t.Errorf("Overall = %q, want none", summary.Overall)
+	}
+	if !summary.ChecksUnavailable {
+		t.Error("ChecksUnavailable = false, want true (checks were withheld even though no Actions runs)")
+	}
+}
+
+func TestSummary_BothForbidden(t *testing.T) {
+	c, _ := newChecksServer(t, checksScenario{
+		checksStatus:  http.StatusForbidden,
+		actionsStatus: http.StatusForbidden,
+	})
+	summary, err := c.Summary(context.Background(), "o/r.git", "abc")
+	if !errors.Is(err, port.ErrForbidden) {
+		t.Fatalf("err = %v, want ErrForbidden", err)
+	}
+	if summary.Overall != "" || summary.ChecksUnavailable {
+		t.Errorf("summary = %+v, want zero value", summary)
+	}
+}
+
+func TestSummary_ChecksUnauthorizedPropagates(t *testing.T) {
+	c, actionsHit := newChecksServer(t, checksScenario{checksStatus: http.StatusUnauthorized})
+	if _, err := c.Summary(context.Background(), "o/r.git", "abc"); !errors.Is(err, port.ErrUnauthorized) {
+		t.Fatalf("err = %v, want ErrUnauthorized", err)
+	}
+	if *actionsHit {
+		t.Error("actions/runs was hit — a 401 must not trigger the fallback")
+	}
+}
+
+func TestSummary_ChecksRateLimitedNoFallback(t *testing.T) {
+	c, actionsHit := newChecksServer(t, checksScenario{
+		checksStatus:  http.StatusForbidden,
+		checksHeaders: map[string]string{"X-RateLimit-Remaining": "0"},
+	})
+	_, err := c.Summary(context.Background(), "o/r.git", "abc")
+	if !errors.Is(err, port.ErrRateLimited) {
+		t.Fatalf("err = %v, want ErrRateLimited", err)
+	}
+	if errors.Is(err, port.ErrForbidden) {
+		t.Error("a rate-limit-shaped 403 must not satisfy errors.Is(ErrForbidden)")
+	}
+	if *actionsHit {
+		t.Error("actions/runs was hit — a rate-limited 403 must not trigger the fallback")
+	}
+}
+
+func TestSummary_ChecksForbiddenWorkflowsRateLimited(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/commits/abc/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "42")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	s := httptest.NewServer(mux)
+	defer s.Close()
+	c := New(s.URL, "tok")
+	_, err := c.Summary(context.Background(), "o/r.git", "abc")
+	if !errors.Is(err, port.ErrRateLimited) {
+		t.Fatalf("err = %v, want ErrRateLimited", err)
+	}
+	var rle *port.RateLimitedError
+	if !errors.As(err, &rle) || rle.RetryAfter != "42" {
+		t.Errorf("RetryAfter not preserved through the fallback: %+v", rle)
+	}
+}
+
+func TestForbiddenFallbackErr(t *testing.T) {
+	rle := &port.RateLimitedError{RetryAfter: "9"}
+	cases := []struct {
+		name        string
+		checksErr   error
+		fallbackErr error
+		want        error
+	}{
+		{"both plain forbidden -> original checks err", port.ErrForbidden, port.ErrForbidden, port.ErrForbidden},
+		{"fallback rate limited -> fallback err", port.ErrForbidden, rle, rle},
+		{"fallback upstream 5xx -> fallback err", port.ErrForbidden, port.ErrUpstream, port.ErrUpstream},
+		{"fallback not found -> fallback err", port.ErrForbidden, port.ErrNotFound, port.ErrNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := forbiddenFallbackErr(tc.checksErr, tc.fallbackErr); !errors.Is(got, tc.want) {
+				t.Errorf("forbiddenFallbackErr = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

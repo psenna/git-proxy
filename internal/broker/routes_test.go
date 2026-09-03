@@ -241,6 +241,42 @@ func TestChecks_HappyPath(t *testing.T) {
 	if !strings.Contains(string(b), `"overall":"success"`) {
 		t.Errorf("body = %s", b)
 	}
+	if !strings.Contains(string(b), `"checks_unavailable":false`) {
+		t.Errorf("body = %s, want checks_unavailable:false present (stable schema)", b)
+	}
+}
+
+// TestChecks_DegradedSummarySerializes: a summary rolled up from Actions alone
+// (Checks API 403) serializes with checks_unavailable:true (issue #95).
+func TestChecks_DegradedSummarySerializes(t *testing.T) {
+	up := &capturingPRSupport{summary: port.CheckSummary{Overall: "failure", ChecksUnavailable: true}}
+	_, srv := newTestBroker(t, up, Config{})
+	resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/checks/abc", "agent-token-1", nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), `"checks_unavailable":true`) {
+		t.Errorf("body = %s, want checks_unavailable:true", b)
+	}
+}
+
+// TestChecks_UpstreamForbiddenStill403: when the adapter returns ErrForbidden
+// (both Checks and Actions legs denied), the broker still answers 403
+// "upstream denied" — no regression from the fallback.
+func TestChecks_UpstreamForbiddenStill403(t *testing.T) {
+	up := &capturingPRSupport{prErr: port.ErrForbidden}
+	_, srv := newTestBroker(t, up, Config{})
+	resp := do(t, srv, http.MethodGet, "/owner%2Frepo.git/checks/abc", "agent-token-1", nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), `"error":"upstream denied"`) {
+		t.Errorf("body = %s", b)
+	}
 }
 
 func TestCheckLog_HappyPath(t *testing.T) {
