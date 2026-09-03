@@ -2,6 +2,7 @@ package rest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -163,13 +164,84 @@ func (c *Client) JobLog(ctx context.Context, repo string, jobID int64, maxBytes 
 	return tailRead(resp.Body, maxBytes)
 }
 
+// maxLogLookupRuns bounds the Actions-only check-log fallback fan-out: for a
+// ref with a long rerun history the proxy lists jobs for at most this many
+// workflow runs (the freshest first, as GitHub returns them) when resolving
+// checkName without the Checks API. It mirrors maxPages as a hostile-upstream
+// bound.
+const maxLogLookupRuns = 10
+
+// ListRunJobs returns the Actions jobs for workflow run runID on repo. GitHub
+// REST: GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs?per_page=100,
+// following the Link header for pagination (max maxPages). The response is the
+// GitHub envelope {"jobs":[...]}; the slice is extracted page by page.
+func (c *Client) ListRunJobs(ctx context.Context, repo string, runID int64) ([]Job, error) {
+	p, err := repoPath(repo)
+	if err != nil {
+		return nil, err
+	}
+	path := fmt.Sprintf("%s/actions/runs/%d/jobs?per_page=100", p, runID)
+	var out []Job
+	for i := 0; i < maxPages; i++ {
+		var page jobsResponse
+		resp, err := c.do(ctx, http.MethodGet, path, nil, &page)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page.Jobs...)
+		next, ok := parseNextLink(resp.Header.Get("Link"))
+		if !ok {
+			break
+		}
+		path = c.stripToPath(next)
+	}
+	return out, nil
+}
+
+// checkLogViaActions is the issue #95 fallback for CheckLogForCheck when the
+// Checks API leg was refused with a plain 403: it resolves checkName against
+// the Actions JOB names of ref's workflow runs (a job's name is identical to
+// the check run's name for Actions-backed checks — the only checks that ever
+// had a fetchable log) and fetches the highest-ID matching job's log. An
+// unresolvable name yields port.ErrNotFound — the same indistinguishable
+// "no such check name / not fetchable" answer the Checks path gives. checksErr
+// is the original 403 so a both-forbidden outcome surfaces as that verbatim
+// (still ErrForbidden → broker 403, no regression).
+func (c *Client) checkLogViaActions(ctx context.Context, repo, ref, checkName string, maxBytes int64, checksErr error) (string, bool, error) {
+	runs, err := c.ListWorkflowRuns(ctx, repo, ref)
+	if err != nil {
+		return "", false, forbiddenFallbackErr(checksErr, err)
+	}
+	var bestID int64
+	for i, r := range runs {
+		if i >= maxLogLookupRuns {
+			break
+		}
+		jobs, err := c.ListRunJobs(ctx, repo, r.ID)
+		if err != nil {
+			return "", false, forbiddenFallbackErr(checksErr, err)
+		}
+		for _, j := range jobs {
+			if j.Name == checkName && j.ID > bestID {
+				bestID = j.ID
+			}
+		}
+	}
+	if bestID == 0 {
+		return "", false, port.ErrNotFound
+	}
+	return c.JobLog(ctx, repo, bestID, maxBytes)
+}
+
 // CheckLogForCheck resolves checkName on ref to its backing Actions job and
 // returns the job's (tail-bounded) log text. It is the glue between the
 // already-called ListCheckRuns (also used by Summary/ci.status — no extra
 // upstream call beyond what checks/{ref} already makes) and JobLog:
 //  1. List check runs for ref and filter to Name == checkName. Zero matches →
 //     ErrNotFound. Multiple matches (reruns) are tiebroken by highest ID (the
-//     most recent check-run wins).
+//     most recent check-run wins). If the Checks API refuses with a plain 403
+//     (issue #95), fall back to resolving checkName against Actions job names
+//     (checkLogViaActions).
 //  2. Parse the matched check-run's DetailsURL for an Actions run_id/job_id.
 //     A non-Actions-shaped URL (third-party check) → ErrNotFound: there is no
 //     log to fetch for that check type, which from the caller's perspective
@@ -178,7 +250,12 @@ func (c *Client) JobLog(ctx context.Context, repo string, jobID int64, maxBytes 
 func (c *Client) CheckLogForCheck(ctx context.Context, repo, ref, checkName string, maxBytes int64) (text string, truncated bool, err error) {
 	runs, err := c.ListCheckRuns(ctx, repo, ref)
 	if err != nil {
-		return "", false, err
+		if !errors.Is(err, port.ErrForbidden) {
+			return "", false, err
+		}
+		// Issue #95: Checks denied but Actions may not be. Resolve checkName
+		// against Actions job names for ref's workflow runs.
+		return c.checkLogViaActions(ctx, repo, ref, checkName, maxBytes, err)
 	}
 	var match *CheckRun
 	for i := range runs {

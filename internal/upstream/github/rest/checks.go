@@ -2,9 +2,12 @@ package rest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+
+	"github.com/psenna/git-proxy/internal/port"
 )
 
 // Overall check-state roll-up values returned by Summary.
@@ -22,6 +25,14 @@ type CheckSummary struct {
 	Overall   string
 	Checks    []CheckRun
 	Workflows []WorkflowRun
+	// ChecksUnavailable reports that the Checks-API leg (proxy→upstream) was
+	// refused with a plain 403 and this summary was rolled up from the Actions
+	// workflow-runs leg alone. It is a class flag about the proxy→upstream call
+	// — it never carries an upstream response body, a token, or a URL, so it is
+	// no-leak-permitted. When true, Checks is empty and Overall reflects only
+	// the workflow runs (issue #95: a credential that can read Actions but not
+	// Checks still gets an honest CI verdict rather than a 403).
+	ChecksUnavailable bool
 }
 
 // ListCheckRuns returns the Checks-API check runs for ref (a SHA or branch
@@ -104,16 +115,43 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, repo, ref string) ([]Work
 // run completed with a passing conclusion, it is success. A ref with no runs
 // at all is StateNone. The bundle (checks + workflows) is returned alongside so
 // the adapter can surface the per-run detail to agents without a second call.
+// Issue #95: a plain 403 on the Checks-API leg (the credential can read Actions
+// but not Checks — a common fine-grained-PAT shape) no longer fails the whole
+// call. Only errors.Is(err, port.ErrForbidden) triggers the Actions-only
+// fallback; ErrUnauthorized (401), *RateLimitedError (403 + X-RateLimit-Remaining:
+// 0, or 429), ErrNotFound, ErrUpstream, and transport/decode errors all
+// propagate unchanged. When the Checks leg was forbidden the returned summary
+// has ChecksUnavailable=true so the agent knows the check-run detail was
+// withheld (even when the Actions leg then reports no runs → StateNone).
 func (c *Client) Summary(ctx context.Context, repo, ref string) (CheckSummary, error) {
-	checks, err := c.ListCheckRuns(ctx, repo, ref)
-	if err != nil {
-		return CheckSummary{}, err
+	checks, checksErr := c.ListCheckRuns(ctx, repo, ref)
+	if checksErr != nil && !errors.Is(checksErr, port.ErrForbidden) {
+		return CheckSummary{}, checksErr
 	}
-	workflows, err := c.ListWorkflowRuns(ctx, repo, ref)
-	if err != nil {
-		return CheckSummary{}, err
+	workflows, wfErr := c.ListWorkflowRuns(ctx, repo, ref)
+	if wfErr != nil {
+		if checksErr != nil {
+			return CheckSummary{}, forbiddenFallbackErr(checksErr, wfErr)
+		}
+		return CheckSummary{}, wfErr
 	}
-	return rollupCI(checks, workflows), nil
+	s := rollupCI(checks, workflows)
+	s.ChecksUnavailable = checksErr != nil
+	return s, nil
+}
+
+// forbiddenFallbackErr picks the error to surface when the Checks leg was
+// forbidden AND the Actions fallback leg also failed. If the fallback failed
+// with only a plain 403 too, the credential can read neither family, so the
+// ORIGINAL Checks error is returned — it is still ErrForbidden, so the broker
+// maps it to today's 403 verbatim (no regression). Any richer fallback failure
+// (a rate limit with its Retry-After, a 5xx, a transport error) propagates as
+// itself so its class is not flattened into a bare 403.
+func forbiddenFallbackErr(checksErr, fallbackErr error) error {
+	if errors.Is(fallbackErr, port.ErrForbidden) {
+		return checksErr
+	}
+	return fallbackErr
 }
 
 // rollupCI is the pure roll-up of CI state over check runs and workflow runs,
