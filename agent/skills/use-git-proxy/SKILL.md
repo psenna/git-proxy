@@ -176,7 +176,7 @@ curl -s -X POST "$GIT_PROXY_BROKER_URL/$REPO/prs/7/reviews" -H "$AUTH" -H 'Conte
 ```sh
 # Query CI for a ref (SHA or branch; slashes preserved). → 200 CheckSummary
 curl -s "$GIT_PROXY_BROKER_URL/$REPO/checks/$SHA_OR_BRANCH" -H "$AUTH"
-# {"overall":"success","checks":[...],"workflows":[...]}
+# {"overall":"success","checks":[...],"workflows":[...],"checks_unavailable":false}
 ```
 
 `overall` is one of: `"none"` (no CI configured for the ref) | `"pending"` (a run
@@ -184,6 +184,25 @@ is queued/in-progress or completed without a conclusion yet) | `"failure"` (at
 least one run failed) | `"success"` (all completed passing) | `"unknown"` (a run
 in a state the roll-up can't classify). Precedence is failure > pending > success
 > unknown.
+
+`checks_unavailable` (always present since v0.0.11): `true` when the proxy's
+credential could not read the GitHub **Checks** API for this repo (the Checks and
+Actions APIs are gated on different fine-grained-PAT permissions), so the summary
+was rolled up from **Actions workflow runs alone** — `checks` is then empty and
+`overall` reflects only the `workflows` entries. Older git-proxy returned a hard
+`403 upstream denied` here; the fallback is **transparent** — no flag, same call,
+the proxy tries Checks, catches the `403`, and switches to Actions on its own. If
+the credential can read *neither* API the route still `403`s. Treat `true` as
+"check-run detail withheld, not absent": the Actions verdict is honest, but a
+non-Actions check (a third-party status) is not counted. The startup **preflight**
+(config `preflight.enabled`, default on) logs a `WARNING` at boot for any
+credential profile whose token is missing a permission an enabled op needs.
+
+**Pass a real commit SHA, not a branch name or a PR merge-commit, when
+`checks_unavailable` may be `true`.** The Actions fallback keys runs by
+`head_sha`, so a branch ref or the synthetic `refs/pull/N/merge` SHA yields
+`overall: "none"` with an empty `workflows` even when CI ran. Resolve the branch
+tip first — `git rev-parse`, or `git ls-remote "$GIT_PROXY_URL/<owner>/<repo>.git" <branch>`.
 
 > **CI logs are opt-in.** `checks/log` is sourced from the SAME upstream as
 > `checks/<ref>`, but is gated behind its own deployment-level toggle
@@ -210,6 +229,11 @@ curl -s -G "$GIT_PROXY_BROKER_URL/$REPO/checks/log" -H "$AUTH" \
 `check_name` must match a check-run's `name` from the `checks/<ref>` response
 exactly. A check not backed by a GitHub Actions job (e.g. a third-party check
 app) has no fetchable log and returns 404, same as an unknown `check_name`.
+When the `checks/<ref>` roll-up came back with `checks_unavailable: true`, there
+are no check-run names to match — pass the **Actions job name** instead (v0.0.11
+resolves `check_name` against Actions job names in that case, transparently;
+identical to the check-run name for Actions-backed checks). For a single-job
+workflow the job name is usually the workflow's `jobs.<id>` key (`test`, `lint`, …).
 
 **Do not dump a large log straight into your own conversation/context.** A job
 log can be tens of KB; pasting the whole thing burns context for little value.
