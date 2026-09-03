@@ -61,6 +61,8 @@ policy:
   # dry_run: true                   # forward a clean policy-deny instead of blocking; audit records deny + dry_run
 audit:
   file: "/tmp/git-proxy/audit.jsonl"  # append-only JSONL; omit to disable
+# preflight:                          # warn-only startup permission diagnostic (see below); enabled by default
+#   enabled: true                     # set false on a rate-limited or air-gapped deployment
 # alerts:
 #   webhook: "https://hooks.example.com/git-proxy"   # omit to disable; malformed URL fails fast at startup
 # ssh:
@@ -93,6 +95,19 @@ unchanged; a push containing a secret is denied; and a `--filter=blob:none`
 clone of a repo with `secrets/**` read-denied withholds the secret blobs. Every
 decision is recorded in the audit file; every deny fires an alert. The agent
 never sees the upstream credentials.
+
+### Startup permission preflight
+
+When `upstream.kind: github` and a `credentials_file` is configured, at boot the
+proxy probes each credential profile's token against the upstream API families
+the enabled ops need (metadata / contents / checks / actions / pull requests /
+issues) and logs a `WARNING` for every gap — for example, a profile whose PAT
+can read Actions but not Checks makes the broker's `ci.status` fall back to
+Actions-only (`checks_unavailable: true` in the response) and `ci.log` resolve
+check names from Actions job names. The preflight is **warn-only**: it never
+blocks startup and never changes an allow/deny decision. It runs in the
+background on a bounded budget; disable it with `preflight.enabled: false` on a
+rate-limited or air-gapped deployment.
 
 ## Deployment
 

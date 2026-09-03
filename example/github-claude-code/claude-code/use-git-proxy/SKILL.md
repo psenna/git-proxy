@@ -176,7 +176,7 @@ curl -s -X POST "$GIT_PROXY_BROKER_URL/$REPO/prs/7/reviews" -H "$AUTH" -H 'Conte
 ```sh
 # Query CI for a ref (SHA or branch; slashes preserved). → 200 CheckSummary
 curl -s "$GIT_PROXY_BROKER_URL/$REPO/checks/$SHA_OR_BRANCH" -H "$AUTH"
-# {"overall":"success","checks":[...],"workflows":[...]}
+# {"overall":"success","checks":[...],"workflows":[...],"checks_unavailable":false}
 ```
 
 `overall` is one of: `"none"` (no CI configured for the ref) | `"pending"` (a run
@@ -184,6 +184,13 @@ is queued/in-progress or completed without a conclusion yet) | `"failure"` (at
 least one run failed) | `"success"` (all completed passing) | `"unknown"` (a run
 in a state the roll-up can't classify). Precedence is failure > pending > success
 > unknown.
+
+`checks_unavailable` is `true` when the proxy's credential could not read the
+Checks API for this repo and the summary was rolled up from GitHub Actions
+workflow runs alone — `checks` is then empty and `overall` reflects only the
+`workflows` entries. Treat a `true` here as "check-run detail was withheld, not
+absent": the Actions verdict is still honest, but a non-Actions check (a
+third-party status) would not be counted. It is always present (never omitted).
 
 > **CI logs are opt-in.** `checks/log` is sourced from the SAME upstream as
 > `checks/<ref>`, but is gated behind its own deployment-level toggle
@@ -210,6 +217,10 @@ curl -s -G "$GIT_PROXY_BROKER_URL/$REPO/checks/log" -H "$AUTH" \
 `check_name` must match a check-run's `name` from the `checks/<ref>` response
 exactly. A check not backed by a GitHub Actions job (e.g. a third-party check
 app) has no fetchable log and returns 404, same as an unknown `check_name`.
+When `checks_unavailable` was `true`, `check_name` is matched against the
+Actions **job** name instead (identical to the check-run name for
+Actions-backed checks), so `checks/log` keeps working on a Checks-restricted
+credential.
 
 **Do not dump a large log straight into your own conversation/context.** A job
 log can be tens of KB; pasting the whole thing burns context for little value.

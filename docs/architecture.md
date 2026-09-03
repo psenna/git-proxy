@@ -199,6 +199,53 @@ values, upstream URLs/credentials, or packfile bytes.** Canary assertions in
 the integration tests string-match the secret value against the audit file and
 the raw webhook POST body.
 
+### CI-status graceful degradation (`checks_unavailable`)
+
+A proxy credential that can read GitHub Actions but **not** the Checks API (a
+common fine-grained-PAT shape) previously turned every `ci.status` and `ci.log`
+call into a broker 403. Now a **plain 403** on the Checks-API leg is tolerated:
+`ci.status` rolls the summary up from the Actions workflow-runs leg alone and
+sets `checks_unavailable: true` (always serialized), and `ci.log` resolves the
+check name against Actions **job** names (identical to the check-run name for
+Actions-backed checks). Only `errors.Is(err, port.ErrForbidden)` triggers the
+fallback — 401, a rate-limit-shaped 403 (`*RateLimitedError`), 404, 5xx and
+transport errors propagate unchanged, and a both-forbidden outcome still
+surfaces the original 403 (no regression). No token, URL or upstream body ever
+enters the flag or an error.
+
+### Startup permission preflight (`internal/preflight`)
+
+A **warn-only startup diagnostic**. After the listeners are wired, for each
+credential profile the proxy probes — in a background goroutine on the
+signal-derived context — whether the profile's token can read the upstream API
+families the enabled ops need (`metadata` / `contents` / `checks` / `actions` /
+`pull_requests` / `issues`) and logs a `WARNING` per gap naming the profile, the
+missing permission, the affected repo or pattern, and the operator-facing
+consequence. It **returns nothing, never blocks startup, and never participates
+in an allow/deny decision** — it is never assigned or consulted by a decision
+path.
+
+- **No-leak:** every line names only a failure class, a profile, a permission
+  label and a repo/pattern. The token is fetched from the profile store
+  (`Store.TokenForProfile`, the single secret-by-name accessor) immediately
+  before a probe and never logged; a test asserts the token string never
+  appears in captured preflight output.
+- **Provider-agnostic + registry-resolved:** the probe calls sit behind
+  `preflight.Prober`, resolved by upstream kind through a `Register` /
+  `ProberFor` registry mirroring `internal/upstream`. `internal/upstream/github`
+  provides the GitHub prober and self-registers via `init()`. Import direction
+  `internal/upstream/github -> internal/preflight -> internal/port + stdlib` —
+  no cycle, and `cmd/git-proxy` never names `PRSupport`/`IssueSupport`.
+- **Bounded:** a global budget (`preflight.timeout_seconds`, default 30s), a
+  per-probe timeout (`probe_timeout_seconds`, default 3s), a per-profile repo
+  cap (`max_repos_per_profile`, default 20), a fixed worker pool
+  (`concurrency`, default 4) whose results are logged in declaration order, a
+  hard abort on the first `ErrRateLimited`, and a per-profile stop on
+  `ErrUnauthorized`. Only `<owner>/*` wildcards are sampled (one repo, via the
+  org/user list endpoint); other shapes get a "not probed" note.
+- **Config:** the top-level `preflight:` block (`enabled` defaults true).
+  Disable it on a rate-limited or air-gapped deployment.
+
 ## Testing strategy
 
 - **Unit tests per package.** The policy engine, pathmatch, gitx, the rules,

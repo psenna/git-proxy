@@ -80,6 +80,19 @@ config:
     mergeMethod: ""                     # "" | merge | squash | rebase
     allowCheckLogs: false                # opt-in: exposes GET /<repo>/checks/log (raw CI job log text)
     maxCheckLogBytes: 0                  # 0 = use the built-in default (262144 / 256 KiB)
+  preflight:
+    # Warn-only startup permission diagnostic: at boot the proxy probes each
+    # credential profile's token against the upstream API families the enabled
+    # ops need and logs a WARNING per gap (e.g. a token that can read Actions
+    # but not Checks -> ci.status falls back to Actions-only). Never blocks
+    # startup, never affects a policy decision. Only an upstream with a
+    # registered prober (kind: github) is probed. Set enabled: false on a
+    # rate-limited or air-gapped deployment.
+    enabled: true
+    timeoutSeconds: 0                    # 0 -> binary default (30)
+    probeTimeoutSeconds: 0               # 0 -> binary default (3)
+    maxReposPerProfile: 0               # 0 -> binary default (20)
+    concurrency: 0                      # 0 -> binary default (4)
 
 # Generic escape hatch for any other sensitive top-level config.yaml key.
 # Must NOT duplicate a key the ConfigMap already renders, or a key another

@@ -68,6 +68,19 @@ policy:
 
 audit:
   file: /tmp/git-proxy/audit.jsonl   # append-only JSONL; omit to disable
+
+# Startup permission preflight: a warn-only diagnostic that probes each
+# credential profile's token against the upstream API families the enabled ops
+# need and logs a WARNING per gap. Never blocks startup, never affects a policy
+# decision. Enabled by default; only a provider with a registered prober (kind:
+# github) is probed — a plain upstream is skipped silently. Set enabled: false
+# on a rate-limited or air-gapped deployment.
+# preflight:
+#   enabled: true
+#   timeout_seconds: 30
+#   probe_timeout_seconds: 3
+#   max_repos_per_profile: 20
+#   concurrency: 4
 # alerts:
 #   webhook: "http://host.docker.internal:9999/hook"  # omit to disable; malformed URL fails fast at startup
 # ssh:
