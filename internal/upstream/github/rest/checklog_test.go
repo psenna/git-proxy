@@ -3,6 +3,7 @@ package rest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -61,6 +62,43 @@ func TestParseJobIDFromDetailsURL(t *testing.T) {
 				t.Errorf("runID=%d jobID=%d, want runID=%d jobID=%d", runID, jobID, tc.wantRun, tc.wantJob)
 			}
 		})
+	}
+}
+
+func TestListRunJobs(t *testing.T) {
+	page := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/actions/runs/5/jobs", func(w http.ResponseWriter, r *http.Request) {
+		page++
+		if page == 1 {
+			q := r.URL.Query()
+			q.Set("page", "2")
+			w.Header().Set("Link", `<`+r.URL.Path+`?`+q.Encode()+`>; rel="next"`)
+			_, _ = w.Write([]byte(`{"jobs":[{"id":1,"name":"a"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"jobs":[{"id":2,"name":"b"}]}`))
+	})
+	s := httptest.NewServer(mux)
+	defer s.Close()
+	c := New(s.URL, "tok")
+	jobs, err := c.ListRunJobs(context.Background(), "o/r.git", 5)
+	if err != nil {
+		t.Fatalf("ListRunJobs: %v", err)
+	}
+	if len(jobs) != 2 || jobs[0].Name != "a" || jobs[1].ID != 2 {
+		t.Errorf("jobs = %+v", jobs)
+	}
+}
+
+func TestListRunJobs_NotFound(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	s := httptest.NewServer(mux)
+	defer s.Close()
+	c := New(s.URL, "tok")
+	if _, err := c.ListRunJobs(context.Background(), "o/r.git", 9); !errors.Is(err, port.ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }
 
@@ -254,6 +292,170 @@ func TestCheckLogForCheck(t *testing.T) {
 		c := New(s.URL, "tok")
 		if _, _, err := c.CheckLogForCheck(context.Background(), "o/r.git", "abc", "does-not-exist", 1024); !errors.Is(err, port.ErrNotFound) {
 			t.Errorf("err = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("checks forbidden resolves via actions jobs", func(t *testing.T) {
+		var signedAuth string
+		signedHit := false
+		signed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			signedHit = true
+			signedAuth = r.Header.Get("Authorization")
+			_, _ = w.Write([]byte("actions job log"))
+		}))
+		defer signed.Close()
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/repos/o/r/commits/abc/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		})
+		mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"workflow_runs":[{"id":2,"name":"CI"}]}`))
+		})
+		mux.HandleFunc("/repos/o/r/actions/runs/2/jobs", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"jobs":[{"id":22,"name":"kind e2e"},{"id":21,"name":"unit"}]}`))
+		})
+		mux.HandleFunc("/repos/o/r/actions/jobs/22/logs", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, signed.URL, http.StatusFound)
+		})
+		s := httptest.NewServer(mux)
+		defer s.Close()
+		c := New(s.URL, "tok")
+
+		text, truncated, err := c.CheckLogForCheck(context.Background(), "o/r.git", "abc", "kind e2e", 1024)
+		if err != nil {
+			t.Fatalf("CheckLogForCheck: %v", err)
+		}
+		if truncated || text != "actions job log" {
+			t.Errorf("text=%q truncated=%v", text, truncated)
+		}
+		if !signedHit {
+			t.Error("signed URL not hit")
+		}
+		if signedAuth != "" {
+			t.Errorf("signed request carried Authorization %q — token must not leak", signedAuth)
+		}
+	})
+
+	t.Run("checks forbidden highest job ID tiebreak across runs", func(t *testing.T) {
+		var hitJob string
+		signed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("log"))
+		}))
+		defer signed.Close()
+		mux := http.NewServeMux()
+		mux.HandleFunc("/repos/o/r/commits/abc/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		})
+		mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"workflow_runs":[{"id":1},{"id":2}]}`))
+		})
+		mux.HandleFunc("/repos/o/r/actions/runs/1/jobs", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"jobs":[{"id":10,"name":"build"}]}`))
+		})
+		mux.HandleFunc("/repos/o/r/actions/runs/2/jobs", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"jobs":[{"id":30,"name":"build"}]}`))
+		})
+		mux.HandleFunc("/repos/o/r/actions/jobs/", func(w http.ResponseWriter, r *http.Request) {
+			hitJob = strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/repos/o/r/actions/jobs/"), "/logs")
+			http.Redirect(w, r, signed.URL, http.StatusFound)
+		})
+		s := httptest.NewServer(mux)
+		defer s.Close()
+		c := New(s.URL, "tok")
+		if _, _, err := c.CheckLogForCheck(context.Background(), "o/r.git", "abc", "build", 1024); err != nil {
+			t.Fatalf("CheckLogForCheck: %v", err)
+		}
+		if hitJob != "30" {
+			t.Errorf("job hit = %q, want 30 (highest ID across runs)", hitJob)
+		}
+	})
+
+	t.Run("checks forbidden unknown name is not found", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/repos/o/r/commits/abc/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		})
+		mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"workflow_runs":[{"id":1}]}`))
+		})
+		mux.HandleFunc("/repos/o/r/actions/runs/1/jobs", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"jobs":[{"id":10,"name":"build"}]}`))
+		})
+		s := httptest.NewServer(mux)
+		defer s.Close()
+		c := New(s.URL, "tok")
+		if _, _, err := c.CheckLogForCheck(context.Background(), "o/r.git", "abc", "nope", 1024); !errors.Is(err, port.ErrNotFound) {
+			t.Errorf("err = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("checks forbidden and actions forbidden is forbidden", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/repos/o/r/commits/abc/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		})
+		mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		})
+		s := httptest.NewServer(mux)
+		defer s.Close()
+		c := New(s.URL, "tok")
+		if _, _, err := c.CheckLogForCheck(context.Background(), "o/r.git", "abc", "ci", 1024); !errors.Is(err, port.ErrForbidden) {
+			t.Errorf("err = %v, want ErrForbidden", err)
+		}
+	})
+
+	t.Run("checks unauthorized propagates without fallback", func(t *testing.T) {
+		actionsHit := false
+		mux := http.NewServeMux()
+		mux.HandleFunc("/repos/o/r/commits/abc/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		})
+		mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, _ *http.Request) {
+			actionsHit = true
+		})
+		s := httptest.NewServer(mux)
+		defer s.Close()
+		c := New(s.URL, "tok")
+		if _, _, err := c.CheckLogForCheck(context.Background(), "o/r.git", "abc", "ci", 1024); !errors.Is(err, port.ErrUnauthorized) {
+			t.Errorf("err = %v, want ErrUnauthorized", err)
+		}
+		if actionsHit {
+			t.Error("actions/runs hit — 401 must not trigger the fallback")
+		}
+	})
+
+	t.Run("checks forbidden fallback run cap respected", func(t *testing.T) {
+		var runsBody strings.Builder
+		runsBody.WriteString(`{"workflow_runs":[`)
+		for i := 1; i <= 12; i++ {
+			if i > 1 {
+				runsBody.WriteString(",")
+			}
+			fmt.Fprintf(&runsBody, `{"id":%d}`, i)
+		}
+		runsBody.WriteString(`]}`)
+		var jobListCalls int
+		mux := http.NewServeMux()
+		mux.HandleFunc("/repos/o/r/commits/abc/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		})
+		mux.HandleFunc("/repos/o/r/actions/runs", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(runsBody.String()))
+		})
+		mux.HandleFunc("/repos/o/r/actions/runs/", func(w http.ResponseWriter, _ *http.Request) {
+			jobListCalls++
+			_, _ = w.Write([]byte(`{"jobs":[]}`))
+		})
+		s := httptest.NewServer(mux)
+		defer s.Close()
+		c := New(s.URL, "tok")
+		if _, _, err := c.CheckLogForCheck(context.Background(), "o/r.git", "abc", "x", 1024); !errors.Is(err, port.ErrNotFound) {
+			t.Errorf("err = %v, want ErrNotFound", err)
+		}
+		if jobListCalls != maxLogLookupRuns {
+			t.Errorf("job-list calls = %d, want %d (fan-out cap)", jobListCalls, maxLogLookupRuns)
 		}
 	})
 

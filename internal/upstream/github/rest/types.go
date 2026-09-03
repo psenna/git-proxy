@@ -97,6 +97,10 @@ type checkRunsResponse struct {
 
 // WorkflowRun is a single GitHub Actions workflow run.
 type WorkflowRun struct {
+	// ID is the Actions run id, used to list the run's jobs
+	// (GET /actions/runs/{id}/jobs) when resolving a check log without the
+	// Checks API (issue #95).
+	ID         int64  `json:"id"`
 	Name       string `json:"name"`
 	Status     string `json:"status"`
 	Conclusion string `json:"conclusion"`
@@ -106,6 +110,19 @@ type WorkflowRun struct {
 // workflowRunsResponse is the paginated /actions/runs envelope.
 type workflowRunsResponse struct {
 	WorkflowRuns []WorkflowRun `json:"workflow_runs"`
+}
+
+// Job is one GitHub Actions job within a workflow run. For an Actions-backed
+// check run, Job.Name equals the check run's Name — which is what makes
+// resolving a check log by name possible without the Checks API (issue #95).
+type Job struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+}
+
+// jobsResponse is the paginated /actions/runs/{run_id}/jobs envelope.
+type jobsResponse struct {
+	Jobs []Job `json:"jobs"`
 }
 
 // Issue is the GitHub REST issue payload as the rest client exposes it for the

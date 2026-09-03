@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -52,6 +53,68 @@ type Config struct {
 	Audit       AuditConfig  `yaml:"audit"`
 	Alerts      AlertConfig  `yaml:"alerts"`
 	Broker      BrokerConfig `yaml:"broker"`
+	// Preflight configures the startup permission diagnostic (issue #95). It is
+	// a top-level block, not nested under upstream, because UpstreamConfig is
+	// shared by both upstream: and issue_upstream: and there is nowhere there
+	// for the timeout/cap knobs. Absent → enabled with defaults.
+	Preflight PreflightConfig `yaml:"preflight"`
+}
+
+// PreflightConfig configures the startup credential-permission preflight
+// (internal/preflight): for each credential profile it probes, at boot,
+// whether the profile's token can read the upstream API families the enabled
+// ops need and logs a WARNING for each gap. It is warn-only and never blocks
+// startup. Disable it (enabled: false) on a rate-limited or air-gapped
+// deployment where the extra probe traffic is unwanted.
+type PreflightConfig struct {
+	// Enabled turns the preflight on/off. nil (absent) means enabled.
+	Enabled *bool `yaml:"enabled"`
+	// TimeoutSeconds is the global budget for one preflight run. 0 → 30.
+	TimeoutSeconds int `yaml:"timeout_seconds"`
+	// ProbeTimeoutSeconds bounds each individual upstream probe. 0 → 3.
+	ProbeTimeoutSeconds int `yaml:"probe_timeout_seconds"`
+	// MaxReposPerProfile caps how many of a profile's repo patterns are probed.
+	// 0 → 20.
+	MaxReposPerProfile int `yaml:"max_repos_per_profile"`
+	// Concurrency is the probe worker-pool size. 0 → 4.
+	Concurrency int `yaml:"concurrency"`
+}
+
+// EnabledOrDefault reports whether the preflight should run (default true).
+func (p PreflightConfig) EnabledOrDefault() bool {
+	return p.Enabled == nil || *p.Enabled
+}
+
+// TimeoutOrDefault returns the global budget, defaulting to 30s.
+func (p PreflightConfig) TimeoutOrDefault() time.Duration {
+	if p.TimeoutSeconds > 0 {
+		return time.Duration(p.TimeoutSeconds) * time.Second
+	}
+	return 30 * time.Second
+}
+
+// ProbeTimeoutOrDefault returns the per-probe timeout, defaulting to 3s.
+func (p PreflightConfig) ProbeTimeoutOrDefault() time.Duration {
+	if p.ProbeTimeoutSeconds > 0 {
+		return time.Duration(p.ProbeTimeoutSeconds) * time.Second
+	}
+	return 3 * time.Second
+}
+
+// MaxReposOrDefault returns the per-profile repo cap, defaulting to 20.
+func (p PreflightConfig) MaxReposOrDefault() int {
+	if p.MaxReposPerProfile > 0 {
+		return p.MaxReposPerProfile
+	}
+	return 20
+}
+
+// ConcurrencyOrDefault returns the probe worker-pool size, defaulting to 4.
+func (p PreflightConfig) ConcurrencyOrDefault() int {
+	if p.Concurrency > 0 {
+		return p.Concurrency
+	}
+	return 4
 }
 
 // BrokerConfig configures the optional agent-facing PR/CI broker HTTP server.
@@ -279,6 +342,12 @@ func (c *Config) validate() error {
 	// look truncated with no log content).
 	if c.Broker.MaxCheckLogBytes < 0 {
 		return fmt.Errorf("config: broker.max_check_log_bytes must not be negative")
+	}
+	// Preflight: negative knobs are nonsensical (fail closed rather than
+	// silently clamping), same posture as broker.max_check_log_bytes.
+	if c.Preflight.TimeoutSeconds < 0 || c.Preflight.ProbeTimeoutSeconds < 0 ||
+		c.Preflight.MaxReposPerProfile < 0 || c.Preflight.Concurrency < 0 {
+		return fmt.Errorf("config: preflight timeout_seconds/probe_timeout_seconds/max_repos_per_profile/concurrency must not be negative")
 	}
 	return nil
 }

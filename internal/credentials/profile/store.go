@@ -64,6 +64,24 @@ type profileWildcard struct {
 type Store struct {
 	matcher   *repomatch.Matcher[*resolved]
 	wildcards []profileWildcard
+	// profiles is the secret-free per-profile summary, in declaration order,
+	// for the startup preflight (internal/preflight). It never holds a secret.
+	profiles []ProfileInfo
+	// tokens maps a profile name to its resolved token, populated only for
+	// profiles that resolved a non-empty token. It is the backing store for
+	// TokenForProfile — the ONLY secret-by-name accessor; the value is used for
+	// one preflight probe and never logged.
+	tokens map[string]string
+}
+
+// ProfileInfo is the secret-free view of one credential profile the startup
+// preflight consumes: name, description, repo patterns, and whether the profile
+// resolved a broker token at all. It NEVER carries the secret itself.
+type ProfileInfo struct {
+	Name        string
+	Description string
+	Repos       []string
+	HasToken    bool
 }
 
 // resolved holds the resolved credentials for a profile, snapshotted at New
@@ -124,6 +142,18 @@ func New(path string) (*Store, error) {
 			Token:    envOr(up+"_TOKEN", rp.Token),
 		}
 		r := &resolved{creds: c}
+		s.profiles = append(s.profiles, ProfileInfo{
+			Name:        rp.Name,
+			Description: rp.Description,
+			Repos:       append([]string(nil), rp.Repos...),
+			HasToken:    c.Token != "",
+		})
+		if c.Token != "" {
+			if s.tokens == nil {
+				s.tokens = make(map[string]string)
+			}
+			s.tokens[rp.Name] = c.Token
+		}
 		for _, pat := range rp.Repos {
 			// repomatch.New validates each pattern (bare *, **, syntax) and
 			// detects duplicate exact and duplicate wildcard patterns across
@@ -184,6 +214,27 @@ func (s *Store) CredentialsFor(repo string) (port.Credentials, bool) {
 		return port.Credentials{}, false // secretless profile → no creds (deny falls through to public_repos)
 	}
 	return r.creds, true
+}
+
+// Profiles returns the secret-free per-profile summary in declaration order.
+// Each entry's Repos slice is a copy, so a caller cannot mutate the store.
+func (s *Store) Profiles() []ProfileInfo {
+	out := make([]ProfileInfo, len(s.profiles))
+	for i, p := range s.profiles {
+		cp := p
+		cp.Repos = append([]string(nil), p.Repos...)
+		out[i] = cp
+	}
+	return out
+}
+
+// TokenForProfile returns the resolved token for the named profile. It is the
+// ONLY secret-by-name accessor on the store; the caller (the startup preflight)
+// uses the value for one probe and MUST never log it. ok is false for an
+// unknown profile or one that resolved no token.
+func (s *Store) TokenForProfile(name string) (string, bool) {
+	t, ok := s.tokens[name]
+	return t, ok
 }
 
 // WildcardPatterns returns each wildcard pattern tagged with the profile name

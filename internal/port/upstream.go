@@ -161,6 +161,14 @@ type CheckSummary struct {
 	Checks []CheckRun `json:"checks"`
 	// Workflows are the individual GitHub Actions workflow runs.
 	Workflows []WorkflowRun `json:"workflows"`
+	// ChecksUnavailable reports that the Checks-API leg (proxy→upstream) was
+	// refused with a plain 403 and this summary was rolled up from the Actions
+	// workflow-runs leg alone (issue #95). It is a class flag about the
+	// proxy→upstream call — it carries no upstream response body, token, or URL
+	// (no-leak-permitted). When true, Checks is empty and Overall reflects only
+	// the workflow runs; the field is always serialized (no omitempty) so the
+	// response schema is stable.
+	ChecksUnavailable bool `json:"checks_unavailable"`
 }
 
 // CheckRun is a single GitHub check run (Checks API), e.g. a CI job.

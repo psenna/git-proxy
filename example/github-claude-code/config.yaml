@@ -97,5 +97,19 @@ broker:
   # Tighten for any real deployment. Example only.
   merge_method: squash
 
+# Startup permission preflight (diagnostic, warn-only). At boot the proxy probes
+# each credential profile's token against the upstream API families the enabled
+# ops need (metadata / contents / checks / actions / pull_requests / issues) and
+# logs a WARNING per gap — e.g. a token that can read Actions but not Checks
+# makes ci.status fall back to Actions-only (checks_unavailable=true). It never
+# blocks startup and never turns a deny into an allow. Enabled by default;
+# disable it on a rate-limited or air-gapped deployment.
+preflight:
+  enabled: true
+  # timeout_seconds: 30          # global budget for one run
+  # probe_timeout_seconds: 3     # per-probe timeout
+  # max_repos_per_profile: 20    # cap on how many of a profile's patterns are probed
+  # concurrency: 4               # probe worker-pool size
+
 audit:
   file: /tmp/git-proxy/audit.jsonl   # append-only JSONL; omit to disable

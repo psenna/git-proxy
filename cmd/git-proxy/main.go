@@ -35,6 +35,7 @@ import (
 	"github.com/psenna/git-proxy/internal/policy"
 	_ "github.com/psenna/git-proxy/internal/policy/rules" // register rules via init()
 	"github.com/psenna/git-proxy/internal/port"
+	"github.com/psenna/git-proxy/internal/preflight"
 	httpfront "github.com/psenna/git-proxy/internal/transport/http"
 	sshfront "github.com/psenna/git-proxy/internal/transport/ssh"
 	"github.com/psenna/git-proxy/internal/upstream"
@@ -425,6 +426,18 @@ func run(configPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Startup permission preflight (issue #95): a warn-only diagnostic that, for
+	// each credential profile, probes whether the profile's token can read the
+	// upstream API families the enabled ops need and logs a WARNING per gap. It
+	// never blocks startup and never feeds a decision — so it runs in a
+	// background goroutine on the signal-derived ctx (SIGTERM cancels it
+	// mid-probe) and a slow upstream cannot delay the listeners or healthz.
+	// main.go never references PRSupport/IssueSupport: the prober is
+	// provider-agnostic and registry-resolved by upstream kind.
+	if cfg.Preflight.EnabledOrDefault() {
+		runPreflight(ctx, cfg, scmStore, issueStore)
+	}
+
 	err = serveTransports(ctx, stop, transports)
 	// Graceful shutdown: close the audit sink (flush-safe; the file is
 	// append-only so close never loses already-written lines) and the webhook
@@ -465,6 +478,95 @@ func serveTransports(ctx context.Context, stop context.CancelFunc, transports []
 		}
 	}
 	return firstErr
+}
+
+// runPreflight kicks off the startup permission diagnostic for the SCM leg
+// and, when a broker issue upstream is configured, the issue leg. Each leg runs
+// in its own background goroutine (preflight.Run never errors and never
+// blocks). A leg is skipped silently when no prober is registered for its
+// upstream kind, or when it has no credential store (no profiles to probe).
+func runPreflight(ctx context.Context, cfg *config.Config, scmStore, issueStore *credprofile.Store) {
+	brokerOn := cfg.Broker.Listen != ""
+	opts := func(label string, feat preflight.Features, prober preflight.Prober, tokens preflight.TokenSource) preflight.Options {
+		return preflight.Options{
+			Perms:              preflight.PermissionsFor(feat),
+			Prober:             prober,
+			Tokens:             tokens,
+			Label:              label,
+			Budget:             cfg.Preflight.TimeoutOrDefault(),
+			ProbeTimeout:       cfg.Preflight.ProbeTimeoutOrDefault(),
+			MaxReposPerProfile: cfg.Preflight.MaxReposOrDefault(),
+			Concurrency:        cfg.Preflight.ConcurrencyOrDefault(),
+		}
+	}
+
+	if scmStore != nil {
+		prober, ok, err := preflight.ProberFor(cfg.Upstream.Kind, cfg.Upstream.URL)
+		switch {
+		case err != nil:
+			log.Printf("git-proxy: preflight: skipped (%v)", err)
+		case ok:
+			feat := preflight.Features{
+				Git:       true,
+				BrokerPRs: brokerOn && anyOpAllowed(cfg.Broker, "pr.create", "pr.get", "pr.list", "pr.merge", "pr.comment", "pr.review"),
+				CIStatus:  brokerOn && anyOpAllowed(cfg.Broker, "ci.status"),
+				CILog:     brokerOn && cfg.Broker.AllowCheckLogs && anyOpAllowed(cfg.Broker, "ci.log"),
+			}
+			go preflight.Run(ctx, toPreflightProfiles(scmStore.Profiles()), opts("", feat, prober, scmStore))
+		}
+	}
+
+	if brokerOn && issueStore != nil {
+		prober, ok, err := preflight.ProberFor(cfg.IssueUpstream.Kind, cfg.IssueUpstream.URL)
+		switch {
+		case err != nil:
+			log.Printf("git-proxy: preflight: [issue_upstream] skipped (%v)", err)
+		case ok:
+			feat := preflight.Features{
+				Issues: anyOpAllowed(cfg.Broker,
+					"issue.create", "issue.get", "issue.list", "issue.comment",
+					"issue.close", "issue.reopen", "issue.edit",
+					"issue.label.add", "issue.label.remove"),
+			}
+			go preflight.Run(ctx, toPreflightProfiles(issueStore.Profiles()), opts("issue_upstream", feat, prober, issueStore))
+		}
+	}
+}
+
+// anyOpAllowed reports whether at least one of ops passes the broker's op
+// allowlist. It replicates broker.authorize's "empty AllowedOps means all ops"
+// semantics so the preflight probes exactly the permissions the broker will
+// actually let an agent exercise.
+func anyOpAllowed(bc config.BrokerConfig, ops ...string) bool {
+	if len(bc.AllowedOps) == 0 {
+		return true
+	}
+	set := make(map[string]bool, len(bc.AllowedOps))
+	for _, o := range bc.AllowedOps {
+		set[o] = true
+	}
+	for _, o := range ops {
+		if set[o] {
+			return true
+		}
+	}
+	return false
+}
+
+// toPreflightProfiles maps the credential store's secret-free ProfileInfo slice
+// to preflight.Profile. Neither type carries a secret; the token is resolved by
+// name from the store (which is the preflight.TokenSource) just before a probe.
+func toPreflightProfiles(in []credprofile.ProfileInfo) []preflight.Profile {
+	out := make([]preflight.Profile, len(in))
+	for i, p := range in {
+		out[i] = preflight.Profile{
+			Name:        p.Name,
+			Description: p.Description,
+			Repos:       p.Repos,
+			HasToken:    p.HasToken,
+		}
+	}
+	return out
 }
 
 // newMirrorOpener returns a gitproto.MirrorOpener that caches one bare mirror

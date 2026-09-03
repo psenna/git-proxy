@@ -2,6 +2,7 @@ package profile
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -624,6 +625,97 @@ credentials:
 	}
 	if !strings.Contains(out2, "COMPANY_ABC_PASSWORD") {
 		t.Errorf("warning should name COMPANY_ABC_PASSWORD; got:\n%s", out2)
+	}
+}
+
+// --- Profiles / TokenForProfile (preflight seam) ---
+
+func TestProfiles_EnumeratesInDeclarationOrderWithoutSecrets(t *testing.T) {
+	body := `
+credentials:
+  - name: alpha
+    description: "alpha desc"
+    password: pw
+    token: tok-alpha
+    repos: ["mycompany/a.git", "mycompany/*"]
+  - name: bravo
+    description: "git only"
+    password: pw
+    repos: ["other/b.git"]
+`
+	p := writeVault(t, body)
+	s, err := New(p)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	profs := s.Profiles()
+	if len(profs) != 2 || profs[0].Name != "alpha" || profs[1].Name != "bravo" {
+		t.Fatalf("Profiles = %+v, want [alpha bravo] in declaration order", profs)
+	}
+	if !profs[0].HasToken {
+		t.Error("alpha.HasToken = false, want true")
+	}
+	if profs[1].HasToken {
+		t.Error("bravo.HasToken = true, want false (password only)")
+	}
+	if len(profs[0].Repos) != 2 || profs[0].Repos[0] != "mycompany/a.git" {
+		t.Errorf("alpha.Repos = %v", profs[0].Repos)
+	}
+	// mutating the returned copy must not affect the store
+	profs[0].Repos[0] = "mutated"
+	if s.Profiles()[0].Repos[0] != "mycompany/a.git" {
+		t.Error("Profiles() returned a slice aliased to the store")
+	}
+}
+
+func TestTokenForProfile(t *testing.T) {
+	body := `
+credentials:
+  - name: alpha
+    token: file-tok
+    repos: ["mycompany/a.git"]
+  - name: bravo
+    password: pw
+    repos: ["other/b.git"]
+`
+	p := writeVault(t, body)
+	t.Setenv("ALPHA_TOKEN", "env-tok")
+	s, err := New(p)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	tok, ok := s.TokenForProfile("alpha")
+	if !ok || tok != "env-tok" {
+		t.Errorf("TokenForProfile(alpha) = (%q, %v), want (env-tok, true)", tok, ok)
+	}
+	if _, ok := s.TokenForProfile("bravo"); ok {
+		t.Error("TokenForProfile(bravo) ok = true, want false (no token)")
+	}
+	if _, ok := s.TokenForProfile("nope"); ok {
+		t.Error("TokenForProfile(nope) ok = true, want false (unknown)")
+	}
+}
+
+func TestProfiles_NoSecretInStruct(t *testing.T) {
+	body := `
+credentials:
+  - name: alpha
+    description: "d"
+    password: hunter2
+    token: ghp_supersecret
+    repos: ["mycompany/a.git"]
+`
+	p := writeVault(t, body)
+	s, err := New(p)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	dump := ""
+	for _, pi := range s.Profiles() {
+		dump += fmt.Sprintf("%+v", pi)
+	}
+	if strings.Contains(dump, "hunter2") || strings.Contains(dump, "ghp_supersecret") {
+		t.Errorf("ProfileInfo carries a secret value: %s", dump)
 	}
 }
 

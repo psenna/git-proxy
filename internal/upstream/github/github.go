@@ -412,5 +412,5 @@ func toCheckSummary(s rest.CheckSummary) port.CheckSummary {
 	for _, wr := range s.Workflows {
 		workflows = append(workflows, port.WorkflowRun{Name: wr.Name, Status: wr.Status, Conclusion: wr.Conclusion, URL: wr.HTMLURL})
 	}
-	return port.CheckSummary{Overall: s.Overall, Checks: checks, Workflows: workflows}
+	return port.CheckSummary{Overall: s.Overall, Checks: checks, Workflows: workflows, ChecksUnavailable: s.ChecksUnavailable}
 }

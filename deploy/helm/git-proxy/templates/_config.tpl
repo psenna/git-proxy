@@ -115,4 +115,20 @@ broker:
   max_check_log_bytes: {{ int64 . }}
   {{- end }}
 {{- end }}
+{{- with .Values.config.preflight }}
+preflight:
+  enabled: {{ .enabled }}
+  {{- if gt (int .timeoutSeconds) 0 }}
+  timeout_seconds: {{ int .timeoutSeconds }}
+  {{- end }}
+  {{- if gt (int .probeTimeoutSeconds) 0 }}
+  probe_timeout_seconds: {{ int .probeTimeoutSeconds }}
+  {{- end }}
+  {{- if gt (int .maxReposPerProfile) 0 }}
+  max_repos_per_profile: {{ int .maxReposPerProfile }}
+  {{- end }}
+  {{- if gt (int .concurrency) 0 }}
+  concurrency: {{ int .concurrency }}
+  {{- end }}
+{{- end }}
 {{- end -}}

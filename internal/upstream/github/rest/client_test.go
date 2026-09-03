@@ -113,12 +113,128 @@ func TestClient_NoLeakTokenInError(t *testing.T) {
 	}
 }
 
+func TestProbe_MapsStatusToSentinel(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		headers map[string]string
+		want    error
+	}{
+		{"ok", http.StatusOK, nil, nil},
+		{"unauthorized", http.StatusUnauthorized, nil, port.ErrUnauthorized},
+		{"forbidden", http.StatusForbidden, nil, port.ErrForbidden},
+		{"rate limited 403", http.StatusForbidden, map[string]string{"X-RateLimit-Remaining": "0"}, port.ErrRateLimited},
+		{"not found", http.StatusNotFound, nil, port.ErrNotFound},
+		{"server error", http.StatusInternalServerError, nil, port.ErrUpstream},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath, gotAuth string
+			mux := http.NewServeMux()
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotAuth = r.Header.Get("Authorization")
+				for k, v := range tc.headers {
+					w.Header().Set(k, v)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"message":"body that must not leak"}`))
+			})
+			s := httptest.NewServer(mux)
+			defer s.Close()
+			c := New(s.URL, "probe-tok")
+			err := c.Probe(context.Background(), "repos/o/r/actions/runs?per_page=1")
+			if tc.want == nil {
+				if err != nil {
+					t.Fatalf("Probe: %v", err)
+				}
+			} else if !errors.Is(err, tc.want) {
+				t.Fatalf("Probe err = %v, want %v", err, tc.want)
+			}
+			if gotPath != "/repos/o/r/actions/runs" {
+				t.Errorf("path = %q", gotPath)
+			}
+			if gotAuth != "Bearer probe-tok" {
+				t.Errorf("auth = %q, want Bearer probe-tok", gotAuth)
+			}
+			if err != nil && strings.Contains(err.Error(), "must not leak") {
+				t.Errorf("error leaks body: %v", err)
+			}
+		})
+	}
+}
+
+func TestRepoInfo(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"full_name":"o/r","default_branch":"trunk"}`))
+	})
+	s := httptest.NewServer(mux)
+	defer s.Close()
+	c := New(s.URL, "tok")
+	info, err := c.RepoInfo(context.Background(), "o/r.git")
+	if err != nil {
+		t.Fatalf("RepoInfo: %v", err)
+	}
+	if info.FullName != "o/r" || info.DefaultBranch != "trunk" {
+		t.Errorf("info = %+v", info)
+	}
+}
+
+func TestListOwnerRepos_OrgThenUserFallback(t *testing.T) {
+	t.Run("org", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/orgs/acme/repos", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`[{"full_name":"acme/first"},{"full_name":"acme/second"}]`))
+		})
+		s := httptest.NewServer(mux)
+		defer s.Close()
+		c := New(s.URL, "tok")
+		got, err := c.ListOwnerRepos(context.Background(), "acme", 1)
+		if err != nil {
+			t.Fatalf("ListOwnerRepos: %v", err)
+		}
+		if len(got) != 1 || got[0] != "acme/first" {
+			t.Errorf("got %v, want [acme/first]", got)
+		}
+	})
+	t.Run("user fallback on 404", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/orgs/dev/repos", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		})
+		mux.HandleFunc("/users/dev/repos", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`[{"full_name":"dev/pet"}]`))
+		})
+		s := httptest.NewServer(mux)
+		defer s.Close()
+		c := New(s.URL, "tok")
+		got, err := c.ListOwnerRepos(context.Background(), "dev", 1)
+		if err != nil {
+			t.Fatalf("ListOwnerRepos: %v", err)
+		}
+		if len(got) != 1 || got[0] != "dev/pet" {
+			t.Errorf("got %v, want [dev/pet]", got)
+		}
+	})
+	t.Run("forbidden propagates", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) })
+		s := httptest.NewServer(mux)
+		defer s.Close()
+		c := New(s.URL, "tok")
+		if _, err := c.ListOwnerRepos(context.Background(), "x", 1); !errors.Is(err, port.ErrForbidden) {
+			t.Errorf("err = %v, want ErrForbidden", err)
+		}
+	})
+}
+
 func TestClient_NormalizeRepo(t *testing.T) {
 	cases := []struct {
-		in            string
-		wantOwner     string
-		wantRepo      string
-		wantErr       bool
+		in        string
+		wantOwner string
+		wantRepo  string
+		wantErr   bool
 	}{
 		{"owner/repo.git", "owner", "repo", false},
 		{"owner/repo", "owner", "repo", false},
